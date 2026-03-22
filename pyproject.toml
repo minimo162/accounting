@@ -1,0 +1,20 @@
+[project]
+name = "accounting"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "browser-use>=0.12.2",
+    "fastapi>=0.135.1",
+    "google-cloud-storage>=3.10.0",
+    "google-genai>=1.65.0",
+    "google-generativeai>=0.8.6",
+    "httpx>=0.28.1",
+    "numpy>=2.4.3",
+    "playwright>=1.58.0",
+    "pydantic>=2.12.5",
+    "pymupdf>=1.27.2.2",
+    "tiktoken>=0.12.0",
+    "uvicorn>=0.42.0",
+]

@@ -1,0 +1,145 @@
+"""Semantic search tool using Gemini embeddings."""
+
+import logging
+import pickle
+from typing import Any
+from collections import defaultdict
+
+import numpy as np
+import tiktoken
+
+from .base import BaseTool
+from ..context import AgentContext
+
+logger = logging.getLogger(__name__)
+
+_tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
+class SemanticSearchTool(BaseTool):
+    def __init__(self, index_path: str, embed_fn):
+        """
+        Args:
+            index_path: Path to sentence_index.pkl
+            embed_fn: Callable that takes a query string and returns a numpy vector
+        """
+        self._embed_fn = embed_fn
+        self._load_index(index_path)
+
+    def _load_index(self, path: str):
+        with open(path, "rb") as f:
+            index = pickle.load(f)
+        self._sentences: list[str] = index["sentences"]
+        self._embeddings: np.ndarray = index["embeddings"]  # (N, dim), normalized
+        self._sent_to_chunk: list[str] = index["sentence_to_chunk"]
+        self._chunks: dict[str, dict] = index["chunks"]
+        logger.info(f"Loaded index: {len(self._sentences)} sentences, {len(self._chunks)} chunks")
+
+    @property
+    def name(self) -> str:
+        return "semantic_search"
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "name": "semantic_search",
+            "description": (
+                "意味的類似性で文書を検索します。自然言語の質問や概念的な検索に適しています。\n"
+                "Search documents by semantic similarity. "
+                "Good for natural language queries and conceptual searches.\n"
+                "STRATEGY:\n"
+                "- Phrase your query as a natural language question or description\n"
+                "- Try different phrasings if initial results aren't relevant\n"
+                "- Good for finding related concepts even without exact term matches"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "検索クエリ / Search query in natural language",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返す結果の最大数 / Max results (default 5, max 20)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        }
+
+    def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
+        query: str = kwargs.get("query", "")
+        top_k: int = min(kwargs.get("top_k", 5), 20)
+
+        if not query:
+            return "検索クエリを指定してください。", {"error": "no query"}
+
+        # Embed query
+        query_vec = self._embed_fn(query)
+        if query_vec is None:
+            return "埋め込みの生成に失敗しました。", {"error": "embedding failed"}
+
+        query_vec = query_vec / np.linalg.norm(query_vec)
+
+        # Cosine similarity
+        similarities = self._embeddings @ query_vec
+
+        # Group by chunk, collect multiple top sentences per chunk
+        chunk_sentences: dict[str, list[dict]] = defaultdict(list)
+        for idx in range(len(similarities)):
+            chunk_id = self._sent_to_chunk[idx]
+            sim = float(similarities[idx])
+            chunk_sentences[chunk_id].append({
+                "sentence": self._sentences[idx],
+                "similarity": sim,
+                "position": idx,
+            })
+
+        # Rank chunks by max sentence similarity
+        chunk_max_scores: dict[str, float] = {}
+        for chunk_id, sents in chunk_sentences.items():
+            chunk_max_scores[chunk_id] = max(s["similarity"] for s in sents)
+
+        ranked = sorted(chunk_max_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+        if not ranked:
+            return "関連する文書が見つかりませんでした。", {"matches": 0}
+
+        lines = []
+        all_matched_text = []
+        chunk_ids = []
+        for chunk_id, score in ranked:
+            chunk = self._chunks.get(chunk_id, {})
+            source = chunk.get("source", "")
+            chunk_ids.append(chunk_id)
+            lines.append(f"[Chunk {chunk_id}] (similarity: {score:.3f}) {source}")
+
+            # Show top 3 most relevant sentences from this chunk
+            sents = sorted(chunk_sentences[chunk_id], key=lambda s: s["similarity"], reverse=True)
+            for s in sents[:3]:
+                snippet = s["sentence"][:150]
+                lines.append(f"  > {snippet}")
+                all_matched_text.append(snippet)
+
+        result = "\n".join(lines)
+
+        # Token counting
+        retrieved_tokens = len(_tokenizer.encode("\n".join(all_matched_text))) if all_matched_text else 0
+
+        context.add_retrieval_log(
+            tool_name="semantic_search",
+            tokens=retrieved_tokens,
+            metadata={
+                "query": query,
+                "chunks_found": len(ranked),
+                "chunk_ids": chunk_ids,
+            },
+        )
+
+        return result, {
+            "matches": len(ranked),
+            "query": query,
+            "retrieved_tokens": retrieved_tokens,
+            "chunk_ids": chunk_ids,
+        }

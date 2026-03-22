@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.venv
+.git
+frontend/node_modules
+frontend/.svelte-kit
+data/pdfs
+/tmp
+scripts/
