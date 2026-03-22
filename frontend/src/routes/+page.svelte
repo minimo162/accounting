@@ -351,6 +351,7 @@
       return cells.slice(0, colCount);
     });
 
+    // Desktop: normal table
     let table = '<div class="table-wrap"><table><thead><tr>';
     for (const h of headers) {
       table += `<th>${formatCell(h)}</th>`;
@@ -364,7 +365,24 @@
       table += '</tr>';
     }
     table += '</tbody></table></div>';
-    return table;
+
+    // Mobile: card layout
+    let cards = '<div class="table-cards">';
+    for (const row of rows) {
+      cards += '<div class="table-card">';
+      for (let c = 0; c < colCount; c++) {
+        const label = headers[c] || '';
+        const value = row[c] || '';
+        cards += `<div class="table-card-field">`;
+        cards += `<div class="table-card-label">${formatCell(label)}</div>`;
+        cards += `<div class="table-card-value">${formatCell(value)}</div>`;
+        cards += `</div>`;
+      }
+      cards += '</div>';
+    }
+    cards += '</div>';
+
+    return table + cards;
   }
 </script>
 
@@ -559,10 +577,10 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    flex: 1;
     text-align: center;
     gap: 0.75rem;
     color: #71717a;
+    min-height: calc(100dvh - 140px);
   }
 
   .welcome-icon {
@@ -608,6 +626,12 @@
 
   .message {
     display: flex;
+    animation: fadeIn 0.3s ease;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   .message.user {
@@ -791,7 +815,8 @@
   }
 
   textarea:focus {
-    border-color: #3f3f46;
+    border-color: #2563eb;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
   }
 
   textarea::placeholder {
@@ -878,44 +903,68 @@
   }
 
   :global(.table-wrap) {
-    overflow-x: auto;
-    margin: 0.5rem 0;
-    border-radius: 0.5rem;
-    border: 1px solid #2a2a35;
-  }
-
-  :global(table) {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.8rem;
-  }
-
-  :global(th) {
-    background: #16161e;
-    color: #e4e4e7;
-    font-weight: 600;
-    text-align: left;
-    padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid #3a3a45;
-  }
-
-  :global(td) {
-    padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid #2a2a35;
-    color: #b4b4be;
-    vertical-align: top;
-  }
-
-  :global(tr:last-child td) {
-    border-bottom: none;
-  }
-
-  :global(tr:hover td) {
-    background: #16161e;
+    display: none;
   }
 
   :global(.ref-tag) {
     color: #60a5fa;
     font-size: 0.8em;
+  }
+
+  :global(.table-cards) {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin: 0.5rem 0;
+  }
+
+  :global(.table-card) {
+    background: #131318;
+    border: 1px solid #2a2a35;
+    border-radius: 0.6rem;
+    padding: 0.85rem 1rem;
+    border-left: 3px solid #2563eb;
+  }
+
+  :global(.table-card-field) {
+    padding: 0.35rem 0;
+    border-bottom: 1px solid #1e1e28;
+  }
+
+  :global(.table-card-field:last-child) {
+    border-bottom: none;
+  }
+
+  :global(.table-card-label) {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #60a5fa;
+    margin-bottom: 0.15rem;
+    letter-spacing: 0.03em;
+  }
+
+  :global(.table-card-value) {
+    font-size: 0.85rem;
+    color: #d8d8de;
+    line-height: 1.6;
+  }
+
+  @media (max-width: 768px) {
+    .bubble {
+      max-width: 95%;
+    }
+
+    main {
+      padding: 1rem;
+    }
+
+    header {
+      padding: 0.75rem 1rem;
+    }
+
+    footer {
+      padding: 0.75rem 1rem;
+    }
+
   }
 </style>

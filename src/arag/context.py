@@ -24,7 +24,6 @@ class AgentContext:
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)
-        self.total_retrieved_tokens += token_count
 
     def is_chunk_read(self, chunk_id: str) -> bool:
         return chunk_id in self.read_chunk_ids

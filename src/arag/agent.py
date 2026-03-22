@@ -14,7 +14,16 @@ from .tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+WRAP_UP_HINT = (
+    "【システム通知】検索ステップが多くなっています。"
+    "これまでに収集した情報で十分回答できる場合は、追加検索せずに最終回答を提供してください。"
+    "完全な情報が得られなくても、現在の情報に基づいて回答し、不足部分はその旨を明記してください。"
+)
+
+
 class Agent:
+    NUDGE_AT_LOOP = 8  # After this many loops, hint the LLM to wrap up
+
     def __init__(self, config: Config, tools: ToolRegistry, chunk_map: dict[str, dict] | None = None):
         self.config = config
         self.llm = LLMClient(config.llm)
@@ -23,6 +32,11 @@ class Agent:
         self.max_loops = config.agent.max_loops
         self.max_token_budget = config.agent.max_token_budget
         self.verbose = config.agent.verbose
+
+    def _maybe_nudge(self, messages: list[dict], loop_idx: int):
+        """Inject a wrap-up hint if we've been searching too long."""
+        if loop_idx == self.NUDGE_AT_LOOP:
+            messages.append({"role": "user", "content": WRAP_UP_HINT})
 
     def run(self, question: str) -> dict[str, Any]:
         """Synchronous run: returns final answer with metadata."""
@@ -37,6 +51,8 @@ class Agent:
         for loop_idx in range(self.max_loops):
             if self.verbose:
                 logger.info(f"Loop {loop_idx + 1}/{self.max_loops}")
+
+            self._maybe_nudge(messages, loop_idx)
 
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
@@ -104,6 +120,8 @@ class Agent:
         total_cost = 0.0
 
         for loop_idx in range(self.max_loops):
+            self._maybe_nudge(messages, loop_idx)
+
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
             if current_tokens > self.max_token_budget:
@@ -167,6 +185,8 @@ class Agent:
 
         for loop_idx in range(self.max_loops):
             yield {"type": "status", "data": f"検索中... (ステップ {loop_idx + 1})"}
+
+            self._maybe_nudge(messages, loop_idx)
 
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
