@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from typing import Any, AsyncGenerator
 
 from .config import Config
@@ -151,7 +152,11 @@ class Agent:
         return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
 
     async def arun_stream(self, question: str) -> AsyncGenerator[dict, None]:
-        """Async streaming run - yields events for SSE."""
+        """Async streaming run - yields events for SSE.
+
+        Tool-calling loops use non-streaming (need full response for tool parsing).
+        Final answer is streamed token-by-token via answer_delta events.
+        """
         context = AgentContext()
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -166,19 +171,9 @@ class Agent:
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
             if current_tokens > self.max_token_budget:
-                answer, cost = await self._aforce_final_answer(messages)
-                total_cost += cost
-                yield {"type": "answer", "data": answer}
-                yield {
-                    "type": "done",
-                    "data": {
-                        "loops": loop_idx + 1,
-                        "stop_reason": "budget_exceeded",
-                        **context.get_summary(),
-                        "total_cost": total_cost,
-                        "references": self._get_referenced_chunks(context),
-                    },
-                }
+                yield {"type": "status", "data": "回答を生成中..."}
+                async for event in self._astream_final_answer(messages, context, loop_idx + 1, "budget_exceeded", total_cost):
+                    yield event
                 return
 
             response = await self.llm.achat(messages=messages, tools=tool_schemas)
@@ -188,9 +183,13 @@ class Agent:
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                # Final answer
-                answer = message.get("content", "")
-                yield {"type": "answer", "data": answer}
+                # LLM produced final answer - strip chunk refs and simulate streaming
+                answer = self._strip_chunk_refs(message.get("content", ""))
+                yield {"type": "status", "data": "回答を生成中..."}
+                chunk_size = 8
+                for i in range(0, len(answer), chunk_size):
+                    yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
+                yield {"type": "answer_done", "data": answer}
                 yield {
                     "type": "done",
                     "data": {
@@ -230,15 +229,33 @@ class Agent:
                     "content": result_text,
                 })
 
-        # Force final answer
+        # Max loops - force final answer with streaming
+        yield {"type": "status", "data": "回答を生成中..."}
+        async for event in self._astream_final_answer(messages, context, self.max_loops, "max_loops", total_cost):
+            yield event
+
+    async def _astream_final_answer(
+        self,
+        messages: list[dict],
+        context: AgentContext,
+        loops: int,
+        stop_reason: str,
+        total_cost: float,
+    ) -> AsyncGenerator[dict, None]:
+        """Force a final answer and simulate streaming output."""
         answer, cost = await self._aforce_final_answer(messages)
+        answer = self._strip_chunk_refs(answer)
         total_cost += cost
-        yield {"type": "answer", "data": answer}
+
+        chunk_size = 8
+        for i in range(0, len(answer), chunk_size):
+            yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
+        yield {"type": "answer_done", "data": answer}
         yield {
             "type": "done",
             "data": {
-                "loops": self.max_loops,
-                "stop_reason": "max_loops",
+                "loops": loops,
+                "stop_reason": stop_reason,
                 **context.get_summary(),
                 "total_cost": total_cost,
                 "references": self._get_referenced_chunks(context),
@@ -269,17 +286,40 @@ class Agent:
         response = await self.llm.achat(messages=messages_copy, tools=None, temperature=0.0)
         return response["message"].get("content", ""), response.get("cost", 0.0)
 
+    @staticmethod
+    def _strip_chunk_refs(text: str) -> str:
+        """Remove any remaining Chunk ID references from the answer."""
+        # Remove patterns like: 【Chunk 123】, [Chunk 123], (Chunk 123), Chunk123, Chunk 123
+        text = re.sub(r'[【\[\(]\s*Chunk\s*\d+\s*[】\]\)]', '', text)
+        text = re.sub(r'\bChunk\s*\d+\b', '', text)
+        # Clean up any resulting double spaces or orphaned punctuation
+        text = re.sub(r'  +', ' ', text)
+        text = re.sub(r' ([。、，,.])', r'\1', text)
+        return text
+
     def _get_referenced_chunks(self, context: AgentContext) -> list[dict]:
-        """Get full text of all chunks that were read during the query."""
+        """Get full text of all chunks that were referenced (read or found via search)."""
+        # Collect all chunk IDs from read_chunks AND search retrieval logs
+        all_chunk_ids: set[str] = set(context.read_chunk_ids)
+        for log in context.retrieval_logs:
+            chunk_ids = log.metadata.get("chunk_ids", [])
+            all_chunk_ids.update(chunk_ids)
+
         refs = []
-        for chunk_id in sorted(context.read_chunk_ids, key=lambda x: int(x) if x.isdigit() else 0):
+        seen_sources = set()
+        for chunk_id in sorted(all_chunk_ids, key=lambda x: int(x) if x.isdigit() else 0):
             chunk = self.chunk_map.get(chunk_id)
             if chunk:
-                refs.append({
-                    "id": chunk_id,
-                    "source": chunk.get("source", ""),
-                    "text": chunk["text"],
-                })
+                source = chunk.get("source", "")
+                # Deduplicate by source to avoid showing multiple pages of same doc
+                # unless they were explicitly read
+                if chunk_id in context.read_chunk_ids or source not in seen_sources:
+                    seen_sources.add(source)
+                    refs.append({
+                        "id": chunk_id,
+                        "source": source,
+                        "text": chunk["text"],
+                    })
         return refs
 
     def _build_result(
@@ -291,7 +331,7 @@ class Agent:
         total_cost: float,
     ) -> dict[str, Any]:
         return {
-            "answer": answer,
+            "answer": self._strip_chunk_refs(answer),
             "loops": loops,
             "stop_reason": stop_reason,
             "total_cost": total_cost,

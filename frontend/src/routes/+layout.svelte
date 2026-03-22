@@ -25,7 +25,7 @@
 
   :global(body) {
     font-family: 'Noto Sans JP', sans-serif;
-    background: #0f0f12;
+    background: #0c0c10;
     color: #e4e4e7;
     height: 100%;
     height: 100dvh;

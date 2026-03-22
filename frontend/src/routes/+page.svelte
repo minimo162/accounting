@@ -31,6 +31,21 @@
     }
   }
 
+  function scrollToMessage(idx: number) {
+    if (chatContainer) {
+      // Wait for DOM to update, then scroll
+      setTimeout(() => {
+        const msgs = chatContainer.querySelectorAll('.message');
+        const header = chatContainer.querySelector('header');
+        const headerHeight = header?.offsetHeight ?? 60;
+        if (msgs[idx]) {
+          const msgTop = (msgs[idx] as HTMLElement).offsetTop;
+          chatContainer.scrollTop = msgTop - headerHeight - 16;
+        }
+      }, 50);
+    }
+  }
+
   async function sendMessage() {
     const question = input.trim();
     if (!question || loading) return;
@@ -58,6 +73,8 @@
       const decoder = new TextDecoder();
       let buffer = '';
       let answerContent = '';
+      let streamingStarted = false;
+      let answerIdx = -1;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -73,8 +90,10 @@
             const event = JSON.parse(line.slice(6));
 
             if (event.type === 'status') {
-              messages[statusIdx] = { role: 'status', content: event.data };
-              messages = [...messages];
+              if (!streamingStarted) {
+                messages[statusIdx] = { role: 'status', content: event.data };
+                messages = [...messages];
+              }
             } else if (event.type === 'tool_call') {
               const toolName = event.data.tool;
               const toolLabels: Record<string, string> = {
@@ -87,20 +106,76 @@
                 content: `${toolLabels[toolName] || toolName}を実行中...`,
               };
               messages = [...messages];
-            } else if (event.type === 'answer') {
+            } else if (event.type === 'answer_delta') {
+              // Streaming token
+              if (!streamingStarted) {
+                streamingStarted = true;
+                // Replace status with empty assistant message
+                messages[statusIdx] = {
+                  role: 'assistant',
+                  content: '',
+                };
+                answerIdx = statusIdx;
+                answerContent = '';
+                // Scroll to show the top of the answer message
+                scrollToMessage(answerIdx);
+              }
+              answerContent += event.data;
+              messages[answerIdx] = {
+                ...messages[answerIdx],
+                content: answerContent,
+              };
+              messages = [...messages];
+              // Don't auto-scroll during streaming - user reads from the top
+            } else if (event.type === 'answer_done') {
+              // Final complete answer
               answerContent = event.data;
-            } else if (event.type === 'done') {
+              if (answerIdx >= 0) {
+                messages[answerIdx] = {
+                  ...messages[answerIdx],
+                  content: answerContent,
+                };
+                messages = [...messages];
+              }
+            } else if (event.type === 'answer') {
+              // Legacy non-streaming answer (fallback)
+              answerContent = event.data;
+            } else if (event.type === 'error') {
+              // Server error
               messages = messages.filter((_, i) => i !== statusIdx);
               messages = [
                 ...messages,
-                {
-                  role: 'assistant',
-                  content: answerContent,
-                  metadata: event.data,
-                },
+                { role: 'assistant', content: event.data },
               ];
+              loading = false;
+              return;
+            } else if (event.type === 'done') {
+              if (!streamingStarted) {
+                // Non-streaming fallback
+                messages = messages.filter((_, i) => i !== statusIdx);
+                messages = [
+                  ...messages,
+                  {
+                    role: 'assistant',
+                    content: answerContent,
+                    metadata: event.data,
+                  },
+                ];
+              } else {
+                // Update metadata on the already-displayed message
+                if (answerIdx >= 0) {
+                  messages[answerIdx] = {
+                    ...messages[answerIdx],
+                    metadata: event.data,
+                  };
+                  messages = [...messages];
+                }
+              }
             }
-            scrollToBottom();
+            // Only auto-scroll for non-streaming events (status, tool_call)
+            if (!streamingStarted) {
+              scrollToBottom();
+            }
           } catch {
             // ignore parse errors
           }
@@ -114,7 +189,6 @@
       ];
     } finally {
       loading = false;
-      scrollToBottom();
     }
   }
 
@@ -136,45 +210,94 @@
   function formatMarkdown(text: string): string {
     if (!text) return '';
 
-    // Split into blocks by double newlines
-    const blocks = text.split(/\n\n+/);
+    // Pre-process: convert literal <br> tags to newlines, but preserve them inside table rows
+    // First, temporarily replace <br> inside table rows (lines starting with |) with a placeholder
+    text = text.replace(/^(\|.*)\n?$/gm, (match) => match.replace(/<br\s*\/?>/gi, '\u200B'));
+    // Then convert remaining <br> tags to newlines
+    text = text.replace(/<br\s*\/?>/gi, '\n');
+
+    // Pre-process: extract tables first (they may span across double newlines)
+    // A table starts with a line containing |, followed by a separator line with dashes
+    const allLines = text.split('\n');
+    const segments: { type: 'table' | 'text'; content: string }[] = [];
+    let i = 0;
+
+    while (i < allLines.length) {
+      // Check if current line starts a table
+      if (
+        i + 1 < allLines.length &&
+        allLines[i].includes('|') &&
+        isSeparatorLine(allLines[i + 1])
+      ) {
+        // Collect all table lines
+        const tableLines: string[] = [allLines[i], allLines[i + 1]];
+        i += 2;
+        while (i < allLines.length && allLines[i].includes('|') && allLines[i].trim() !== '') {
+          tableLines.push(allLines[i]);
+          i++;
+        }
+        segments.push({ type: 'table', content: tableLines.join('\n') });
+      } else {
+        // Collect text lines until next table or end
+        const textLines: string[] = [];
+        while (i < allLines.length) {
+          if (
+            i + 1 < allLines.length &&
+            allLines[i].includes('|') &&
+            isSeparatorLine(allLines[i + 1])
+          ) {
+            break;
+          }
+          textLines.push(allLines[i]);
+          i++;
+        }
+        const joined = textLines.join('\n').trim();
+        if (joined) {
+          segments.push({ type: 'text', content: joined });
+        }
+      }
+    }
+
     const html: string[] = [];
 
-    for (const block of blocks) {
-      const trimmed = block.trim();
-      if (!trimmed) continue;
-
-      // Check if it's a markdown table
-      const lines = trimmed.split('\n');
-      if (lines.length >= 2 && lines[0].includes('|') && lines[1].match(/^\|[\s\-:|]+\|$/)) {
-        html.push(renderTable(lines));
+    for (const seg of segments) {
+      if (seg.type === 'table') {
+        html.push(renderTable(seg.content.split('\n')));
         continue;
       }
 
-      // Check if it's a heading
-      const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/m);
-      if (headingMatch && lines.length === 1) {
-        const level = headingMatch[1].length;
-        const content = escapeHtml(headingMatch[2]);
-        html.push(`<h${level + 2}>${inlineFormat(content)}</h${level + 2}>`);
-        continue;
-      }
+      // Split text into blocks by double newlines
+      const blocks = seg.content.split(/\n\n+/);
+      for (const block of blocks) {
+        const trimmed = block.trim();
+        if (!trimmed) continue;
+        const lines = trimmed.split('\n');
 
-      // Check if it's a list
-      if (lines.every(l => l.match(/^\s*[-・•]\s/) || l.match(/^\s*\d+\.\s/) || l.trim() === '')) {
-        const items = lines.filter(l => l.trim()).map(l => {
-          const content = l.replace(/^\s*[-・•]\s*/, '').replace(/^\s*\d+\.\s*/, '');
-          return `<li>${inlineFormat(escapeHtml(content))}</li>`;
-        });
-        const isOrdered = lines[0]?.match(/^\s*\d+\.\s/);
-        const tag = isOrdered ? 'ol' : 'ul';
-        html.push(`<${tag}>${items.join('')}</${tag}>`);
-        continue;
-      }
+        // Check if it's a heading
+        const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/m);
+        if (headingMatch && lines.length === 1) {
+          const level = headingMatch[1].length;
+          const content = escapeHtml(headingMatch[2]);
+          html.push(`<h${level + 2}>${inlineFormat(content)}</h${level + 2}>`);
+          continue;
+        }
 
-      // Regular paragraph
-      const escaped = lines.map(l => inlineFormat(escapeHtml(l))).join('<br>');
-      html.push(`<p>${escaped}</p>`);
+        // Check if it's a list
+        if (lines.every(l => l.match(/^\s*[-・•]\s/) || l.match(/^\s*\d+\.\s/) || l.trim() === '')) {
+          const items = lines.filter(l => l.trim()).map(l => {
+            const content = l.replace(/^\s*[-・•]\s*/, '').replace(/^\s*\d+\.\s*/, '');
+            return `<li>${inlineFormat(escapeHtml(content))}</li>`;
+          });
+          const isOrdered = lines[0]?.match(/^\s*\d+\.\s/);
+          const tag = isOrdered ? 'ol' : 'ul';
+          html.push(`<${tag}>${items.join('')}</${tag}>`);
+          continue;
+        }
+
+        // Regular paragraph
+        const escaped = lines.map(l => inlineFormat(escapeHtml(l))).join('<br>');
+        html.push(`<p>${escaped}</p>`);
+      }
     }
 
     return html.join('');
@@ -195,22 +318,48 @@
       .replace(/【(.*?)】/g, '<span class="ref-tag">$1</span>');
   }
 
-  function renderTable(lines: string[]): string {
-    const parseRow = (line: string) =>
-      line.split('|').filter((_, i, a) => i > 0 && i < a.length - 1).map(c => c.trim());
+  function isSeparatorLine(line: string): boolean {
+    if (!line) return false;
+    const trimmed = line.trim();
+    // Match separator patterns: |---|---|, | --- | --- |, |:--:|--:|, etc.
+    // Must contain at least one dash sequence between pipes
+    return /^\|?[\s\-:|\u2014]+\|?$/.test(trimmed) && trimmed.includes('-');
+  }
 
+  function parseRow(line: string): string[] {
+    const trimmed = line.trim();
+    // Split by | and handle leading/trailing pipes
+    const parts = trimmed.split('|');
+    // Remove empty first/last if line starts/ends with |
+    if (parts.length > 0 && parts[0].trim() === '') parts.shift();
+    if (parts.length > 0 && parts[parts.length - 1].trim() === '') parts.pop();
+    return parts.map(c => c.trim());
+  }
+
+  function formatCell(text: string): string {
+    // Restore placeholders to <br> for in-cell line breaks, then apply formatting
+    const withBreaks = escapeHtml(text).replace(/\u200B/g, '<br>');
+    return inlineFormat(withBreaks);
+  }
+
+  function renderTable(lines: string[]): string {
     const headers = parseRow(lines[0]);
-    const rows = lines.slice(2).filter(l => l.includes('|')).map(parseRow);
+    const colCount = headers.length;
+    const rows = lines.slice(2).filter(l => l.includes('|')).map(l => {
+      const cells = parseRow(l);
+      while (cells.length < colCount) cells.push('');
+      return cells.slice(0, colCount);
+    });
 
     let table = '<div class="table-wrap"><table><thead><tr>';
     for (const h of headers) {
-      table += `<th>${inlineFormat(escapeHtml(h))}</th>`;
+      table += `<th>${formatCell(h)}</th>`;
     }
     table += '</tr></thead><tbody>';
     for (const row of rows) {
       table += '<tr>';
       for (const cell of row) {
-        table += `<td>${inlineFormat(escapeHtml(cell))}</td>`;
+        table += `<td>${formatCell(cell)}</td>`;
       }
       table += '</tr>';
     }
@@ -220,14 +369,17 @@
 </script>
 
 <div class="app">
-  <header>
-    <button class="header-inner" onclick={resetChat}>
-      <h1>会計基準 Q&A</h1>
-      <p class="subtitle">日本の会計基準についてAIが回答します</p>
-    </button>
-  </header>
+  <div class="scroll-outer" bind:this={chatContainer}>
+    <header>
+      <div class="header-wrap">
+        <button class="header-inner" onclick={resetChat}>
+          <h1>会計基準 Q&A</h1>
+          <p class="subtitle">日本の会計基準についてAIが回答します</p>
+        </button>
+      </div>
+    </header>
 
-  <main bind:this={chatContainer}>
+    <main>
     {#if messages.length === 0}
       <div class="welcome">
         <div class="welcome-icon">&#x1f4d1;</div>
@@ -293,7 +445,8 @@
         </div>
       {/if}
     {/each}
-  </main>
+    </main>
+  </div>
 
   <footer>
     <div class="input-area">
@@ -321,18 +474,47 @@
     flex-direction: column;
     height: 100%;
     height: 100dvh;
-    max-width: 900px;
-    margin: 0 auto;
     overflow: hidden;
   }
 
+  .scroll-outer {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #3f3f46 transparent;
+  }
+
+  .scroll-outer::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .scroll-outer::-webkit-scrollbar-track {
+    background: #0c0c10;
+  }
+
+  .scroll-outer::-webkit-scrollbar-thumb {
+    background: #3f3f46;
+    border-radius: 4px;
+  }
+
+  .scroll-outer::-webkit-scrollbar-thumb:hover {
+    background: #52525b;
+  }
+
   header {
-    flex-shrink: 0;
-    padding: 1rem 1.5rem;
-    border-bottom: 1px solid #1e1e26;
-    backdrop-filter: blur(8px);
-    background: rgba(15, 15, 18, 0.85);
+    position: sticky;
+    top: 0;
     z-index: 10;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid #1e1e28;
+    backdrop-filter: blur(12px);
+    background: rgba(12, 12, 16, 0.92);
+  }
+
+  .header-wrap {
+    max-width: 900px;
+    margin: 0 auto;
   }
 
   .header-inner {
@@ -358,37 +540,18 @@
 
   .subtitle {
     font-size: 0.8rem;
-    color: #71717a;
+    color: #8b8b95;
     margin-top: 0.15rem;
   }
 
   main {
-    flex: 1 1 0;
-    min-height: 0;
-    overflow-y: auto;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
     padding: 1.5rem;
     display: flex;
     flex-direction: column;
     gap: 1rem;
-    scrollbar-width: thin;
-    scrollbar-color: #27272a transparent;
-  }
-
-  main::-webkit-scrollbar {
-    width: 6px;
-  }
-
-  main::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  main::-webkit-scrollbar-thumb {
-    background: #27272a;
-    border-radius: 3px;
-  }
-
-  main::-webkit-scrollbar-thumb:hover {
-    background: #3f3f46;
   }
 
   .welcome {
@@ -426,8 +589,8 @@
   }
 
   .examples button {
-    background: #1e1e26;
-    border: 1px solid #27272a;
+    background: #1a1a23;
+    border: 1px solid #2a2a35;
     color: #a1a1aa;
     padding: 0.5rem 1rem;
     border-radius: 0.75rem;
@@ -438,9 +601,9 @@
   }
 
   .examples button:hover {
-    background: #27272a;
+    background: #252530;
     color: #e4e4e7;
-    border-color: #3f3f46;
+    border-color: #3f3f4a;
   }
 
   .message {
@@ -456,11 +619,11 @@
   }
 
   .bubble {
-    max-width: 80%;
-    padding: 0.75rem 1rem;
+    max-width: 75%;
+    padding: 1rem 1.25rem;
     border-radius: 1rem;
     font-size: 0.9rem;
-    line-height: 1.6;
+    line-height: 1.7;
     word-break: break-word;
   }
 
@@ -471,10 +634,11 @@
   }
 
   .assistant-bubble {
-    background: #1e1e26;
-    color: #e4e4e7;
+    background: #1c1c28;
+    color: #d8d8de;
     border-bottom-left-radius: 0.25rem;
-    border: 1px solid #27272a;
+    border: 1px solid #32323e;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
   }
 
   .status-bubble {
@@ -490,7 +654,7 @@
   .references {
     margin-top: 0.75rem;
     padding-top: 0.75rem;
-    border-top: 1px solid #27272a;
+    border-top: 1px solid #2a2a35;
   }
 
   .references details {
@@ -530,8 +694,8 @@
   }
 
   .ref-item {
-    background: #16161b;
-    border: 1px solid #27272a;
+    background: #131318;
+    border: 1px solid #2a2a35;
     border-radius: 0.5rem;
     padding: 0.75rem;
     font-size: 0.8rem;
@@ -588,20 +752,22 @@
   .meta {
     margin-top: 0.5rem;
     padding-top: 0.5rem;
-    border-top: 1px solid #27272a;
+    border-top: 1px solid #2a2a35;
     font-size: 0.7rem;
-    color: #52525b;
+    color: #5a5a65;
   }
 
   footer {
     flex-shrink: 0;
     padding: 1rem 1.5rem;
-    border-top: 1px solid #1e1e26;
-    background: rgba(15, 15, 18, 0.95);
-    backdrop-filter: blur(8px);
+    border-top: 1px solid #1e1e28;
+    background: rgba(12, 12, 16, 0.95);
+    backdrop-filter: blur(12px);
   }
 
   .input-area {
+    max-width: 900px;
+    margin: 0 auto;
     display: flex;
     gap: 0.75rem;
     align-items: flex-end;
@@ -609,8 +775,8 @@
 
   textarea {
     flex: 1;
-    background: #1e1e26;
-    border: 1px solid #27272a;
+    background: #141419;
+    border: 1px solid #2a2a35;
     color: #e4e4e7;
     padding: 0.75rem 1rem;
     border-radius: 0.75rem;
@@ -715,7 +881,7 @@
     overflow-x: auto;
     margin: 0.5rem 0;
     border-radius: 0.5rem;
-    border: 1px solid #27272a;
+    border: 1px solid #2a2a35;
   }
 
   :global(table) {
@@ -725,19 +891,18 @@
   }
 
   :global(th) {
-    background: #1a1a22;
-    color: #d4d4d8;
+    background: #16161e;
+    color: #e4e4e7;
     font-weight: 600;
     text-align: left;
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid #3f3f46;
-    white-space: nowrap;
+    border-bottom: 1px solid #3a3a45;
   }
 
   :global(td) {
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid #27272a;
-    color: #a1a1aa;
+    border-bottom: 1px solid #2a2a35;
+    color: #b4b4be;
     vertical-align: top;
   }
 
@@ -746,7 +911,7 @@
   }
 
   :global(tr:hover td) {
-    background: #1a1a22;
+    background: #16161e;
   }
 
   :global(.ref-tag) {

@@ -130,6 +130,47 @@ class LLMClient:
             "finish_reason": choice.get("finish_reason"),
         }
 
+    async def astream_chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ):
+        """Async streaming chat - yields content deltas."""
+        url = f"{self.config.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else self.config.temperature,
+            "max_tokens": max_tokens or self.config.max_tokens,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk["choices"][0].get("delta", {})
+                            content = delta.get("content")
+                            if content:
+                                yield content
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
     def stream_chat(
         self,
         messages: list[dict],

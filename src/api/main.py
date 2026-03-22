@@ -132,8 +132,13 @@ async def ask_question_stream(req: QuestionRequest):
     agent = get_agent()
 
     async def event_generator():
-        async for event in agent.arun_stream(req.question):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        try:
+            async for event in agent.arun_stream(req.question):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            error_event = {"type": "error", "data": f"エラーが発生しました: {str(e)}"}
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),
