@@ -105,15 +105,21 @@ def _init_agent() -> Agent:
     return Agent(config=config, tools=registry, chunk_map=chunk_map)
 
 
+class ConversationTurn(BaseModel):
+    question: str
+    answer: str
+
+
 class QuestionRequest(BaseModel):
     question: str
+    history: list[ConversationTurn] = []
 
 
 @app.post("/api/ask")
 async def ask_question(req: QuestionRequest):
     """Non-streaming endpoint."""
     agent = get_agent()
-    result = await agent.arun(req.question)
+    result = await agent.arun(req.question, history=req.history)
     return {
         "answer": result["answer"],
         "metadata": {
@@ -133,7 +139,7 @@ async def ask_question_stream(req: QuestionRequest):
 
     async def event_generator():
         try:
-            async for event in agent.arun_stream(req.question):
+            async for event in agent.arun_stream(req.question, history=req.history):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}")

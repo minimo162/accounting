@@ -60,10 +60,25 @@
     scrollToBottom();
 
     try {
+      // Build conversation history from previous messages
+      const history: { question: string; answer: string }[] = [];
+      for (let h = 0; h < messages.length - 1; h++) {
+        const msg = messages[h];
+        if (msg.role === 'user' && h + 1 < messages.length) {
+          // Find the next assistant message
+          for (let j = h + 1; j < messages.length; j++) {
+            if (messages[j].role === 'assistant') {
+              history.push({ question: msg.content, answer: messages[j].content });
+              break;
+            }
+          }
+        }
+      }
+
       const response = await fetch(`${API_BASE}/api/ask/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, history }),
       });
 
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -75,6 +90,7 @@
       let answerContent = '';
       let streamingStarted = false;
       let answerIdx = -1;
+      let collectedRefs: Reference[] = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -140,6 +156,9 @@
             } else if (event.type === 'answer') {
               // Legacy non-streaming answer (fallback)
               answerContent = event.data;
+            } else if (event.type === 'reference') {
+              // Collect references sent individually
+              collectedRefs = [...collectedRefs, event.data as Reference];
             } else if (event.type === 'error') {
               // Server error
               messages = messages.filter((_, i) => i !== statusIdx);
@@ -150,6 +169,11 @@
               loading = false;
               return;
             } else if (event.type === 'done') {
+              // Merge collected references into metadata
+              const metadata = {
+                ...event.data,
+                references: collectedRefs.length > 0 ? collectedRefs : event.data.references,
+              };
               if (!streamingStarted) {
                 // Non-streaming fallback
                 messages = messages.filter((_, i) => i !== statusIdx);
@@ -158,7 +182,7 @@
                   {
                     role: 'assistant',
                     content: answerContent,
-                    metadata: event.data,
+                    metadata,
                   },
                 ];
               } else {
@@ -166,7 +190,7 @@
                 if (answerIdx >= 0) {
                   messages[answerIdx] = {
                     ...messages[answerIdx],
-                    metadata: event.data,
+                    metadata,
                   };
                   messages = [...messages];
                 }
@@ -266,38 +290,71 @@
         continue;
       }
 
-      // Split text into blocks by double newlines
-      const blocks = seg.content.split(/\n\n+/);
-      for (const block of blocks) {
-        const trimmed = block.trim();
-        if (!trimmed) continue;
-        const lines = trimmed.split('\n');
+      // Split text into lines and process each line contextually
+      const allBlockLines = seg.content.split('\n');
+      let currentParagraph: string[] = [];
 
-        // Check if it's a heading
-        const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/m);
-        if (headingMatch && lines.length === 1) {
+      const flushParagraph = () => {
+        if (currentParagraph.length > 0) {
+          const escaped = currentParagraph.map(l => inlineFormat(escapeHtml(l))).join('<br>');
+          html.push(`<p>${escaped}</p>`);
+          currentParagraph = [];
+        }
+      };
+
+      const isListLine = (l: string) =>
+        l.match(/^\s*[-・•*]\s/) || l.match(/^\s*\d+\.\s/);
+
+      for (let li = 0; li < allBlockLines.length; li++) {
+        const line = allBlockLines[li];
+        const trimmedLine = line.trim();
+
+        // Empty line = paragraph break
+        if (!trimmedLine) {
+          flushParagraph();
+          continue;
+        }
+
+        // Heading
+        const headingMatch = trimmedLine.match(/^(#{1,4})\s+(.+)$/);
+        if (headingMatch) {
+          flushParagraph();
           const level = headingMatch[1].length;
           const content = escapeHtml(headingMatch[2]);
           html.push(`<h${level + 2}>${inlineFormat(content)}</h${level + 2}>`);
           continue;
         }
 
-        // Check if it's a list
-        if (lines.every(l => l.match(/^\s*[-・•]\s/) || l.match(/^\s*\d+\.\s/) || l.trim() === '')) {
-          const items = lines.filter(l => l.trim()).map(l => {
-            const content = l.replace(/^\s*[-・•]\s*/, '').replace(/^\s*\d+\.\s*/, '');
-            return `<li>${inlineFormat(escapeHtml(content))}</li>`;
-          });
-          const isOrdered = lines[0]?.match(/^\s*\d+\.\s/);
+        // List item (-, ・, •, *, or 1.)
+        if (isListLine(line)) {
+          flushParagraph();
+          // Collect consecutive list items
+          const listItems: string[] = [];
+          const isOrdered = !!line.match(/^\s*\d+\.\s/);
+          while (li < allBlockLines.length && (isListLine(allBlockLines[li]) || allBlockLines[li].trim() === '')) {
+            const ll = allBlockLines[li].trim();
+            if (ll === '') {
+              // Check if next line is also a list item (allow blank lines within lists)
+              if (li + 1 < allBlockLines.length && isListLine(allBlockLines[li + 1])) {
+                li++;
+                continue;
+              }
+              break;
+            }
+            const content = ll.replace(/^\s*[-・•*]\s*/, '').replace(/^\s*\d+\.\s*/, '');
+            listItems.push(`<li>${inlineFormat(escapeHtml(content))}</li>`);
+            li++;
+          }
+          li--; // Back up one since the for loop will increment
           const tag = isOrdered ? 'ol' : 'ul';
-          html.push(`<${tag}>${items.join('')}</${tag}>`);
+          html.push(`<${tag}>${listItems.join('')}</${tag}>`);
           continue;
         }
 
-        // Regular paragraph
-        const escaped = lines.map(l => inlineFormat(escapeHtml(l))).join('<br>');
-        html.push(`<p>${escaped}</p>`);
+        // Regular text line
+        currentParagraph.push(trimmedLine);
       }
+      flushParagraph();
     }
 
     return html.join('');
@@ -456,7 +513,7 @@
             {#if msg.metadata}
               <div class="meta">
                 検索ステップ: {msg.metadata.loops ?? '?'} |
-                参照チャンク: {msg.metadata.chunks_read_count ?? '?'}
+                参照: {msg.metadata.references?.length ?? msg.metadata.chunks_read_count ?? '?'}件
               </div>
             {/if}
           </div>

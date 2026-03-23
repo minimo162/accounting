@@ -38,13 +38,29 @@ class Agent:
         if loop_idx == self.NUDGE_AT_LOOP:
             messages.append({"role": "user", "content": WRAP_UP_HINT})
 
-    def run(self, question: str) -> dict[str, Any]:
+    def _build_initial_messages(self, question: str, history: list[dict] | None = None) -> list[dict]:
+        """Build initial messages with optional conversation history."""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        if history:
+            # Include recent conversation turns as context
+            # Keep last 2 turns to avoid token overflow
+            recent = history[-2:]
+            context_text = "以下は直前の会話です。ユーザーの新しい質問が前の話題の続きかどうかを判断し、続きであれば前の文脈を踏まえて検索・回答してください。全く別の話題であれば、独立した質問として扱ってください。\n\n"
+            for turn in recent:
+                q = turn["question"] if isinstance(turn, dict) else turn.question
+                a = turn["answer"] if isinstance(turn, dict) else turn.answer
+                context_text += f"ユーザー: {q}\nアシスタント: {a[:500]}\n\n"
+            messages.append({"role": "user", "content": context_text})
+            messages.append({"role": "assistant", "content": "理解しました。前の会話の文脈を踏まえて、新しい質問に回答します。"})
+
+        messages.append({"role": "user", "content": question})
+        return messages
+
+    def run(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Synchronous run: returns final answer with metadata."""
         context = AgentContext()
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ]
+        messages = self._build_initial_messages(question, history)
         tool_schemas = self.tools.get_schemas()
         total_cost = 0.0
 
@@ -102,6 +118,7 @@ class Agent:
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result_text,
+                    "_func_name": func_name,
                 })
 
         # Max loops exceeded
@@ -109,13 +126,10 @@ class Agent:
         total_cost += cost
         return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
 
-    async def arun(self, question: str) -> dict[str, Any]:
+    async def arun(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Async run."""
         context = AgentContext()
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ]
+        messages = self._build_initial_messages(question, history)
         tool_schemas = self.tools.get_schemas()
         total_cost = 0.0
 
@@ -163,23 +177,21 @@ class Agent:
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result_text,
+                    "_func_name": func_name,
                 })
 
         answer, cost = await self._aforce_final_answer(messages)
         total_cost += cost
         return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
 
-    async def arun_stream(self, question: str) -> AsyncGenerator[dict, None]:
+    async def arun_stream(self, question: str, history: list[dict] | None = None) -> AsyncGenerator[dict, None]:
         """Async streaming run - yields events for SSE.
 
         Tool-calling loops use non-streaming (need full response for tool parsing).
         Final answer is streamed token-by-token via answer_delta events.
         """
         context = AgentContext()
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ]
+        messages = self._build_initial_messages(question, history)
         tool_schemas = self.tools.get_schemas()
         total_cost = 0.0
 
@@ -210,6 +222,9 @@ class Agent:
                 for i in range(0, len(answer), chunk_size):
                     yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
                 yield {"type": "answer_done", "data": answer}
+                # Send references individually to avoid oversized SSE events
+                for ref in self._get_referenced_chunks(context):
+                    yield {"type": "reference", "data": ref}
                 yield {
                     "type": "done",
                     "data": {
@@ -217,7 +232,6 @@ class Agent:
                         "stop_reason": "natural",
                         **context.get_summary(),
                         "total_cost": total_cost,
-                        "references": self._get_referenced_chunks(context),
                     },
                 }
                 return
@@ -247,6 +261,7 @@ class Agent:
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result_text,
+                    "_func_name": func_name,
                 })
 
         # Max loops - force final answer with streaming
@@ -271,6 +286,8 @@ class Agent:
         for i in range(0, len(answer), chunk_size):
             yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
         yield {"type": "answer_done", "data": answer}
+        for ref in self._get_referenced_chunks(context):
+            yield {"type": "reference", "data": ref}
         yield {
             "type": "done",
             "data": {
@@ -278,7 +295,6 @@ class Agent:
                 "stop_reason": stop_reason,
                 **context.get_summary(),
                 "total_cost": total_cost,
-                "references": self._get_referenced_chunks(context),
             },
         }
 

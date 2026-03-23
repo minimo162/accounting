@@ -27,7 +27,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --memory 4Gi \
   --cpu 2 \
   --timeout 300 \
-  --set-env-vars "CEREBRAS_API_KEY=${CEREBRAS_API_KEY},GEMINI_API_KEY=${GEMINI_API_KEY},USE_GCS=true,GCS_BUCKET=jp-accounting-chat-data,GCS_PREFIX=index" \
+  --set-env-vars "GEMINI_API_KEY=${GEMINI_API_KEY},USE_GCS=true,GCS_BUCKET=jp-accounting-chat-data,GCS_PREFIX=index" \
   --min-instances 0 \
   --max-instances 10
 

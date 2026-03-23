@@ -34,7 +34,7 @@ def create_chunks(pdf_dir: str, output_path: str):
     chunks = []
     chunk_id = 0
 
-    for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+    for pdf_path in sorted(pdf_dir.glob("**/*.pdf")):
         print(f"Processing: {pdf_path.name}")
         pages = extract_pages(pdf_path)
 
@@ -53,7 +53,7 @@ def create_chunks(pdf_dir: str, output_path: str):
     with open(output, "w", encoding="utf-8") as f:
         json.dump(chunks, f, ensure_ascii=False, indent=2)
 
-    print(f"Created {len(chunks)} chunks from {len(list(pdf_dir.glob('*.pdf')))} PDFs")
+    print(f"Created {len(chunks)} chunks from {len(list(pdf_dir.glob('**/*.pdf')))} PDFs")
     print(f"Output: {output}")
 
 

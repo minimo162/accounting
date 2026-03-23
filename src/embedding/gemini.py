@@ -39,31 +39,45 @@ class GeminiEmbedder:
             return None
 
     def embed_batch(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[np.ndarray]:
-        """Embed a batch of texts."""
+        """Embed a batch of texts with retry logic."""
+        import time as _time
+
         results = []
-        # Process in smaller batches for API limits
         for i in range(0, len(texts), 50):
             batch = texts[i : i + 50]
-            try:
-                result = self.client.models.embed_content(
-                    model=self.model,
-                    contents=batch,
-                    config={"task_type": task_type},
-                )
-                for emb in result.embeddings:
-                    results.append(np.array(emb.values, dtype=np.float32))
-            except Exception as e:
-                logger.error(f"Batch embedding failed at {i}: {e}")
-                # Try one by one as fallback
+            success = False
+            for retry in range(5):
+                try:
+                    result = self.client.models.embed_content(
+                        model=self.model,
+                        contents=batch,
+                        config={"task_type": task_type},
+                    )
+                    for emb in result.embeddings:
+                        results.append(np.array(emb.values, dtype=np.float32))
+                    success = True
+                    break
+                except Exception as e:
+                    delay = 3 * (2 ** retry)
+                    logger.warning(f"Batch embedding failed at {i} (retry {retry+1}/5): {e}. Waiting {delay}s...")
+                    _time.sleep(delay)
+
+            if not success:
+                logger.error(f"Batch failed after 5 retries at {i}, falling back to individual")
                 for text in batch:
-                    try:
-                        r = self.client.models.embed_content(
-                            model=self.model,
-                            contents=text,
-                            config={"task_type": task_type},
-                        )
-                        results.append(np.array(r.embeddings[0].values, dtype=np.float32))
-                    except Exception as e2:
-                        logger.error(f"Single embedding failed: {e2}")
-                        results.append(np.zeros(3072, dtype=np.float32))
+                    for r_retry in range(3):
+                        try:
+                            r = self.client.models.embed_content(
+                                model=self.model,
+                                contents=text,
+                                config={"task_type": task_type},
+                            )
+                            results.append(np.array(r.embeddings[0].values, dtype=np.float32))
+                            break
+                        except Exception as e2:
+                            if r_retry < 2:
+                                _time.sleep(3 * (2 ** r_retry))
+                            else:
+                                logger.error(f"Single embedding failed: {e2}")
+                                results.append(np.zeros(3072, dtype=np.float32))
         return results

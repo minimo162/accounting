@@ -1,4 +1,10 @@
-"""Build sentence-level embedding index using Gemini embeddings."""
+"""Build sentence-level embedding index using Gemini embeddings.
+
+Features:
+- Checkpoint saving every 5000 sentences (resumes from last checkpoint on restart)
+- Retry with exponential backoff on API errors
+- Progress tracking
+"""
 
 import json
 import os
@@ -16,6 +22,10 @@ from src.embedding.gemini import GeminiEmbedder
 # Japanese-aware sentence splitting
 _SENTENCE_RE = re.compile(r'(?<=[。．.！！\?？\n])\s*')
 
+CHECKPOINT_INTERVAL = 5000  # Save checkpoint every N sentences
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 5  # seconds
+
 
 def split_sentences(text: str) -> list[str]:
     """Split Japanese text into sentences."""
@@ -24,7 +34,7 @@ def split_sentences(text: str) -> list[str]:
 
 
 def build_index(chunks_path: str, output_dir: str, api_key: str):
-    """Build sentence-level embedding index."""
+    """Build sentence-level embedding index with checkpointing."""
     with open(chunks_path, encoding="utf-8") as f:
         chunks = json.load(f)
 
@@ -42,21 +52,66 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
             sentences.append(sent)
             sentence_to_chunk.append(chunk["id"])
 
-    print(f"Split into {len(sentences)} sentences")
+    total_sentences = len(sentences)
+    print(f"Split into {total_sentences} sentences")
 
-    # Embed all sentences
+    # Check for checkpoint
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "checkpoint.pkl"
+
+    all_embeddings = []
+    start_idx = 0
+
+    if checkpoint_path.exists():
+        print("Found checkpoint, resuming...")
+        with open(checkpoint_path, "rb") as f:
+            checkpoint = pickle.load(f)
+        all_embeddings = checkpoint["embeddings"]
+        start_idx = checkpoint["next_idx"]
+        print(f"  Resuming from sentence {start_idx}/{total_sentences} ({len(all_embeddings)} embeddings loaded)")
+
+    # Embed sentences
     embedder = GeminiEmbedder(api_key=api_key, model="gemini-embedding-2-preview")
     print("Embedding sentences with Gemini...")
 
-    all_embeddings = []
     batch_size = 100
-    for i in range(0, len(sentences), batch_size):
+    for i in range(start_idx, total_sentences, batch_size):
         batch = sentences[i : i + batch_size]
-        embeddings = embedder.embed_batch(batch)
-        all_embeddings.extend(embeddings)
-        print(f"  Embedded {min(i + batch_size, len(sentences))}/{len(sentences)}")
-        if i + batch_size < len(sentences):
+
+        # Retry with exponential backoff
+        for retry in range(MAX_RETRIES):
+            try:
+                embeddings = embedder.embed_batch(batch)
+                all_embeddings.extend(embeddings)
+                break
+            except Exception as e:
+                if retry < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** retry)
+                    print(f"  Error at {i}: {e}. Retrying in {delay}s... (attempt {retry + 2}/{MAX_RETRIES})")
+                    time.sleep(delay)
+                else:
+                    print(f"  FATAL: Failed after {MAX_RETRIES} retries at {i}: {e}")
+                    # Save checkpoint before exiting
+                    print(f"  Saving checkpoint at {i}...")
+                    with open(checkpoint_path, "wb") as f:
+                        pickle.dump({"embeddings": all_embeddings, "next_idx": i}, f)
+                    print(f"  Checkpoint saved. Re-run to resume.")
+                    sys.exit(1)
+
+        processed = min(i + batch_size, total_sentences)
+        print(f"  Embedded {processed}/{total_sentences} ({processed * 100 // total_sentences}%)")
+
+        # Save checkpoint periodically
+        if (i - start_idx) > 0 and (i - start_idx) % CHECKPOINT_INTERVAL == 0:
+            print(f"  Saving checkpoint at {processed}...")
+            with open(checkpoint_path, "wb") as f:
+                pickle.dump({"embeddings": all_embeddings, "next_idx": processed}, f)
+
+        if i + batch_size < total_sentences:
             time.sleep(0.5)  # Rate limiting
+
+    print(f"Embedding complete: {len(all_embeddings)} vectors")
 
     embeddings_array = np.array(all_embeddings, dtype=np.float32)
     # Normalize
@@ -65,9 +120,6 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
     embeddings_array = embeddings_array / norms
 
     # Save index
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     index = {
         "sentences": sentences,
         "embeddings": embeddings_array,
@@ -79,6 +131,11 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
     index_path = output_dir / "sentence_index.pkl"
     with open(index_path, "wb") as f:
         pickle.dump(index, f)
+
+    # Clean up checkpoint
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Checkpoint cleaned up")
 
     print(f"Index saved to {index_path}")
     print(f"  Sentences: {len(sentences)}")

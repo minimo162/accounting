@@ -7,15 +7,15 @@ from dataclasses import dataclass, field
 
 @dataclass
 class LLMConfig:
-    model: str = "gpt-oss-120b"
+    model: str = "gemini-3.1-flash-lite-preview"
     api_key: str = ""
-    base_url: str = "https://api.cerebras.ai/v1"
+    base_url: str = ""  # Not used for Gemini
     temperature: float = 0.0
     max_tokens: int = 16384
 
     def __post_init__(self):
         if not self.api_key:
-            self.api_key = os.getenv("CEREBRAS_API_KEY", "")
+            self.api_key = os.getenv("GEMINI_API_KEY", "")
 
 
 @dataclass
