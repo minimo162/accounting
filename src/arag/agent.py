@@ -24,11 +24,12 @@ WRAP_UP_HINT = (
 class Agent:
     NUDGE_AT_LOOP = 8  # After this many loops, hint the LLM to wrap up
 
-    def __init__(self, config: Config, tools: ToolRegistry, chunk_map: dict[str, dict] | None = None):
+    def __init__(self, config: Config, tools: ToolRegistry, chunk_map: dict[str, dict] | None = None, pdf_sources: dict[str, str] | None = None):
         self.config = config
         self.llm = LLMClient(config.llm)
         self.tools = tools
         self.chunk_map = chunk_map or {}
+        self.pdf_sources = pdf_sources or {}
         self.max_loops = config.agent.max_loops
         self.max_token_budget = config.agent.max_token_budget
         self.verbose = config.agent.verbose
@@ -351,11 +352,16 @@ class Agent:
                 # unless they were explicitly read
                 if chunk_id in context.read_chunk_ids or source not in seen_sources:
                     seen_sources.add(source)
-                    refs.append({
+                    ref = {
                         "id": chunk_id,
                         "source": source,
                         "text": chunk["text"],
-                    })
+                    }
+                    # Add PDF source URL if available
+                    filename = chunk.get("file", "")
+                    if filename and filename in self.pdf_sources:
+                        ref["url"] = self.pdf_sources[filename]
+                    refs.append(ref)
         return refs
 
     def _build_result(

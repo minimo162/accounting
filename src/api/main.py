@@ -67,6 +67,13 @@ def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
         blob.download_to_filename(str(chunks_path))
         logger.info(f"Downloaded chunks.json ({chunks_path.stat().st_size // 1024} KB)")
 
+    pdf_sources_path = local_dir / "pdf_sources.json"
+    if not pdf_sources_path.exists():
+        pdf_blob = bucket.blob(f"{prefix}/pdf_sources.json")
+        if pdf_blob.exists():
+            pdf_blob.download_to_filename(str(pdf_sources_path))
+            logger.info(f"Downloaded pdf_sources.json")
+
     # Prefer compressed npz + meta format
     npz_blob = bucket.blob(f"{prefix}/sentence_index.npz")
     meta_blob = bucket.blob(f"{prefix}/sentence_meta.pkl")
@@ -121,7 +128,16 @@ def _init_agent() -> Agent:
     registry.register(ReadChunkTool(chunks))
 
     chunk_map = {c["id"]: c for c in chunks}
-    return Agent(config=config, tools=registry, chunk_map=chunk_map)
+
+    # Load PDF source URL mapping
+    pdf_sources_path = data_dir / "pdf_sources.json"
+    pdf_sources = {}
+    if pdf_sources_path.exists():
+        with open(pdf_sources_path) as f:
+            pdf_sources = json.load(f)
+        logger.info(f"Loaded {len(pdf_sources)} PDF source URLs")
+
+    return Agent(config=config, tools=registry, chunk_map=chunk_map, pdf_sources=pdf_sources)
 
 
 class ConversationTurn(BaseModel):

@@ -3,6 +3,7 @@
     id: string;
     source: string;
     text: string;
+    url?: string;
   }
 
   interface Message {
@@ -498,7 +499,14 @@
                     {#each msg.metadata.references as ref}
                       <div class="ref-item">
                         <div class="ref-header">
-                          <span class="ref-source">{ref.source}</span>
+                          {#if ref.url}
+                            <a class="ref-source ref-link" href={ref.url} target="_blank" rel="noopener noreferrer">
+                              {ref.source}
+                              <span class="ref-link-icon">&#x2197;</span>
+                            </a>
+                          {:else}
+                            <span class="ref-source">{ref.source}</span>
+                          {/if}
                         </div>
                         <details class="ref-details">
                           <summary>原文を表示</summary>
@@ -790,6 +798,25 @@
     color: #d4d4d8;
     font-size: 0.8rem;
     font-weight: 500;
+  }
+
+  .ref-link {
+    color: #60a5fa;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    transition: color 0.15s ease;
+  }
+
+  .ref-link:hover {
+    color: #93bbfd;
+    text-decoration: underline;
+  }
+
+  .ref-link-icon {
+    font-size: 0.7rem;
+    opacity: 0.7;
   }
 
   .ref-details {
