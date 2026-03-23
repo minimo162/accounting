@@ -148,8 +148,26 @@ class LLMClient:
 
         Stores raw Content object in _gemini_content for thought signature preservation.
         """
+        if not response.candidates:
+            logger.warning("Gemini returned no candidates")
+            return {
+                "message": {"role": "assistant", "content": "回答を生成できませんでした。再度お試しください。"},
+                "usage": {},
+                "cost": 0.0,
+                "finish_reason": "error",
+            }
+
         candidate = response.candidates[0]
         content = candidate.content
+
+        if content is None:
+            logger.warning(f"Gemini returned empty content, finish_reason={candidate.finish_reason}")
+            return {
+                "message": {"role": "assistant", "content": "回答を生成できませんでした。再度お試しください。"},
+                "usage": {},
+                "cost": 0.0,
+                "finish_reason": candidate.finish_reason.name if candidate.finish_reason else "error",
+            }
 
         message: dict[str, Any] = {
             "role": "assistant",
@@ -159,7 +177,7 @@ class LLMClient:
         tool_calls = []
         text_parts = []
 
-        for part in content.parts:
+        for part in (content.parts or []):
             if part.function_call:
                 fc = part.function_call
                 tool_calls.append({
@@ -201,12 +219,27 @@ class LLMClient:
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         contents, config = self._build_contents_and_config(messages, tools, temperature, max_tokens)
-        response = self.client.models.generate_content(
-            model=self.config.model,
-            contents=contents,
-            config=config,
-        )
-        return self._parse_response(response)
+        import time as _time
+        for attempt in range(3):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.config.model,
+                    contents=contents,
+                    config=config,
+                )
+                return self._parse_response(response)
+            except Exception as e:
+                logger.warning(f"Gemini API error (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    _time.sleep(1 * (attempt + 1))
+                else:
+                    logger.error(f"Gemini API failed after 3 attempts: {e}")
+                    return {
+                        "message": {"role": "assistant", "content": "APIエラーが発生しました。再度お試しください。"},
+                        "usage": {},
+                        "cost": 0.0,
+                        "finish_reason": "error",
+                    }
 
     async def achat(
         self,
@@ -216,9 +249,24 @@ class LLMClient:
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         contents, config = self._build_contents_and_config(messages, tools, temperature, max_tokens)
-        response = await self.client.aio.models.generate_content(
-            model=self.config.model,
-            contents=contents,
-            config=config,
-        )
-        return self._parse_response(response)
+        for attempt in range(3):
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model=self.config.model,
+                    contents=contents,
+                    config=config,
+                )
+                return self._parse_response(response)
+            except Exception as e:
+                logger.warning(f"Gemini API error (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(1 * (attempt + 1))
+                else:
+                    logger.error(f"Gemini API failed after 3 attempts: {e}")
+                    return {
+                        "message": {"role": "assistant", "content": "APIエラーが発生しました。再度お試しください。"},
+                        "usage": {},
+                        "cost": 0.0,
+                        "finish_reason": "error",
+                    }

@@ -27,12 +27,28 @@ class SemanticSearchTool(BaseTool):
         self._load_index(index_path)
 
     def _load_index(self, path: str):
-        with open(path, "rb") as f:
-            index = pickle.load(f)
-        self._sentences: list[str] = index["sentences"]
-        self._embeddings: np.ndarray = index["embeddings"]  # (N, dim), normalized
-        self._sent_to_chunk: list[str] = index["sentence_to_chunk"]
-        self._chunks: dict[str, dict] = index["chunks"]
+        from pathlib import Path
+        p = Path(path)
+        npz_path = p.with_name("sentence_index.npz")
+        meta_path = p.with_name("sentence_meta.pkl")
+
+        if npz_path.exists() and meta_path.exists():
+            # Load compressed npz + metadata (faster, smaller)
+            data = np.load(str(npz_path))
+            self._embeddings: np.ndarray = data["embeddings"].astype(np.float32)
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+            self._sentences: list[str] = meta["sentences"]
+            self._sent_to_chunk: list[str] = meta["sentence_to_chunk"]
+            self._chunks: dict[str, dict] = meta["chunks"]
+        else:
+            # Fallback to legacy pkl format
+            with open(path, "rb") as f:
+                index = pickle.load(f)
+            self._sentences = index["sentences"]
+            self._embeddings = index["embeddings"]
+            self._sent_to_chunk = index["sentence_to_chunk"]
+            self._chunks = index["chunks"]
         logger.info(f"Loaded index: {len(self._sentences)} sentences, {len(self._chunks)} chunks")
 
     @property

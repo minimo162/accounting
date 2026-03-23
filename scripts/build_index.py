@@ -119,28 +119,49 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
     norms[norms == 0] = 1
     embeddings_array = embeddings_array / norms
 
-    # Save index
-    index = {
+    # Save as compressed npz with float16 embeddings for smaller file size
+    index_path = output_dir / "sentence_index.npz"
+    np.savez_compressed(
+        index_path,
+        embeddings=embeddings_array.astype(np.float16),
+    )
+    # Save metadata separately (sentences, mappings, chunks) as pickle
+    meta_path = output_dir / "sentence_meta.pkl"
+    meta = {
+        "sentences": sentences,
+        "sentence_to_chunk": sentence_to_chunk,
+        "chunks": chunk_map,
+        "model_name": embedder.model,
+    }
+    with open(meta_path, "wb") as f:
+        pickle.dump(meta, f)
+
+    # Also save legacy pkl format for backward compatibility
+    legacy_path = output_dir / "sentence_index.pkl"
+    legacy_index = {
         "sentences": sentences,
         "embeddings": embeddings_array,
         "sentence_to_chunk": sentence_to_chunk,
         "chunks": chunk_map,
         "model_name": embedder.model,
     }
-
-    index_path = output_dir / "sentence_index.pkl"
-    with open(index_path, "wb") as f:
-        pickle.dump(index, f)
+    with open(legacy_path, "wb") as f:
+        pickle.dump(legacy_index, f)
 
     # Clean up checkpoint
     if checkpoint_path.exists():
         checkpoint_path.unlink()
         print("Checkpoint cleaned up")
 
-    print(f"Index saved to {index_path}")
+    npz_size = index_path.stat().st_size / 1024 / 1024
+    meta_size = meta_path.stat().st_size / 1024 / 1024
+    legacy_size = legacy_path.stat().st_size / 1024 / 1024
+    print(f"Index saved:")
+    print(f"  npz (float16 compressed): {index_path} ({npz_size:.1f} MB)")
+    print(f"  meta: {meta_path} ({meta_size:.1f} MB)")
+    print(f"  legacy pkl (float32): {legacy_path} ({legacy_size:.1f} MB)")
     print(f"  Sentences: {len(sentences)}")
     print(f"  Embedding dim: {embeddings_array.shape[1]}")
-    print(f"  Index size: {index_path.stat().st_size / 1024 / 1024:.1f} MB")
 
 
 if __name__ == "__main__":

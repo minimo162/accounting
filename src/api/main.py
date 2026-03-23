@@ -44,10 +44,18 @@ def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
     index_dir.mkdir(parents=True, exist_ok=True)
 
     chunks_path = local_dir / "chunks.json"
-    index_path = index_dir / "sentence_index.pkl"
+    npz_path = index_dir / "sentence_index.npz"
+    meta_path = index_dir / "sentence_meta.pkl"
+    legacy_path = index_dir / "sentence_index.pkl"
 
-    if chunks_path.exists() and index_path.exists():
+    # Already have compressed format
+    if chunks_path.exists() and npz_path.exists() and meta_path.exists():
         logger.info("Index files already exist locally, skipping download")
+        return
+
+    # Already have legacy format
+    if chunks_path.exists() and legacy_path.exists():
+        logger.info("Legacy index files already exist locally, skipping download")
         return
 
     logger.info(f"Downloading index from gs://{bucket_name}/{prefix}/...")
@@ -59,10 +67,21 @@ def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
         blob.download_to_filename(str(chunks_path))
         logger.info(f"Downloaded chunks.json ({chunks_path.stat().st_size // 1024} KB)")
 
-    if not index_path.exists():
+    # Prefer compressed npz + meta format
+    npz_blob = bucket.blob(f"{prefix}/sentence_index.npz")
+    meta_blob = bucket.blob(f"{prefix}/sentence_meta.pkl")
+    if npz_blob.exists() and meta_blob.exists():
+        if not npz_path.exists():
+            npz_blob.download_to_filename(str(npz_path))
+            logger.info(f"Downloaded sentence_index.npz ({npz_path.stat().st_size // 1024 // 1024} MB)")
+        if not meta_path.exists():
+            meta_blob.download_to_filename(str(meta_path))
+            logger.info(f"Downloaded sentence_meta.pkl ({meta_path.stat().st_size // 1024 // 1024} MB)")
+    elif not legacy_path.exists():
+        # Fallback to legacy pkl
         blob = bucket.blob(f"{prefix}/sentence_index.pkl")
-        blob.download_to_filename(str(index_path))
-        logger.info(f"Downloaded sentence_index.pkl ({index_path.stat().st_size // 1024 // 1024} MB)")
+        blob.download_to_filename(str(legacy_path))
+        logger.info(f"Downloaded sentence_index.pkl ({legacy_path.stat().st_size // 1024 // 1024} MB)")
 
 
 def get_agent() -> Agent:
@@ -115,6 +134,14 @@ class QuestionRequest(BaseModel):
     history: list[ConversationTurn] = []
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load agent and index during startup, before serving requests."""
+    logger.info("Pre-loading agent and index...")
+    get_agent()
+    logger.info("Agent ready")
+
+
 @app.post("/api/ask")
 async def ask_question(req: QuestionRequest):
     """Non-streaming endpoint."""
@@ -142,7 +169,7 @@ async def ask_question_stream(req: QuestionRequest):
             async for event in agent.arun_stream(req.question, history=req.history):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
-            logger.error(f"Stream error: {e}")
+            logger.exception(f"Stream error: {e}")
             error_event = {"type": "error", "data": f"エラーが発生しました: {str(e)}"}
             yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 
