@@ -105,6 +105,16 @@ SSBJ_PAGES = [
 REGULATIONS_PDFS = [
     # 財務諸表等規則ガイドライン (金融庁)
     ("https://www.fsa.go.jp/common/law/kaiji/1.pdf", "reg_zaimuhyou_guideline.pdf"),
+    # 財務諸表等規則ガイドライン (最新版)
+    ("https://www.fsa.go.jp/common/law/kaiji/zaiki.pdf", "reg_zaimuhyou_latest.pdf"),
+    # 連結財務諸表規則ガイドライン (最新版)
+    ("https://www.fsa.go.jp/common/law/kaiji/renketuzaiki.pdf", "reg_renketsu_latest.pdf"),
+    # 中間財務諸表等規則ガイドライン
+    ("https://www.fsa.go.jp/common/law/kaiji/05.pdf", "reg_chukan_guideline.pdf"),
+    # 企業内容等開示ガイドライン (最新版)
+    ("https://www.fsa.go.jp/common/law/kaiji/260220_kaiji.pdf", "reg_disclosure_guideline.pdf"),
+    # 財務諸表等の監査証明に関する内閣府令ガイドライン
+    ("https://www.fsa.go.jp/common/law/kaiji/kansa.pdf", "reg_kansa_guideline.pdf"),
 ]
 
 REGULATIONS_PAGES = [
