@@ -6,6 +6,7 @@ from typing import Any
 import tiktoken
 
 from .base import BaseTool
+from .filters import get_chunk_tag, is_clearly_low_value
 from ..context import AgentContext
 
 # Japanese-aware sentence splitting
@@ -47,7 +48,7 @@ class KeywordSearchTool(BaseTool):
                     "top_k": {
                         "type": "integer",
                         "description": "返す結果の最大数 / Max results to return (default 5, max 20)",
-                        "default": 5,
+                        "default": 10,
                     },
                 },
                 "required": ["keywords"],
@@ -56,7 +57,7 @@ class KeywordSearchTool(BaseTool):
 
     def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
         keywords: list[str] = kwargs.get("keywords", [])
-        top_k: int = min(kwargs.get("top_k", 5), 20)
+        top_k: int = min(kwargs.get("top_k", 10), 20)
 
         if not keywords:
             return "キーワードを指定してください。", {"error": "no keywords"}
@@ -64,6 +65,8 @@ class KeywordSearchTool(BaseTool):
         scored: list[tuple[str, float, list[str]]] = []
 
         for chunk in self._chunks:
+            if is_clearly_low_value(chunk["text"]):
+                continue
             text = chunk["text"].lower()
             score = 0.0
             matched_sentences = []
@@ -99,7 +102,9 @@ class KeywordSearchTool(BaseTool):
             chunk = self._chunk_map[chunk_id]
             source = chunk.get("source", "")
             chunk_ids.append(chunk_id)
-            lines.append(f"[Chunk {chunk_id}] (score: {score:.1f}) {source}")
+            tag = get_chunk_tag(chunk.get("text", ""))
+            tag_str = f" {tag}" if tag else ""
+            lines.append(f"[Chunk {chunk_id}] (score: {score:.1f}){tag_str} {source}")
             for s in matched_sentences[:5]:
                 lines.append(f"  > {s}")
                 all_matched_text.append(s)

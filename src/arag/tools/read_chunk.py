@@ -13,22 +13,20 @@ _tokenizer = tiktoken.get_encoding("cl100k_base")
 class ReadChunkTool(BaseTool):
     def __init__(self, chunks: list[dict]):
         self._chunk_map = {c["id"]: c for c in chunks}
-        # Build adjacency: map chunk_id -> (prev_id, next_id)
-        self._chunk_ids = [c["id"] for c in chunks]
-        self._id_to_idx = {c["id"]: i for i, c in enumerate(chunks)}
 
     def _get_adjacent_ids(self, chunk_id: str) -> tuple[str | None, str | None]:
-        """Get the previous and next chunk IDs for context expansion."""
-        idx = self._id_to_idx.get(chunk_id)
-        if idx is None:
+        """Get the previous and next chunk IDs by file:page convention."""
+        chunk = self._chunk_map.get(chunk_id)
+        if chunk is None:
             return None, None
-        prev_id = self._chunk_ids[idx - 1] if idx > 0 else None
-        next_id = self._chunk_ids[idx + 1] if idx < len(self._chunk_ids) - 1 else None
-        # Only return adjacent if from the same file
-        chunk = self._chunk_map[chunk_id]
-        if prev_id and self._chunk_map[prev_id].get("file") != chunk.get("file"):
+        file_name = chunk.get("file", "")
+        page = chunk.get("page", 0)
+        prev_id = f"{file_name}:{page - 1}" if page > 1 else None
+        next_id = f"{file_name}:{page + 1}"
+        # Only return if they actually exist
+        if prev_id and prev_id not in self._chunk_map:
             prev_id = None
-        if next_id and self._chunk_map[next_id].get("file") != chunk.get("file"):
+        if next_id not in self._chunk_map:
             next_id = None
         return prev_id, next_id
 
@@ -49,7 +47,7 @@ class ReadChunkTool(BaseTool):
                 "- Make sure to read the most relevant chunks to gather complete information\n"
                 "- If information seems incomplete or truncated, read adjacent chunks (± 1)\n"
                 "- Reading full text is essential for accurate answers\n"
-                "- Adjacent chunk IDs are typically the current ID ± 1 (e.g., chunk '50' has neighbors '49' and '51')"
+                "- Adjacent chunk IDs use file:page format (e.g., chunk 'foo.pdf:5' has neighbors 'foo.pdf:4' and 'foo.pdf:6')"
             ),
             "parameters": {
                 "type": "object",

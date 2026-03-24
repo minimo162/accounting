@@ -1,14 +1,14 @@
-"""Semantic search tool using Gemini embeddings."""
+"""Semantic search tool using Gemini embeddings at chunk level."""
 
 import logging
 import pickle
 from typing import Any
-from collections import defaultdict
 
 import numpy as np
 import tiktoken
 
 from .base import BaseTool
+from .filters import get_chunk_tag, is_clearly_low_value
 from ..context import AgentContext
 
 logger = logging.getLogger(__name__)
@@ -33,23 +33,21 @@ class SemanticSearchTool(BaseTool):
         meta_path = p.with_name("sentence_meta.pkl")
 
         if npz_path.exists() and meta_path.exists():
-            # Load compressed npz + metadata (faster, smaller)
             data = np.load(str(npz_path))
             self._embeddings: np.ndarray = data["embeddings"].astype(np.float32)
             with open(meta_path, "rb") as f:
                 meta = pickle.load(f)
-            self._sentences: list[str] = meta["sentences"]
-            self._sent_to_chunk: list[str] = meta["sentence_to_chunk"]
+            self._texts: list[str] = meta["sentences"]
+            self._text_to_chunk: list[str] = meta["sentence_to_chunk"]
             self._chunks: dict[str, dict] = meta["chunks"]
         else:
-            # Fallback to legacy pkl format
             with open(path, "rb") as f:
                 index = pickle.load(f)
-            self._sentences = index["sentences"]
+            self._texts = index["sentences"]
             self._embeddings = index["embeddings"]
-            self._sent_to_chunk = index["sentence_to_chunk"]
+            self._text_to_chunk = index["sentence_to_chunk"]
             self._chunks = index["chunks"]
-        logger.info(f"Loaded index: {len(self._sentences)} sentences, {len(self._chunks)} chunks")
+        logger.info(f"Loaded index: {len(self._texts)} entries, {len(self._chunks)} chunks")
 
     @property
     def name(self) -> str:
@@ -77,7 +75,7 @@ class SemanticSearchTool(BaseTool):
                     "top_k": {
                         "type": "integer",
                         "description": "返す結果の最大数 / Max results (default 5, max 20)",
-                        "default": 5,
+                        "default": 10,
                     },
                 },
                 "required": ["query"],
@@ -86,7 +84,7 @@ class SemanticSearchTool(BaseTool):
 
     def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
         query: str = kwargs.get("query", "")
-        top_k: int = min(kwargs.get("top_k", 5), 20)
+        top_k: int = min(kwargs.get("top_k", 10), 20)
 
         if not query:
             return "検索クエリを指定してください。", {"error": "no query"}
@@ -98,26 +96,21 @@ class SemanticSearchTool(BaseTool):
 
         query_vec = query_vec / np.linalg.norm(query_vec)
 
-        # Cosine similarity
+        # Cosine similarity against all chunk embeddings
         similarities = self._embeddings @ query_vec
 
-        # Group by chunk, collect multiple top sentences per chunk
-        chunk_sentences: dict[str, list[dict]] = defaultdict(list)
+        # Build (index, chunk_id, similarity) list, excluding clearly low-value chunks
+        scored = []
         for idx in range(len(similarities)):
-            chunk_id = self._sent_to_chunk[idx]
-            sim = float(similarities[idx])
-            chunk_sentences[chunk_id].append({
-                "sentence": self._sentences[idx],
-                "similarity": sim,
-                "position": idx,
-            })
+            chunk_id = self._text_to_chunk[idx]
+            chunk_text = self._chunks.get(chunk_id, {}).get("text", "")
+            if is_clearly_low_value(chunk_text):
+                continue
+            scored.append((idx, chunk_id, float(similarities[idx])))
 
-        # Rank chunks by max sentence similarity
-        chunk_max_scores: dict[str, float] = {}
-        for chunk_id, sents in chunk_sentences.items():
-            chunk_max_scores[chunk_id] = max(s["similarity"] for s in sents)
-
-        ranked = sorted(chunk_max_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        # Sort by similarity descending
+        scored.sort(key=lambda x: x[2], reverse=True)
+        ranked = scored[:top_k]
 
         if not ranked:
             return "関連する文書が見つかりませんでした。", {"matches": 0}
@@ -125,18 +118,18 @@ class SemanticSearchTool(BaseTool):
         lines = []
         all_matched_text = []
         chunk_ids = []
-        for chunk_id, score in ranked:
+        for idx, chunk_id, score in ranked:
             chunk = self._chunks.get(chunk_id, {})
             source = chunk.get("source", "")
             chunk_ids.append(chunk_id)
-            lines.append(f"[Chunk {chunk_id}] (similarity: {score:.3f}) {source}")
+            tag = get_chunk_tag(chunk.get("text", ""))
+            tag_str = f" {tag}" if tag else ""
+            lines.append(f"[Chunk {chunk_id}] (similarity: {score:.3f}){tag_str} {source}")
 
-            # Show top 3 most relevant sentences from this chunk
-            sents = sorted(chunk_sentences[chunk_id], key=lambda s: s["similarity"], reverse=True)
-            for s in sents[:3]:
-                snippet = s["sentence"][:150]
-                lines.append(f"  > {snippet}")
-                all_matched_text.append(snippet)
+            # Show first 300 chars as snippet
+            snippet = self._texts[idx][:300]
+            lines.append(f"  > {snippet}")
+            all_matched_text.append(snippet)
 
         result = "\n".join(lines)
 

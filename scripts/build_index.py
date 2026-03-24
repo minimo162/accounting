@@ -1,17 +1,18 @@
-"""Build sentence-level embedding index using Gemini embeddings.
+"""Build chunk-level embedding index using Gemini embeddings.
 
-Features:
-- Checkpoint saving every 5000 sentences (resumes from last checkpoint on restart)
-- Retry with exponential backoff on API errors
-- Progress tracking
+Supports incremental indexing with file-level checkpointing:
+- Tracks which files have been embedded via indexed_files in metadata
+- Only processes new files on subsequent runs
+- Saves index after each file completes (crash-safe)
+
+Embeds at chunk (page/article) level (~750 tokens avg), not sentence level.
+This produces ~5K embeddings instead of ~130K, cutting build time from hours to minutes.
 """
 
 import json
 import os
 import pickle
-import re
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -19,149 +20,127 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.embedding.gemini import GeminiEmbedder
 
-# Japanese-aware sentence splitting
-_SENTENCE_RE = re.compile(r'(?<=[。．.！！\?？\n])\s*')
 
-CHECKPOINT_INTERVAL = 5000  # Save checkpoint every N sentences
-MAX_RETRIES = 5
-RETRY_BASE_DELAY = 5  # seconds
+def _save_index(output_dir, chunks_text, all_embeddings_list, chunk_ids, chunk_map, indexed_files, model_name):
+    """Save current index state to disk."""
+    npz_path = output_dir / "sentence_index.npz"
+    meta_path = output_dir / "sentence_meta.pkl"
 
-
-def split_sentences(text: str) -> list[str]:
-    """Split Japanese text into sentences."""
-    sentences = _SENTENCE_RE.split(text)
-    return [s.strip() for s in sentences if len(s.strip()) > 10]
-
-
-def build_index(chunks_path: str, output_dir: str, api_key: str):
-    """Build sentence-level embedding index with checkpointing."""
-    with open(chunks_path, encoding="utf-8") as f:
-        chunks = json.load(f)
-
-    print(f"Loaded {len(chunks)} chunks")
-
-    # Split all chunks into sentences
-    sentences = []
-    sentence_to_chunk = []
-    chunk_map = {}
-
-    for chunk in chunks:
-        chunk_map[chunk["id"]] = chunk
-        sents = split_sentences(chunk["text"])
-        for sent in sents:
-            sentences.append(sent)
-            sentence_to_chunk.append(chunk["id"])
-
-    total_sentences = len(sentences)
-    print(f"Split into {total_sentences} sentences")
-
-    # Check for checkpoint
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "checkpoint.pkl"
-
-    all_embeddings = []
-    start_idx = 0
-
-    if checkpoint_path.exists():
-        print("Found checkpoint, resuming...")
-        with open(checkpoint_path, "rb") as f:
-            checkpoint = pickle.load(f)
-        all_embeddings = checkpoint["embeddings"]
-        start_idx = checkpoint["next_idx"]
-        print(f"  Resuming from sentence {start_idx}/{total_sentences} ({len(all_embeddings)} embeddings loaded)")
-
-    # Embed sentences
-    embedder = GeminiEmbedder(api_key=api_key, model="gemini-embedding-2-preview")
-    print("Embedding sentences with Gemini...")
-
-    batch_size = 100
-    for i in range(start_idx, total_sentences, batch_size):
-        batch = sentences[i : i + batch_size]
-
-        # Retry with exponential backoff
-        for retry in range(MAX_RETRIES):
-            try:
-                embeddings = embedder.embed_batch(batch)
-                all_embeddings.extend(embeddings)
-                break
-            except Exception as e:
-                if retry < MAX_RETRIES - 1:
-                    delay = RETRY_BASE_DELAY * (2 ** retry)
-                    print(f"  Error at {i}: {e}. Retrying in {delay}s... (attempt {retry + 2}/{MAX_RETRIES})")
-                    time.sleep(delay)
-                else:
-                    print(f"  FATAL: Failed after {MAX_RETRIES} retries at {i}: {e}")
-                    # Save checkpoint before exiting
-                    print(f"  Saving checkpoint at {i}...")
-                    with open(checkpoint_path, "wb") as f:
-                        pickle.dump({"embeddings": all_embeddings, "next_idx": i}, f)
-                    print(f"  Checkpoint saved. Re-run to resume.")
-                    sys.exit(1)
-
-        processed = min(i + batch_size, total_sentences)
-        print(f"  Embedded {processed}/{total_sentences} ({processed * 100 // total_sentences}%)")
-
-        # Save checkpoint periodically
-        if (i - start_idx) > 0 and (i - start_idx) % CHECKPOINT_INTERVAL == 0:
-            print(f"  Saving checkpoint at {processed}...")
-            with open(checkpoint_path, "wb") as f:
-                pickle.dump({"embeddings": all_embeddings, "next_idx": processed}, f)
-
-        if i + batch_size < total_sentences:
-            time.sleep(0.5)  # Rate limiting
-
-    print(f"Embedding complete: {len(all_embeddings)} vectors")
-
-    embeddings_array = np.array(all_embeddings, dtype=np.float32)
+    embeddings_array = np.array(all_embeddings_list, dtype=np.float32)
     # Normalize
     norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
     norms[norms == 0] = 1
     embeddings_array = embeddings_array / norms
 
-    # Save as compressed npz with float16 embeddings for smaller file size
-    index_path = output_dir / "sentence_index.npz"
-    np.savez_compressed(
-        index_path,
-        embeddings=embeddings_array.astype(np.float16),
-    )
-    # Save metadata separately (sentences, mappings, chunks) as pickle
-    meta_path = output_dir / "sentence_meta.pkl"
+    np.savez_compressed(npz_path, embeddings=embeddings_array.astype(np.float16))
+
     meta = {
-        "sentences": sentences,
-        "sentence_to_chunk": sentence_to_chunk,
+        "sentences": chunks_text,
+        "sentence_to_chunk": chunk_ids,
         "chunks": chunk_map,
-        "model_name": embedder.model,
+        "indexed_files": indexed_files,
+        "model_name": model_name,
     }
     with open(meta_path, "wb") as f:
         pickle.dump(meta, f)
 
-    # Also save legacy pkl format for backward compatibility
+    # Legacy pkl
     legacy_path = output_dir / "sentence_index.pkl"
-    legacy_index = {
-        "sentences": sentences,
+    legacy = {
+        "sentences": chunks_text,
         "embeddings": embeddings_array,
-        "sentence_to_chunk": sentence_to_chunk,
+        "sentence_to_chunk": chunk_ids,
         "chunks": chunk_map,
-        "model_name": embedder.model,
+        "model_name": model_name,
     }
     with open(legacy_path, "wb") as f:
-        pickle.dump(legacy_index, f)
+        pickle.dump(legacy, f)
 
-    # Clean up checkpoint
-    if checkpoint_path.exists():
-        checkpoint_path.unlink()
-        print("Checkpoint cleaned up")
+    return embeddings_array
 
-    npz_size = index_path.stat().st_size / 1024 / 1024
-    meta_size = meta_path.stat().st_size / 1024 / 1024
-    legacy_size = legacy_path.stat().st_size / 1024 / 1024
-    print(f"Index saved:")
-    print(f"  npz (float16 compressed): {index_path} ({npz_size:.1f} MB)")
-    print(f"  meta: {meta_path} ({meta_size:.1f} MB)")
-    print(f"  legacy pkl (float32): {legacy_path} ({legacy_size:.1f} MB)")
-    print(f"  Sentences: {len(sentences)}")
-    print(f"  Embedding dim: {embeddings_array.shape[1]}")
+
+def build_index(chunks_path: str, output_dir: str, api_key: str):
+    """Build or incrementally update chunk-level embedding index."""
+    with open(chunks_path, encoding="utf-8") as f:
+        chunks = json.load(f)
+
+    print(f"Loaded {len(chunks)} chunks")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = output_dir / "sentence_index.npz"
+    meta_path = output_dir / "sentence_meta.pkl"
+
+    # Load existing index if available
+    all_texts: list[str] = []
+    all_embeddings: list[np.ndarray] = []
+    all_chunk_ids: list[str] = []
+    indexed_files: set[str] = set()
+
+    if npz_path.exists() and meta_path.exists():
+        print("Loading existing index...")
+        data = np.load(str(npz_path))
+        emb_array = data["embeddings"].astype(np.float32)
+        all_embeddings = [emb_array[i] for i in range(len(emb_array))]
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        all_texts = meta["sentences"]
+        all_chunk_ids = meta["sentence_to_chunk"]
+        indexed_files = meta.get("indexed_files", set())
+        print(f"  Existing: {len(all_texts)} chunks from {len(indexed_files)} files")
+
+    # Build chunk_map from current chunks (always update)
+    chunk_map = {c["id"]: c for c in chunks}
+
+    # Group chunks by file
+    chunks_by_file: dict[str, list[dict]] = {}
+    for c in chunks:
+        chunks_by_file.setdefault(c["file"], []).append(c)
+
+    # Determine new files
+    all_files = set(chunks_by_file.keys())
+    new_files = sorted(all_files - indexed_files)
+
+    if not new_files:
+        print("All files already indexed. Nothing to do.")
+        _save_index(output_dir, all_texts, all_embeddings, all_chunk_ids, chunk_map, indexed_files, "gemini-embedding-2-preview")
+        print("Updated chunk_map in metadata.")
+        return
+
+    total_new_chunks = sum(len(chunks_by_file[f]) for f in new_files)
+    print(f"New files to index: {len(new_files)} ({total_new_chunks} chunks)")
+
+    embedder = GeminiEmbedder(api_key=api_key, model="gemini-embedding-2-preview")
+    embedded_count = 0
+
+    for file_idx, file_name in enumerate(new_files):
+        file_chunks = chunks_by_file[file_name]
+        file_texts = [c["text"] for c in file_chunks]
+        file_ids = [c["id"] for c in file_chunks]
+
+        print(f"  [{file_idx+1}/{len(new_files)}] {file_name}: {len(file_chunks)} chunks...", end="", flush=True)
+
+        # Embed all chunks for this file
+        # embed_batch handles internal batching (50/call) and retries
+        file_embeddings = embedder.embed_batch(file_texts)
+
+        all_texts.extend(file_texts)
+        all_embeddings.extend(file_embeddings)
+        all_chunk_ids.extend(file_ids)
+        indexed_files.add(file_name)
+        embedded_count += len(file_chunks)
+
+        print(f" done ({embedded_count}/{total_new_chunks} total)")
+
+        # Checkpoint: save after each file
+        _save_index(output_dir, all_texts, all_embeddings, all_chunk_ids, chunk_map, indexed_files, embedder.model)
+
+    npz_size = (output_dir / "sentence_index.npz").stat().st_size / 1024 / 1024
+    print(f"\nIndex complete:")
+    print(f"  npz: {npz_size:.1f} MB")
+    print(f"  Chunks indexed: {len(all_texts)}")
+    print(f"  Embedding dim: {len(all_embeddings[0])}")
+    print(f"  Indexed files: {len(indexed_files)}")
 
 
 if __name__ == "__main__":

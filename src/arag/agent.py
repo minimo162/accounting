@@ -326,42 +326,31 @@ class Agent:
     @staticmethod
     def _strip_chunk_refs(text: str) -> str:
         """Remove any remaining Chunk ID references from the answer."""
-        # Remove patterns like: 【Chunk 123】, [Chunk 123], (Chunk 123), Chunk123, Chunk 123
+        # Remove old format: 【Chunk 123】, [Chunk 123], (Chunk 123), Chunk123, Chunk 123
         text = re.sub(r'[【\[\(]\s*Chunk\s*\d+\s*[】\]\)]', '', text)
         text = re.sub(r'\bChunk\s*\d+\b', '', text)
+        # Remove new format: filename.pdf:123, filename.xml:45 (file:page IDs)
+        text = re.sub(r'\b[\w\-]+\.(pdf|xml):\d+\b', '', text)
         # Clean up any resulting double spaces or orphaned punctuation
         text = re.sub(r'  +', ' ', text)
         text = re.sub(r' ([。、，,.])', r'\1', text)
         return text
 
     def _get_referenced_chunks(self, context: AgentContext) -> list[dict]:
-        """Get full text of all chunks that were referenced (read or found via search)."""
-        # Collect all chunk IDs from read_chunks AND search retrieval logs
-        all_chunk_ids: set[str] = set(context.read_chunk_ids)
-        for log in context.retrieval_logs:
-            chunk_ids = log.metadata.get("chunk_ids", [])
-            all_chunk_ids.update(chunk_ids)
-
+        """Get full text of chunks the agent explicitly read via read_chunk."""
         refs = []
-        seen_sources = set()
-        for chunk_id in sorted(all_chunk_ids, key=lambda x: int(x) if x.isdigit() else 0):
+        for chunk_id in context.read_chunk_ids:
             chunk = self.chunk_map.get(chunk_id)
             if chunk:
-                source = chunk.get("source", "")
-                # Deduplicate by source to avoid showing multiple pages of same doc
-                # unless they were explicitly read
-                if chunk_id in context.read_chunk_ids or source not in seen_sources:
-                    seen_sources.add(source)
-                    ref = {
-                        "id": chunk_id,
-                        "source": source,
-                        "text": chunk["text"],
-                    }
-                    # Add PDF source URL if available
-                    filename = chunk.get("file", "")
-                    if filename and filename in self.pdf_sources:
-                        ref["url"] = self.pdf_sources[filename]
-                    refs.append(ref)
+                ref = {
+                    "id": chunk_id,
+                    "source": chunk.get("source", ""),
+                    "text": chunk["text"],
+                }
+                filename = chunk.get("file", "")
+                if filename and filename in self.pdf_sources:
+                    ref["url"] = self.pdf_sources[filename]
+                refs.append(ref)
         return refs
 
     def _build_result(

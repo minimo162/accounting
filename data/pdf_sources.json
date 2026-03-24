@@ -149,5 +149,6 @@
   "reg_renketsu_latest.pdf": "https://www.fsa.go.jp/common/law/kaiji/renketuzaiki.pdf",
   "reg_chukan_guideline.pdf": "https://www.fsa.go.jp/common/law/kaiji/05.pdf",
   "reg_disclosure_guideline.pdf": "https://www.fsa.go.jp/common/law/kaiji/260220_kaiji.pdf",
-  "reg_kansa_guideline.pdf": "https://www.fsa.go.jp/common/law/kaiji/kansa.pdf"
+  "reg_kansa_guideline.pdf": "https://www.fsa.go.jp/common/law/kaiji/kansa.pdf",
+  "egov_zaireg.xml": "https://laws.e-gov.go.jp/law/338M50000040059"
 }
