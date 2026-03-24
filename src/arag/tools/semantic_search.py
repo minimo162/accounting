@@ -74,8 +74,8 @@ class SemanticSearchTool(BaseTool):
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返す結果の最大数 / Max results (default 5, max 20)",
-                        "default": 10,
+                        "description": "返す結果の最大数 / Max results (default 15, max 30). 複雑な質問では多めに設定してください。",
+                        "default": 15,
                     },
                 },
                 "required": ["query"],
@@ -84,7 +84,7 @@ class SemanticSearchTool(BaseTool):
 
     def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
         query: str = kwargs.get("query", "")
-        top_k: int = min(kwargs.get("top_k", 10), 20)
+        top_k: int = min(kwargs.get("top_k", 15), 30)
 
         if not query:
             return "検索クエリを指定してください。", {"error": "no query"}

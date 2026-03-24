@@ -5,7 +5,7 @@
 ## アーキテクチャ
 
 - **A-RAG (Agentic RAG)**: ReActループでセマンティック検索・キーワード検索・チャンク読み取りを組み合わせて回答を生成
-- **LLM**: Gemini (gemini-3.1-flash-lite-preview)
+- **LLM**: Cerebras (gpt-oss-120b) / Gemini フォールバック
 - **Embedding**: Gemini (gemini-embedding-2-preview / 3072次元)
 - **Frontend**: SvelteKit + SSE ストリーミング
 - **Backend**: FastAPI (Python)
@@ -31,7 +31,7 @@ src/
   api/main.py          # FastAPI エントリポイント (startup事前ロード)
   arag/
     agent.py           # ReActエージェントループ
-    llm.py             # Gemini LLMクライアント (リトライ付き)
+    llm.py             # LLMクライアント (Cerebras/Gemini、リトライ付き)
     prompt.py          # システムプロンプト
     config.py          # 設定管理
     tools/
@@ -65,6 +65,7 @@ cd frontend && npm ci && npm run build && cd ..
 
 # 環境変数
 export GEMINI_API_KEY="your-api-key"
+export CEREBRAS_API_KEY="your-api-key"
 ```
 
 ## インデックス構築
