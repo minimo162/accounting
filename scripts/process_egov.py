@@ -11,12 +11,22 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
+_OVERLAP_CHARS = 100
+
+
 LAWS = {
     "338M50000040059": {
         "source": "財務諸表等の用語、様式及び作成方法に関する規則（財規）",
         "file": "egov_zaireg.xml",
+        # PDFs containing the same law — these are skipped in process_pdfs.py
+        "supersedes_pdfs": ["reg_zaimuhyou_latest.pdf"],
     },
 }
+
+
+def get_egov_covered_pdfs() -> set[str]:
+    """e-Gov XML でカバーされるため PDF 処理をスキップすべきファイル名の集合を返す。"""
+    return {pdf for info in LAWS.values() for pdf in info.get("supersedes_pdfs", [])}
 
 
 def extract_text(elem) -> list[str]:
@@ -99,6 +109,13 @@ def process_law(xml_path: Path, source_name: str, file_name: str) -> list[dict]:
                     "page": page_counter,
                 })
                 page_counter += 1
+
+    # Add overlap: prepend tail of previous chunk to each chunk
+    prev_tail = ""
+    for chunk in chunks:
+        if prev_tail:
+            chunk["text"] = prev_tail + "\n...\n" + chunk["text"]
+        prev_tail = chunk["text"][-_OVERLAP_CHARS:]
 
     return chunks
 

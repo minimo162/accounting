@@ -349,7 +349,11 @@ class Agent:
                 }
                 filename = chunk.get("file", "")
                 if filename and filename in self.pdf_sources:
-                    ref["url"] = self.pdf_sources[filename]
+                    url = self.pdf_sources[filename]
+                    pdf_page = chunk.get("pdf_page")
+                    if pdf_page and pdf_page > 1:
+                        url = f"{url}#page={pdf_page}"
+                    ref["url"] = url
                 refs.append(ref)
         return refs
 
