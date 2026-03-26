@@ -298,12 +298,22 @@ def create_chunks(pdf_dir: str, output_path: str):
     # e-Gov XML でカバーされる PDF はスキップ (XML の方が構造的に正確)
     egov_covered = get_egov_covered_pdfs()
 
+    # スキャンPDFなどテキスト抽出不可のファイルを明示的に除外
+    SKIP_GARBLED = {
+        "bac_genson_kijun.pdf",   # 原価計算基準 — スキャンPDF、テキスト抽出不可
+        "bac_genson_iken.pdf",    # 企業会計審議会意見書 — スキャンPDF、テキスト抽出不可
+        "reg_chukan_guideline.pdf",  # 中間財務諸表等規則ガイドライン — スキャンPDF
+    }
+
     lp = LiteParse()
     chunks = []
 
     for pdf_path in pdf_files:
         if pdf_path.name in egov_covered:
             print(f"Skipping (covered by e-Gov XML): {pdf_path.name}")
+            continue
+        if pdf_path.name in SKIP_GARBLED:
+            print(f"Skipping (garbled scan PDF): {pdf_path.name}")
             continue
         print(f"Processing: {pdf_path.name}")
         full_text, page_breaks = _parse_pdf(lp, pdf_path)
