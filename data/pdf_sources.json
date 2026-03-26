@@ -165,5 +165,7 @@
   "kansa_kijun.pdf": "https://www.fsa.go.jp/singi/singi_kigyou/kijun/20201106_kansa.pdf",
   "ikan_20240701_05.pdf": "https://www.asb-j.jp/jp/wp-content/uploads/sites/4/ikan_20240701_05.pdf",
   "ikan_20240701_15.pdf": "https://www.asb-j.jp/jp/wp-content/uploads/sites/4/ikan_20240701_15.pdf",
-  "lease_20240913_23.pdf": "https://www.asb-j.jp/jp/wp-content/uploads/sites/4/lease_20240913_23.pdf"
+  "lease_20240913_23.pdf": "https://www.asb-j.jp/jp/wp-content/uploads/sites/4/lease_20240913_23.pdf",
+  "egov_renketsu.xml": "https://laws.e-gov.go.jp/law/351M50000040028",
+  "egov_chukan.xml": "https://laws.e-gov.go.jp/law/352M50000040038"
 }
