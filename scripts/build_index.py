@@ -141,6 +141,25 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
         if f not in indexed_files or saved_checksums.get(f) != current_checksums[f]
     )
 
+    # Remove stale embeddings for deleted files (before early return)
+    deleted_files = [f for f in list(indexed_files) if f not in all_files]
+    if deleted_files:
+        print(f"Deleted files (removing from index): {len(deleted_files)}")
+        keep = [
+            (t, e, cid)
+            for t, e, cid in zip(all_texts, all_embeddings, all_chunk_ids)
+            if _chunk_file(cid) not in set(deleted_files)
+        ]
+        if keep:
+            all_texts, all_embeddings, all_chunk_ids = zip(*keep)
+            all_texts, all_embeddings, all_chunk_ids = list(all_texts), list(all_embeddings), list(all_chunk_ids)
+        else:
+            all_texts, all_embeddings, all_chunk_ids = [], [], []
+        indexed_files -= set(deleted_files)
+        for f in deleted_files:
+            saved_checksums.pop(f, None)
+        print(f"  Removed stale embeddings for {len(deleted_files)} deleted file(s)")
+
     if not files_to_reindex:
         print("All files already indexed and up-to-date. Nothing to do.")
         _save_index(
@@ -159,8 +178,8 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
         print(f"Changed files (will re-embed): {len(changed_files)}")
 
     # Remove stale embeddings for changed files
-    if changed_files:
-        files_to_remove = set(changed_files)
+    files_to_remove = set(changed_files)
+    if files_to_remove:
         keep = [
             (t, e, cid)
             for t, e, cid in zip(all_texts, all_embeddings, all_chunk_ids)
