@@ -21,6 +21,16 @@ LAWS = {
         # PDFs containing the same law — these are skipped in process_pdfs.py
         "supersedes_pdfs": ["reg_zaimuhyou_latest.pdf"],
     },
+    "351M50000040028": {
+        "source": "連結財務諸表の用語、様式及び作成方法に関する規則（連結財規）",
+        "file": "egov_renketsu.xml",
+        "supersedes_pdfs": ["reg_renketsu_latest.pdf"],
+    },
+    "352M50000040038": {
+        "source": "中間財務諸表等の用語、様式及び作成方法に関する規則（中間財規）",
+        "file": "egov_chukan.xml",
+        "supersedes_pdfs": [],
+    },
 }
 
 
