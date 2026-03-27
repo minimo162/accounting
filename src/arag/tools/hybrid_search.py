@@ -13,7 +13,7 @@ from ..config import RetrievalConfig
 from ..context import AgentContext
 from ..query_rewrite import QueryExpander
 from ..reranker import BaseReranker
-from ..retrieval import reciprocal_rank_fusion
+from ..retrieval import reciprocal_rank_fusion, tokenize_for_bm25
 
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -110,6 +110,8 @@ class HybridSearchTool(BaseTool):
 
         fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
         fused = self._apply_exact_match_boosts(query, fused)
+        fused = self._apply_change_intent_boosts(query, fused)
+        fused = self._apply_topic_alignment_boosts(query, fused)
         reranked = self.reranker.rerank(query, fused[: self.config.rerank_top_n])
         final = reranked[:top_k]
         return final, expansions, hyde_doc
@@ -162,5 +164,85 @@ class HybridSearchTool(BaseTool):
                     metadata=item.metadata,
                 )
             )
+        boosted.sort(key=lambda item: item.score, reverse=True)
+        return boosted
+
+    @staticmethod
+    def _is_change_query(query: str) -> bool:
+        return any(term in query for term in ("改正", "変更", "見直し", "新基準", "改訂"))
+
+    def _apply_change_intent_boosts(self, query: str, results: list) -> list:
+        if not self._is_change_query(query):
+            return results
+
+        positive_terms = ("改正", "変更", "見直し", "導入", "廃止", "新た", "経過措置", "適用初年度")
+        negative_terms = ("議決", "委員", "名簿")
+        boosted = []
+
+        for item in results:
+            source = item.source or ""
+            text_window = f"{source} {item.snippet[:260]} {item.text[:800]}"
+            bonus = 0.0
+
+            for term in positive_terms:
+                if term in text_window:
+                    bonus += 0.25
+            for term in negative_terms:
+                if term in text_window:
+                    bonus -= 0.5
+
+            boosted.append(
+                item.__class__(
+                    chunk_id=item.chunk_id,
+                    parent_id=item.parent_id,
+                    score=item.score + bonus,
+                    source=item.source,
+                    snippet=item.snippet,
+                    text=item.text,
+                    metadata=item.metadata,
+                )
+            )
+
+        boosted.sort(key=lambda item: item.score, reverse=True)
+        return boosted
+
+    @staticmethod
+    def _query_anchor_terms(query: str) -> list[str]:
+        generic_terms = {
+            "改正", "改正点", "変更", "変更点", "見直し", "新基準", "改訂",
+            "教えて", "内容", "記載", "取扱い", "方法", "基準", "会計基準",
+        }
+        anchors: list[str] = []
+        for token in tokenize_for_bm25(query):
+            if len(token) < 2 or token in generic_terms:
+                continue
+            if token not in anchors:
+                anchors.append(token)
+        return anchors[:4]
+
+    def _apply_topic_alignment_boosts(self, query: str, results: list) -> list:
+        anchors = self._query_anchor_terms(query)
+        if not anchors:
+            return results
+
+        boosted = []
+        for item in results:
+            text_window = f"{item.source} {item.snippet[:260]} {item.text[:800]}"
+            hits = sum(1 for term in anchors if term in text_window)
+            bonus = hits * 0.2
+            if hits == 0:
+                bonus -= 0.35
+            boosted.append(
+                item.__class__(
+                    chunk_id=item.chunk_id,
+                    parent_id=item.parent_id,
+                    score=item.score + bonus,
+                    source=item.source,
+                    snippet=item.snippet,
+                    text=item.text,
+                    metadata=item.metadata,
+                )
+            )
+
         boosted.sort(key=lambda item: item.score, reverse=True)
         return boosted
