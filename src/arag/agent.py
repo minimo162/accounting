@@ -216,7 +216,7 @@ class Agent:
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                answer = self._strip_chunk_refs(message.get("content", ""))
+                answer = self._sanitize_answer(message.get("content", ""))
                 yield {"type": "status", "data": "回答を生成中..."}
                 chunk_size = 8
                 for i in range(0, len(answer), chunk_size):
@@ -279,7 +279,7 @@ class Agent:
     ) -> AsyncGenerator[dict, None]:
         """Force a final answer and simulate streaming output."""
         answer, cost = await self._aforce_final_answer(messages)
-        answer = self._strip_chunk_refs(answer)
+        answer = self._sanitize_answer(answer)
         total_cost += cost
 
         chunk_size = 8
@@ -335,6 +335,24 @@ class Agent:
         text = re.sub(r' ([。、，,.])', r'\1', text)
         return text
 
+    @classmethod
+    def _sanitize_answer(cls, text: str) -> str:
+        """Normalize answer formatting before returning it to clients."""
+        text = cls._strip_chunk_refs(text)
+
+        normalized_lines = []
+        previous_blank = False
+        for raw_line in text.splitlines():
+            line = re.sub(r'^[ \t]+(?=-\s)', '', raw_line)
+            line = re.sub(r'[ \t]+$', '', line)
+            is_blank = not line.strip()
+            if is_blank and previous_blank:
+                continue
+            normalized_lines.append("" if is_blank else line)
+            previous_blank = is_blank
+
+        return "\n".join(normalized_lines).strip()
+
     def _get_referenced_chunks(self, context: AgentContext) -> list[dict]:
         """Get full text of chunks the agent explicitly read via read_chunk."""
         refs = []
@@ -365,7 +383,7 @@ class Agent:
         total_cost: float,
     ) -> dict[str, Any]:
         return {
-            "answer": self._strip_chunk_refs(answer),
+            "answer": self._sanitize_answer(answer),
             "loops": loops,
             "stop_reason": stop_reason,
             "total_cost": total_cost,
