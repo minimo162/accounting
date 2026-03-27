@@ -41,6 +41,7 @@
 
 - `sentence_index.*` という名前ですが、実態は searchable child chunk の index です
 - `read_document` は `chunks.json` から全文を再構築するため、`full_texts.json` は必須ではありません
+- 実行時の `semantic_search` は `data/index/sentence_index.pkl` を読み込みます。`build_index.py` は互換性のため `npz` / `meta.pkl` とあわせて `pkl` も出力します
 
 ## リポジトリ構成
 
@@ -98,7 +99,15 @@ export EMBEDDING_BASE_URL="https://api.openai.com/v1"
 export LLM_PROVIDER="cerebras"   # or gemini
 export USE_GCS="false"           # ローカル data/ を使う場合
 export DATA_DIR="data"
+export GCS_BUCKET="jp-accounting-chat-data"
+export GCS_PREFIX="index"
 ```
+
+補足:
+
+- LLM 推論は `LLM_PROVIDER` に従って Cerebras または Gemini を使います
+- 埋め込みは常に Gemini を使うため、インデックス構築や `semantic_search` には `GEMINI_API_KEY` が必要です
+- `USE_GCS=true` の場合、起動時に `chunks.json` / `pdf_sources.json` / index 一式を GCS から取得します
 
 ## ローカル開発
 
@@ -151,6 +160,19 @@ python scripts/build_index.py
 - `build_index.py` はチェックポイント付きで差分更新に対応しています
 - retrieval 候補を評価したい場合は `python scripts/eval_retrieval.py --write-candidates` を使います
 - Cloud Run では `USE_GCS=true` の場合、起動時に GCS から `chunks.json` と index 一式を取得します
+- `add_context.py` を実行して `context` が変わった場合も、`build_index.py` の checksum 判定で再埋め込み対象になります
+
+更新判断の目安:
+
+- PDF ソースを追加・差し替えた: `process_pdfs.py` のあとに `build_index.py`
+- e-Gov 法令キャッシュを更新した: `process_egov.py` のあとに `build_index.py`
+- 検索精度改善のため `context` を付与し直した: `add_context.py` のあとに `build_index.py`
+- `read_document` 用の補助テキストだけ更新したい: `process_full_texts.py` のみでも可
+
+重複回避のルール:
+
+- 一部法令は PDF ではなく e-Gov XML を正本として扱います
+- その対象 PDF は `process_pdfs.py` 側でスキップされる前提なので、法令系ソースを追加する際は `process_egov.py` の `LAWS` 定義との重複を確認してください
 
 ## デプロイ
 
@@ -168,6 +190,21 @@ gsutil cp data/pdf_sources.json gs://jp-accounting-chat-data/index/
 gsutil cp data/index/sentence_index.npz gs://jp-accounting-chat-data/index/
 gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
 ```
+
+デプロイ時の前提:
+
+- `scripts/deploy.sh` には `PROJECT_ID` `REGION` `SERVICE_NAME` `REPO` が固定値で入っています
+- 別環境へ出す場合は、先に `scripts/deploy.sh` の定数と `--set-env-vars` の GCS 設定を見直してください
+
+## トラブルシュート
+
+- `Error: GEMINI_API_KEY environment variable not set`
+  - `build_index.py` 実行時に発生します。埋め込み構築には Gemini API キーが必須です
+- 起動時に index が見つからない
+  - ローカルなら `data/chunks.json` と `data/index/sentence_index.pkl` を確認してください
+  - Cloud Run なら `USE_GCS=true` と `GCS_BUCKET` `GCS_PREFIX` の組み合わせを確認してください
+- フロントから API に接続できない
+  - 開発時のフロント既定 API は `http://localhost:8000` です。backend を別ポートで起動している場合は合わせてください
 
 ## 実装メモ
 
