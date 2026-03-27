@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.arag.agent import Agent
-from src.arag.config import Config
+from src.arag.config import Config, LLMConfig
 from src.arag.llm import LLMClient
 from src.arag.query_rewrite import QueryExpander
 from src.arag.reranker import BaseReranker, HeuristicReranker, LLMReranker
@@ -112,7 +112,20 @@ def _init_agent() -> Agent:
         corpus=corpus,
     )
     if config.retrieval.reranker == "llm":
-        reranker = LLMReranker(llm_client)
+        rerank_llm = llm_client
+        if config.llm.provider == "cerebras":
+            rerank_llm = LLMClient(
+                LLMConfig(
+                    provider="cerebras",
+                    model=os.getenv("RERANKER_LLM_MODEL", "llama3.1-8b"),
+                    api_key=config.llm.api_key,
+                    base_url=config.llm.base_url,
+                    temperature=0.0,
+                    max_tokens=256,
+                )
+            )
+            logger.info("Using Cerebras-backed reranker model")
+        reranker = LLMReranker(rerank_llm)
     elif config.retrieval.reranker == "none":
         reranker = BaseReranker()
     else:
