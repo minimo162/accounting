@@ -216,7 +216,6 @@ class Agent:
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                # LLM produced final answer - strip chunk refs and simulate streaming
                 answer = self._strip_chunk_refs(message.get("content", ""))
                 yield {"type": "status", "data": "回答を生成中..."}
                 chunk_size = 8

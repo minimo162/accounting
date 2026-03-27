@@ -83,6 +83,22 @@ JICPA_PDFS = [
     ("https://jicpa.or.jp/specialized_field/publication/files/2-11-14-2-20150416.pdf", "jicpa_kinyushohin_jitsumu.pdf"),
     # 金融商品会計に関するQ&A
     ("https://jicpa.or.jp/specialized_field/publication/files/2-11-0-2-20150416.pdf", "jicpa_kinyushohin_qa.pdf"),
+    # 税効果会計に関する実務指針 (第6号・第10号・第11号 本文)
+    ("https://jicpa.or.jp/specialized_field/files/6-11-6_10_11-2-20180219.pdf", "jicpa_zeikouka_jitsumu.pdf"),
+    # 税効果会計に関する実務指針 (前書文)
+    ("https://jicpa.or.jp/specialized_field/files/6-11-6_10_11-1-20180219.pdf", "jicpa_zeikouka_maegaki.pdf"),
+    # 研究開発費及びソフトウェアの会計処理に関する実務指針 (第12号 本文)
+    ("https://jicpa.or.jp/specialized_field/files/01138-003671.pdf", "jicpa_kenkyukaihatsu_jitsumu.pdf"),
+    # 研究開発費及びソフトウェア 結論の背景
+    ("https://jicpa.or.jp/specialized_field/files/01138-003673.pdf", "jicpa_kenkyukaihatsu_haikei.pdf"),
+    # 研究開発費及びソフトウェア 設例による解説
+    ("https://jicpa.or.jp/specialized_field/files/01138-003675.pdf", "jicpa_kenkyukaihatsu_setsurei.pdf"),
+    # 退職給付会計に関する実務指針 (第13号 本文)
+    ("https://jicpa.or.jp/specialized_field/files/01704-007137.pdf", "jicpa_taishokukyufu_jitsumu.pdf"),
+    # 退職給付会計 結論の背景
+    ("https://jicpa.or.jp/specialized_field/files/01704-007139.pdf", "jicpa_taishokukyufu_haikei.pdf"),
+    # 退職給付会計 設例
+    ("https://jicpa.or.jp/specialized_field/files/01704-007141.pdf", "jicpa_taishokukyufu_setsurei.pdf"),
 ]
 
 JICPA_PAGES = [
