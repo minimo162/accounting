@@ -113,6 +113,7 @@ class HybridSearchTool(BaseTool):
         fused = self._apply_change_intent_boosts(query, fused)
         fused = self._apply_topic_alignment_boosts(query, fused)
         reranked = self.reranker.rerank(query, fused[: self.config.rerank_top_n])
+        reranked = self._filter_change_delta_results(query, reranked)
         final = reranked[:top_k]
         return final, expansions, hyde_doc
 
@@ -208,13 +209,16 @@ class HybridSearchTool(BaseTool):
 
     @staticmethod
     def _query_anchor_terms(query: str) -> list[str]:
-        generic_terms = {
-            "改正", "改正点", "変更", "変更点", "見直し", "新基準", "改訂",
-            "教えて", "内容", "記載", "取扱い", "方法", "基準", "会計基準",
-        }
+        generic_terms = (
+            "改正点", "変更点", "会計基準", "改正", "変更", "見直し", "新基準", "改訂",
+            "教えてください", "教えて", "内容", "記載", "取扱い", "方法", "基準",
+        )
+        reduced = query
+        for term in generic_terms:
+            reduced = reduced.replace(term, " ")
         anchors: list[str] = []
-        for token in tokenize_for_bm25(query):
-            if len(token) < 2 or token in generic_terms:
+        for token in re.findall(r"[一-龥ぁ-んァ-ヶーA-Za-z0-9]{2,8}", reduced):
+            if len(token) < 2:
                 continue
             if token not in anchors:
                 anchors.append(token)
@@ -246,3 +250,22 @@ class HybridSearchTool(BaseTool):
 
         boosted.sort(key=lambda item: item.score, reverse=True)
         return boosted
+
+    def _filter_change_delta_results(self, query: str, results: list) -> list:
+        if not self._is_change_query(query):
+            return results
+
+        strong_terms = (
+            "改正", "改正前", "改正後", "変更", "見直し", "新たに", "新設", "廃止",
+            "従前", "従来", "今回", "経過措置", "適用初年度",
+        )
+        anchors = self._query_anchor_terms(query)
+        kept = []
+        for item in results:
+            text_window = f"{item.source} {item.snippet[:260]} {item.text[:1200]}"
+            has_change_term = any(term in text_window for term in strong_terms)
+            has_anchor = any(term in text_window for term in anchors) if anchors else True
+            if has_change_term and has_anchor:
+                kept.append(item)
+
+        return kept or results
