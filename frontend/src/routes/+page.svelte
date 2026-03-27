@@ -32,6 +32,10 @@
     }
   }
 
+  function getDisplayedReferenceCount(message: Message): number | string {
+    return message.metadata?.chunks_read_count ?? message.metadata?.references?.length ?? '?';
+  }
+
   function scrollToMessage(idx: number) {
     if (chatContainer) {
       // Wait for DOM to update, then scroll
@@ -494,7 +498,7 @@
             {#if msg.metadata?.references?.length}
               <div class="references">
                 <details>
-                  <summary>参照した条文 ({msg.metadata.references.length}件)</summary>
+                  <summary>参照した条文 ({getDisplayedReferenceCount(msg)}件)</summary>
                   <div class="ref-list">
                     {#each msg.metadata.references as ref}
                       <div class="ref-item">
@@ -521,7 +525,7 @@
             {#if msg.metadata}
               <div class="meta">
                 検索ステップ: {msg.metadata.loops ?? '?'} |
-                参照: {msg.metadata.references?.length ?? msg.metadata.chunks_read_count ?? '?'}件
+                参照: {getDisplayedReferenceCount(msg)}件
               </div>
             {/if}
           </div>
