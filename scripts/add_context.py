@@ -135,9 +135,9 @@ def generate_contexts(
             chunk=chunk["text"],
         )
 
-        # Retry with exponential backoff
+        # Retry only for transient errors (rate limit, network); null content = skip immediately
         context_text = None
-        for retry in range(5):
+        for retry in range(4):
             try:
                 response = client.chat.completions.create(
                     model=_MODEL,
@@ -148,12 +148,18 @@ def generate_contexts(
                     temperature=0.0,
                     max_tokens=256,
                 )
-                context_text = response.choices[0].message.content.strip()
+                content = response.choices[0].message.content
+                if content is None:
+                    # Not retryable — model refused or context too long
+                    finish = response.choices[0].finish_reason
+                    print(f"  Skip (null content, finish_reason={finish}): {chunk['id']}")
+                    break
+                context_text = content.strip()
                 time.sleep(0.3)  # Proactive rate-limit throttle (~3.3 req/sec)
                 break
             except Exception as e:
-                delay = 3 * (2**retry)
-                print(f"  Retry {retry + 1}/5 for {chunk['id']}: {e}. Waiting {delay}s...")
+                delay = 2 * (2**retry)  # 2, 4, 8, 16s
+                print(f"  Retry {retry + 1}/4 for {chunk['id']}: {e}. Waiting {delay}s...")
                 time.sleep(delay)
 
         if context_text:

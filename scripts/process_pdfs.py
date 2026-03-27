@@ -233,6 +233,10 @@ def create_chunks(pdf_dir: str, output_path: str):
                 chunk["overlap_prefix"] = prev_tail
             prev_tail = chunk["text"][-_OVERLAP_CHARS:]
 
+        # Skip files where all remaining chunks are garbage (single tiny chunk)
+        if len(file_chunks) == 1 and len(file_chunks[0]["text"]) < 150:
+            print(f"  Skipping (garbage-only file): {pdf_path.name}")
+            continue
         chunks.extend(file_chunks)
         print(f"  {len(file_chunks)} chunks")
 
