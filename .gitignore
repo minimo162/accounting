@@ -28,3 +28,32 @@ Thumbs.db
 # Env
 .env
 .env.local
+.env.example
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+# Dependency directories
+node_modules/
+# Environment variables
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# OS specific
+
+# Task files
+.taskmaster/
+
+# Local generated data
+data/egov_cache/
+data/full_texts.json
+eng.traineddata
