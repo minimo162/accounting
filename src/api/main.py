@@ -179,7 +179,7 @@ async def ask_question(req: QuestionRequest):
         "answer": result["answer"],
         "metadata": {
             "loops": result["loops"],
-            "chunks_read_count": result.get("chunks_read_count", 0),
+            "chunks_read_count": result.get("cited_reference_count", 0),
             "stop_reason": result["stop_reason"],
             "total_cost": result.get("total_cost", 0.0),
             "total_retrieved_tokens": result.get("total_retrieved_tokens", 0),

@@ -382,6 +382,25 @@ class Agent:
                 refs.append(ref)
         return refs
 
+    @staticmethod
+    def _count_cited_references(answer: str) -> int:
+        """Count unique standards / section citations explicitly mentioned in the answer."""
+        patterns = [
+            r"企業会計基準第\s*\d+\s*号",
+            r"企業会計基準適用指針第\s*\d+\s*号",
+            r"実務対応報告第\s*\d+\s*号",
+            r"IFRS\s*第?\s*\d+\s*号",
+            r"第\s*\d+\s*項",
+            r"第\s*\d+\s*条",
+            r"BC\s*\d+(?:\s*[-‑–]\s*\d+)?",
+        ]
+        citations: set[str] = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, answer):
+                normalized = re.sub(r"\s+", "", match)
+                citations.add(normalized)
+        return len(citations)
+
     def _build_result(
         self,
         answer: str,
@@ -390,12 +409,15 @@ class Agent:
         stop_reason: str,
         total_cost: float,
     ) -> dict[str, Any]:
+        sanitized_answer = self._sanitize_answer(answer)
+        references = self._get_referenced_chunks(context)
         return {
-            "answer": self._sanitize_answer(answer),
+            "answer": sanitized_answer,
             "loops": loops,
             "stop_reason": stop_reason,
             "total_cost": total_cost,
             **context.get_summary(),
+            "cited_reference_count": self._count_cited_references(sanitized_answer),
             "trajectory": context.trajectory,
-            "references": self._get_referenced_chunks(context),
+            "references": references,
         }
