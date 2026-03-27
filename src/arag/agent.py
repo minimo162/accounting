@@ -340,11 +340,19 @@ class Agent:
         """Normalize answer formatting before returning it to clients."""
         text = cls._strip_chunk_refs(text)
 
+        heading_only_bullet = re.compile(
+            r"^-\s+\*\*(?P<label>[^*]+)\*\*(?P<suffix>（[^）]+）)?$"
+        )
         normalized_lines = []
         previous_blank = False
         for raw_line in text.splitlines():
             line = re.sub(r'^[ \t]+(?=-\s)', '', raw_line)
             line = re.sub(r'[ \t]+$', '', line)
+            match = heading_only_bullet.match(line)
+            if match:
+                label = match.group("label").strip()
+                suffix = (match.group("suffix") or "").strip()
+                line = f"## {label}{suffix}".rstrip()
             is_blank = not line.strip()
             if is_blank and previous_blank:
                 continue
