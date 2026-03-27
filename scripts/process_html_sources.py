@@ -28,6 +28,37 @@ HTML_SOURCES = [
         "doc_type": "原価計算基準",
         "is_pdf": True,
     },
+    {
+        "url": "https://www.fsa.go.jp/status/ifrs.html",
+        "file": "html_fsa_ifrs.html",
+        "source": "金融庁 IFRS 関連情報",
+        "doc_type": "IFRS関連情報",
+    },
+    {
+        "url": "https://www.fsa.go.jp/news/27/sonota/20160331-5.html",
+        "file": "html_fsa_ifrs_disclosure_examples.html",
+        "source": "IFRSに基づく連結財務諸表の開示例",
+        "doc_type": "IFRS関連情報",
+    },
+    {
+        "url": "https://www.fsa.go.jp/news/24/sonota/20130620-2.html",
+        "file": "html_fsa_ifrs_policy.html",
+        "source": "IFRSへの対応のあり方に関する当面の方針",
+        "doc_type": "IFRS関連情報",
+    },
+    {
+        "url": "https://www.chusho.meti.go.jp/zaimu/youryou/about/",
+        "file": "html_chusho_kaikei_youryo_about.html",
+        "source": "中小企業の会計に関する基本要領",
+        "doc_type": "中小企業会計",
+    },
+    {
+        "url": "https://www.chusho.meti.go.jp/zaimu/youryou/about/download/0528KaikeiYouryou-1.pdf",
+        "file": "html_chusho_kaikei_youryo.pdf",
+        "source": "中小企業の会計に関する基本要領",
+        "doc_type": "中小企業会計",
+        "is_pdf": True,
+    },
 ]
 
 

@@ -103,6 +103,7 @@ JICPA_PDFS = [
 
 JICPA_PAGES = [
     "https://jicpa.or.jp/specialized_field/publication/practical_guidelines/",
+    "https://jicpa.or.jp/specialized_field/publication/research_report/",
 ]
 
 
