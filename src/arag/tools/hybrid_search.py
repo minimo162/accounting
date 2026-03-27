@@ -1,5 +1,6 @@
 """Hybrid retrieval with query expansion and reranking."""
 
+import re
 from typing import Any
 
 import tiktoken
@@ -108,6 +109,58 @@ class HybridSearchTool(BaseTool):
             semantic_rankings.append(self.semantic_tool.search(hyde_doc, self.config.semantic_top_k))
 
         fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
+        fused = self._apply_exact_match_boosts(query, fused)
         reranked = self.reranker.rerank(query, fused[: self.config.rerank_top_n])
         final = reranked[:top_k]
         return final, expansions, hyde_doc
+
+    @staticmethod
+    def _extract_exact_terms(query: str) -> list[str]:
+        patterns = [
+            r"企業会計基準第\d+号",
+            r"適用指針第\d+号",
+            r"実務対応報告第\d+号",
+            r"会計基準第\d+号",
+            r"第\d+項",
+            r"BC\d+",
+        ]
+        terms: list[str] = []
+        for pattern in patterns:
+            for match in re.findall(pattern, query):
+                if match not in terms:
+                    terms.append(match)
+        return terms
+
+    def _apply_exact_match_boosts(self, query: str, results: list) -> list:
+        exact_terms = self._extract_exact_terms(query)
+        if not exact_terms:
+            return results
+
+        boosted = []
+        for item in results:
+            source = item.source or ""
+            metadata = item.metadata or {}
+            haystacks = [
+                source,
+                str(metadata.get("source", "")),
+                str(metadata.get("doc_title", "")),
+                str(metadata.get("section_title", "")),
+                str(metadata.get("standard_no", "")),
+            ]
+            bonus = 0.0
+            for term in exact_terms:
+                if any(term in haystack for haystack in haystacks):
+                    bonus += 0.6
+            boosted.append(
+                item.__class__(
+                    chunk_id=item.chunk_id,
+                    parent_id=item.parent_id,
+                    score=item.score + bonus,
+                    source=item.source,
+                    snippet=item.snippet,
+                    text=item.text,
+                    metadata=item.metadata,
+                )
+            )
+        boosted.sort(key=lambda item: item.score, reverse=True)
+        return boosted

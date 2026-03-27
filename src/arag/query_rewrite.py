@@ -19,9 +19,17 @@ class QueryExpander:
     def _extract_keywords(query: str) -> list[str]:
         return list(dict.fromkeys(re.findall(r"(企業会計基準第\d+号|適用指針第\d+号|実務対応報告第\d+号|第\d+項|[一-龥ぁ-んァ-ヶーA-Za-z0-9]{2,})", query)))
 
+    @staticmethod
+    def is_exact_query(query: str) -> bool:
+        return bool(
+            re.search(r"(企業会計基準第\d+号|適用指針第\d+号|実務対応報告第\d+号|会計基準第\d+号|第\d+項|BC\d+)", query)
+        )
+
     def expand(self, query: str) -> list[str]:
         variants = [query]
         if self.config.enable_query_expansion:
+            if self.is_exact_query(query):
+                return variants
             variants.extend(self._heuristic_variants(query))
             if self.llm is not None:
                 variants.extend(self._llm_variants(query))
@@ -33,7 +41,7 @@ class QueryExpander:
         return deduped[: self.config.expansion_max_variants]
 
     def generate_hypothetical_document(self, query: str) -> str | None:
-        if not self.config.enable_hyde or self.llm is None:
+        if not self.config.enable_hyde or self.llm is None or self.is_exact_query(query):
             return None
         prompt = (
             "次の日本の会計基準に関する質問について、検索用の仮想回答断片を150〜250字で書いてください。"
