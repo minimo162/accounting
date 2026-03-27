@@ -1,7 +1,15 @@
+from .hybrid_search import HybridSearchTool
 from .keyword_search import KeywordSearchTool
-from .semantic_search import SemanticSearchTool
 from .read_chunk import ReadChunkTool
 from .read_document import ReadDocumentTool
 from .registry import ToolRegistry
+from .semantic_search import SemanticSearchTool
 
-__all__ = ["KeywordSearchTool", "SemanticSearchTool", "ReadChunkTool", "ReadDocumentTool", "ToolRegistry"]
+__all__ = [
+    "HybridSearchTool",
+    "KeywordSearchTool",
+    "ReadChunkTool",
+    "ReadDocumentTool",
+    "SemanticSearchTool",
+    "ToolRegistry",
+]

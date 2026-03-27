@@ -1,4 +1,4 @@
-"""Keyword search tool for exact lexical matching in Japanese text."""
+"""Keyword and BM25-style retrieval over searchable child chunks."""
 
 import re
 from typing import Any
@@ -8,17 +8,18 @@ import tiktoken
 from .base import BaseTool
 from .filters import get_chunk_tag, is_clearly_low_value
 from ..context import AgentContext
+from ..retrieval import BM25Index, ChunkCorpus, SearchResult
 
-# Japanese-aware sentence splitting
-_SENTENCE_RE = re.compile(r'[。．.！！\?？\n]+')
-
+_SENTENCE_RE = re.compile(r"[。．.!！?？\n]+")
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
 class KeywordSearchTool(BaseTool):
-    def __init__(self, chunks: list[dict]):
-        self._chunks = chunks
-        self._chunk_map = {c["id"]: c for c in chunks}
+    def __init__(self, corpus: ChunkCorpus):
+        self._corpus = corpus
+        self._chunks = corpus.searchable_chunks
+        self._chunk_map = corpus.chunk_map
+        self._bm25 = BM25Index(self._chunks)
 
     @property
     def name(self) -> str:
@@ -26,105 +27,83 @@ class KeywordSearchTool(BaseTool):
 
     def get_schema(self) -> dict[str, Any]:
         return {
-            "name": "keyword_search",
-            "description": (
-                "キーワードで文書を検索します。会計基準の用語、条項番号、"
-                "特定のフレーズなどの完全一致検索に適しています。\n"
-                "Search documents by exact keyword matching. "
-                "Good for accounting terms, article numbers, specific phrases.\n"
-                "STRATEGY:\n"
-                "- Use specific accounting terms (e.g., '減損', 'のれん', '収益認識')\n"
-                "- Use standard numbers (e.g., '第29号', '第34号')\n"
-                "- Combine multiple related keywords for better results"
-            ),
+            "name": self.name,
+            "description": "キーワード完全一致とBM25で会計基準を検索します。条項番号や基準名向けです。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keywords": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "検索キーワードのリスト / List of keywords to search for",
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "返す結果の最大数 / Max results to return (default 15, max 30). 複雑な質問では多めに設定してください。",
-                        "default": 15,
-                    },
+                    "keywords": {"type": "array", "items": {"type": "string"}},
+                    "top_k": {"type": "integer", "default": 10},
                 },
                 "required": ["keywords"],
             },
         }
 
-    def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
-        keywords: list[str] = kwargs.get("keywords", [])
-        top_k: int = min(kwargs.get("top_k", 15), 30)
+    def search(self, keywords: list[str], top_k: int = 10) -> list[SearchResult]:
+        query = " ".join(keywords)
+        bm25_scores = self._bm25.score(query)
+        scored: list[SearchResult] = []
+        for idx, bm25_score in bm25_scores:
+            chunk = self._chunks[idx]
+            text = chunk["text"]
+            if is_clearly_low_value(text):
+                continue
+            parent = self._corpus.get_parent(chunk["id"]) or chunk
+            snippets: list[str] = []
+            for kw in keywords:
+                for sent in _SENTENCE_RE.split(text):
+                    if kw.lower() in sent.lower() and len(sent.strip()) > 5:
+                        snippet = sent.strip()[:200]
+                        if snippet not in snippets:
+                            snippets.append(snippet)
+            if not snippets:
+                snippets = [text[:200]]
+            exact_bonus = sum(0.3 for kw in keywords if kw in text or kw in parent.get("source", ""))
+            scored.append(
+                SearchResult(
+                    chunk_id=chunk["id"],
+                    parent_id=parent["id"],
+                    score=float(bm25_score + exact_bonus),
+                    source=parent.get("source", chunk.get("source", "")),
+                    snippet=" / ".join(snippets[:3]),
+                    text=parent.get("text", text),
+                    metadata=parent,
+                )
+            )
+        return self._corpus.dedupe_to_parents(scored, top_k)
 
+    def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
+        keywords = kwargs.get("keywords", [])
+        top_k = min(int(kwargs.get("top_k", 10)), 30)
         if not keywords:
             return "キーワードを指定してください。", {"error": "no keywords"}
-
-        scored: list[tuple[str, float, list[str]]] = []
-
-        for chunk in self._chunks:
-            if is_clearly_low_value(chunk["text"]):
-                continue
-            text = chunk["text"].lower()
-            score = 0.0
-            matched_sentences = []
-
-            for kw in keywords:
-                kw_lower = kw.lower()
-                count = text.count(kw_lower)
-                if count > 0:
-                    score += count * len(kw)
-                    # Extract sentences containing keyword
-                    sentences = _SENTENCE_RE.split(chunk["text"])
-                    for sent in sentences:
-                        if kw_lower in sent.lower() and len(sent.strip()) > 5:
-                            snippet = sent.strip()[:200]
-                            if snippet not in matched_sentences:
-                                matched_sentences.append(snippet)
-                            if len(matched_sentences) >= 5:
-                                break
-
-            if score > 0:
-                scored.append((chunk["id"], score, matched_sentences))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = scored[:top_k]
-
+        top = self.search([str(kw) for kw in keywords], top_k)
         if not top:
             return "指定されたキーワードに一致する文書が見つかりませんでした。", {"matches": 0}
 
         lines = []
-        all_matched_text = []
+        snippets = []
         chunk_ids = []
-        for chunk_id, score, matched_sentences in top:
-            chunk = self._chunk_map[chunk_id]
-            source = chunk.get("source", "")
-            chunk_ids.append(chunk_id)
-            tag = get_chunk_tag(chunk.get("text", ""))
+        for item in top:
+            chunk_ids.append(item.parent_id)
+            tag = get_chunk_tag(item.text)
             tag_str = f" {tag}" if tag else ""
-            lines.append(f"[Chunk {chunk_id}] (score: {score:.1f}){tag_str} {source}")
-            for s in matched_sentences[:5]:
-                lines.append(f"  > {s}")
-                all_matched_text.append(s)
+            lines.append(f"[Chunk {item.parent_id}] (keyword: {item.score:.3f}){tag_str} {item.source}")
+            lines.append(f"  > {item.snippet}")
+            snippets.append(item.snippet)
 
-        result = "\n".join(lines)
+        unread_ids = [cid for cid in chunk_ids if not context.is_chunk_read(cid) and not get_chunk_tag((self._corpus.get_parent(cid) or {}).get("text", ""))]
+        if unread_ids:
+            lines.append(f"\n--- {len(unread_ids)}件の未読チャンクがあります。read_chunkで全文を取得してください ---")
+            lines.append(f"read_chunk(chunk_ids={unread_ids})")
 
-        # Token counting for retrieval tracking
-        retrieved_tokens = len(_tokenizer.encode("\n".join(all_matched_text))) if all_matched_text else 0
-
+        retrieved_tokens = len(_tokenizer.encode("\n".join(snippets))) if snippets else 0
         context.add_retrieval_log(
-            tool_name="keyword_search",
+            tool_name=self.name,
             tokens=retrieved_tokens,
-            metadata={
-                "keywords": keywords,
-                "chunks_found": len(top),
-                "chunk_ids": chunk_ids,
-            },
+            metadata={"keywords": keywords, "chunks_found": len(top), "chunk_ids": chunk_ids},
         )
-
-        return result, {
+        return "\n".join(lines), {
             "matches": len(top),
             "keywords": keywords,
             "retrieved_tokens": retrieved_tokens,

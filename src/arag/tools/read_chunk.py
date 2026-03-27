@@ -6,29 +6,15 @@ import tiktoken
 
 from .base import BaseTool
 from ..context import AgentContext
+from ..retrieval import ChunkCorpus
 
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
 class ReadChunkTool(BaseTool):
-    def __init__(self, chunks: list[dict]):
-        self._chunk_map = {c["id"]: c for c in chunks}
-
-    def _get_adjacent_ids(self, chunk_id: str) -> tuple[str | None, str | None]:
-        """Get the previous and next chunk IDs by file:page convention."""
-        chunk = self._chunk_map.get(chunk_id)
-        if chunk is None:
-            return None, None
-        file_name = chunk.get("file", "")
-        page = chunk.get("page", 0)
-        prev_id = f"{file_name}:{page - 1}" if page > 1 else None
-        next_id = f"{file_name}:{page + 1}"
-        # Only return if they actually exist
-        if prev_id and prev_id not in self._chunk_map:
-            prev_id = None
-        if next_id not in self._chunk_map:
-            next_id = None
-        return prev_id, next_id
+    def __init__(self, corpus: ChunkCorpus):
+        self._corpus = corpus
+        self._chunk_map = corpus.chunk_map
 
     @property
     def name(self) -> str:
@@ -74,26 +60,27 @@ class ReadChunkTool(BaseTool):
         total_tokens = 0
 
         for cid in chunk_ids:
-            if cid not in self._chunk_map:
+            parent = self._corpus.get_parent(cid)
+            if parent is None:
                 lines.append(f"[Chunk {cid}] Not found.")
                 continue
 
-            if context.is_chunk_read(cid):
-                lines.append(f"[Chunk {cid}] (既読 / already read)")
+            parent_id = parent["id"]
+            if context.is_chunk_read(parent_id):
+                lines.append(f"[Chunk {parent_id}] (既読 / already read)")
                 skipped += 1
                 continue
 
-            chunk = self._chunk_map[cid]
-            text = chunk["text"]
-            source = chunk.get("source", "")
+            text = parent["text"]
+            source = parent.get("source", "")
             chunk_tokens = len(_tokenizer.encode(text))
             total_tokens += chunk_tokens
 
-            context.mark_chunk_read(cid, chunk_tokens)
+            context.mark_chunk_read(parent_id, chunk_tokens)
             new_count += 1
 
             # Show adjacent chunk info for context expansion
-            prev_id, next_id = self._get_adjacent_ids(cid)
+            prev_id, next_id = self._corpus.get_adjacent_parent_ids(parent_id)
             adj_info = ""
             if prev_id or next_id:
                 parts = []
@@ -103,9 +90,13 @@ class ReadChunkTool(BaseTool):
                     parts.append(f"次: Chunk {next_id}")
                 adj_info = f" [隣接チャンク: {', '.join(parts)}]"
 
-            lines.append(f"=== Chunk {cid} | {source}{adj_info} ===")
+            lines.append(f"=== Chunk {parent_id} | {source}{adj_info} ===")
             lines.append(text)
             lines.append("")
+
+        # Show cumulative read count to help agent gauge progress
+        total_read = len(context.read_chunk_ids)
+        lines.append(f"[累計読了チャンク数: {total_read}]")
 
         result = "\n".join(lines)
 

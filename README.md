@@ -4,9 +4,11 @@
 
 ## アーキテクチャ
 
-- **A-RAG (Agentic RAG)**: ReActループでセマンティック検索・キーワード検索・チャンク読み取りを組み合わせて回答を生成
+- **A-RAG (Agentic RAG)**: ReActループで `hybrid_search` / `read_chunk` を中心に回答生成
+- **Retrieval**: dense + BM25 + RRF + heuristic/LLM rerank + optional query expansion/HyDE
+- **Chunking**: parent/child chunking。検索は child、表示は parent
 - **LLM**: Cerebras (gpt-oss-120b) / Gemini フォールバック
-- **Embedding**: Gemini (gemini-embedding-2-preview / 3072次元)
+- **Embedding**: provider 抽象化済み。既定は Gemini、OpenAI-compatible embeddings にも対応
 - **Frontend**: SvelteKit + SSE ストリーミング
 - **Backend**: FastAPI (Python)
 - **インフラ**: Google Cloud Run + GCS
@@ -36,20 +38,27 @@ src/
     prompt.py          # システムプロンプト (質問複雑度に応じた検索戦略)
     config.py          # 設定管理
     context.py         # エージェント実行コンテキスト (チャンク読取追跡、トークン集計)
+    retrieval.py         # ChunkCorpus / BM25 / RRF
+    query_rewrite.py     # query expansion / HyDE
+    reranker.py          # heuristic / LLM reranker
     tools/
-      semantic_search.py  # Gemini embedding による意味検索 (top_k最大30)
-      keyword_search.py   # キーワード完全一致検索 (top_k最大30)
-      read_chunk.py       # チャンク全文読み取り (隣接チャンク展開)
+      hybrid_search.py    # dense + keyword + rerank の統合検索
+      semantic_search.py  # dense retrieval
+      keyword_search.py   # BM25 / exact-hit 検索
+      read_chunk.py       # parent chunk 全文読み取り (隣接展開)
       filters.py          # チャンク品質フィルタ (表紙・目次除外、名簿・短文タグ)
       registry.py         # ツール登録
   embedding/
-    gemini.py          # Gemini Embedder (バッチ処理・リトライ)
+    factory.py         # 埋め込み provider ファクトリ
+    gemini.py          # Gemini Embedder
+    openai_compat.py   # OpenAI-compatible Embedder
 frontend/              # SvelteKit SPA (ストリーミング回答、参照リンク、モバイル対応)
 scripts/
-  build_index.py       # 文レベルembeddingインデックス構築 (チェックポイント付き)
-  process_pdfs.py      # PDF → チャンク変換 (LiteParse空間レイアウト抽出)
-  process_egov.py      # e-Gov法令API → チャンク変換
-  process_html_sources.py  # HTML/PDFソース → チャンク変換
+  build_index.py       # searchable child chunk の embedding インデックス構築
+  process_pdfs.py      # PDF → parent/child chunk 変換
+  process_egov.py      # e-Gov法令API → parent/child chunk 変換
+  process_html_sources.py  # HTML/PDFソース → parent/child chunk 変換
+  eval_retrieval.py    # Recall/MRR/nDCG 評価と候補出力
   download_additional_sources.py  # JICPA・企業会計審議会等のPDFダウンロード
   update_chunk_sources.py  # pdf_sources.json 更新
   deploy.sh            # Cloud Run デプロイ
@@ -73,6 +82,9 @@ cd frontend && npm ci && npm run build && cd ..
 # 環境変数
 export GEMINI_API_KEY="your-api-key"
 export CEREBRAS_API_KEY="your-api-key"
+# OpenAI-compatible embeddings を使う場合
+export EMBEDDING_API_KEY="your-api-key"
+export EMBEDDING_BASE_URL="https://api.openai.com/v1"
 ```
 
 ## インデックス構築
@@ -89,6 +101,9 @@ python scripts/process_html_sources.py
 
 # Embeddingインデックス構築 (チェックポイント付き、中断再開可能)
 python scripts/build_index.py
+
+# retrieval 評価候補の出力
+python scripts/eval_retrieval.py --write-candidates
 ```
 
 ## ローカル実行

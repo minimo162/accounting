@@ -1,0 +1,113 @@
+"""Hybrid retrieval with query expansion and reranking."""
+
+from typing import Any
+
+import tiktoken
+
+from .base import BaseTool
+from .filters import get_chunk_tag
+from .keyword_search import KeywordSearchTool
+from .semantic_search import SemanticSearchTool
+from ..config import RetrievalConfig
+from ..context import AgentContext
+from ..query_rewrite import QueryExpander
+from ..reranker import BaseReranker
+from ..retrieval import reciprocal_rank_fusion
+
+_tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
+class HybridSearchTool(BaseTool):
+    def __init__(
+        self,
+        semantic_tool: SemanticSearchTool,
+        keyword_tool: KeywordSearchTool,
+        query_expander: QueryExpander,
+        reranker: BaseReranker,
+        config: RetrievalConfig,
+    ):
+        self.semantic_tool = semantic_tool
+        self.keyword_tool = keyword_tool
+        self.query_expander = query_expander
+        self.reranker = reranker
+        self.config = config
+
+    @property
+    def name(self) -> str:
+        return "hybrid_search"
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": "dense検索とkeyword検索を統合し、必要ならquery expansionとrerankも行います。通常はこのツールを優先してください。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer", "default": 10},
+                },
+                "required": ["query"],
+            },
+        }
+
+    def execute(self, context: AgentContext, **kwargs) -> tuple[str, dict]:
+        query = kwargs.get("query", "")
+        top_k = min(int(kwargs.get("top_k", self.config.final_top_k)), 30)
+        if not query:
+            return "検索クエリを指定してください。", {"error": "no query"}
+        final, expansions, hyde_doc = self.search(query, top_k)
+        if not final:
+            return "関連する文書が見つかりませんでした。", {"matches": 0}
+
+        lines = []
+        snippets = []
+        chunk_ids = []
+        for item in final:
+            chunk_ids.append(item.parent_id)
+            tag = get_chunk_tag(item.text)
+            tag_str = f" {tag}" if tag else ""
+            lines.append(f"[Chunk {item.parent_id}] (hybrid: {item.score:.3f}){tag_str} {item.source}")
+            lines.append(f"  > {item.snippet}")
+            snippets.append(item.snippet)
+
+        unread_ids = [cid for cid in chunk_ids if not context.is_chunk_read(cid) and not get_chunk_tag((self.semantic_tool._corpus.get_parent(cid) or {}).get("text", ""))]
+        if unread_ids:
+            lines.append(f"\n--- {len(unread_ids)}件の未読チャンクがあります。read_chunkで全文を取得してください ---")
+            lines.append(f"read_chunk(chunk_ids={unread_ids})")
+
+        retrieved_tokens = len(_tokenizer.encode("\n".join(snippets))) if snippets else 0
+        context.add_retrieval_log(
+            tool_name=self.name,
+            tokens=retrieved_tokens,
+            metadata={
+                "query": query,
+                "expansions": expansions,
+                "hyde_used": bool(hyde_doc),
+                "chunks_found": len(final),
+                "chunk_ids": chunk_ids,
+            },
+        )
+        return "\n".join(lines), {
+            "matches": len(final),
+            "query": query,
+            "expansions": expansions,
+            "retrieved_tokens": retrieved_tokens,
+            "chunk_ids": chunk_ids,
+        }
+
+    def search(self, query: str, top_k: int) -> tuple[list, list[str], str | None]:
+        expansions = self.query_expander.expand(query)
+        hyde_doc = self.query_expander.generate_hypothetical_document(query)
+
+        semantic_rankings = []
+        keyword_rankings = []
+        for expanded in expansions:
+            semantic_rankings.append(self.semantic_tool.search(expanded, self.config.semantic_top_k))
+            keyword_rankings.append(self.keyword_tool.search([expanded], self.config.keyword_top_k))
+        if hyde_doc:
+            semantic_rankings.append(self.semantic_tool.search(hyde_doc, self.config.semantic_top_k))
+
+        fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
+        reranked = self.reranker.rerank(query, fused[: self.config.rerank_top_n])
+        final = reranked[:top_k]
+        return final, expansions, hyde_doc

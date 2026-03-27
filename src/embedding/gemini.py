@@ -4,10 +4,12 @@ import logging
 import numpy as np
 from google import genai
 
+from .base import BaseEmbedder
+
 logger = logging.getLogger(__name__)
 
 
-class GeminiEmbedder:
+class GeminiEmbedder(BaseEmbedder):
     def __init__(self, api_key: str, model: str = "gemini-embedding-exp-03-07"):
         self.client = genai.Client(api_key=api_key)
         self.model = model

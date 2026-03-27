@@ -11,10 +11,14 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.arag.config import Config
 from src.arag.agent import Agent
-from src.arag.tools import KeywordSearchTool, SemanticSearchTool, ReadChunkTool, ReadDocumentTool, ToolRegistry
-from src.embedding.gemini import GeminiEmbedder
+from src.arag.config import Config
+from src.arag.llm import LLMClient
+from src.arag.query_rewrite import QueryExpander
+from src.arag.reranker import BaseReranker, HeuristicReranker, LLMReranker
+from src.arag.retrieval import ChunkCorpus
+from src.arag.tools import HybridSearchTool, KeywordSearchTool, ReadChunkTool, ReadDocumentTool, SemanticSearchTool, ToolRegistry
+from src.embedding import create_embedder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +32,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global state
 _agent: Agent | None = None
 
 GCS_BUCKET = os.getenv("GCS_BUCKET", "jp-accounting-chat-data")
@@ -36,7 +39,6 @@ GCS_PREFIX = os.getenv("GCS_PREFIX", "index")
 
 
 def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
-    """Download index files from GCS if they don't exist locally."""
     from google.cloud import storage as gcs
 
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -48,12 +50,9 @@ def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
     meta_path = index_dir / "sentence_meta.pkl"
     legacy_path = index_dir / "sentence_index.pkl"
 
-    # Already have compressed format
     if chunks_path.exists() and npz_path.exists() and meta_path.exists():
         logger.info("Index files already exist locally, skipping download")
         return
-
-    # Already have legacy format
     if chunks_path.exists() and legacy_path.exists():
         logger.info("Legacy index files already exist locally, skipping download")
         return
@@ -63,8 +62,7 @@ def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
     bucket = client.bucket(bucket_name)
 
     if not chunks_path.exists():
-        blob = bucket.blob(f"{prefix}/chunks.json")
-        blob.download_to_filename(str(chunks_path))
+        bucket.blob(f"{prefix}/chunks.json").download_to_filename(str(chunks_path))
         logger.info(f"Downloaded chunks.json ({chunks_path.stat().st_size // 1024} KB)")
 
     pdf_sources_path = local_dir / "pdf_sources.json"
@@ -72,23 +70,17 @@ def _download_from_gcs(bucket_name: str, prefix: str, local_dir: Path):
         pdf_blob = bucket.blob(f"{prefix}/pdf_sources.json")
         if pdf_blob.exists():
             pdf_blob.download_to_filename(str(pdf_sources_path))
-            logger.info(f"Downloaded pdf_sources.json")
+            logger.info("Downloaded pdf_sources.json")
 
-    # Prefer compressed npz + meta format
     npz_blob = bucket.blob(f"{prefix}/sentence_index.npz")
     meta_blob = bucket.blob(f"{prefix}/sentence_meta.pkl")
     if npz_blob.exists() and meta_blob.exists():
         if not npz_path.exists():
             npz_blob.download_to_filename(str(npz_path))
-            logger.info(f"Downloaded sentence_index.npz ({npz_path.stat().st_size // 1024 // 1024} MB)")
         if not meta_path.exists():
             meta_blob.download_to_filename(str(meta_path))
-            logger.info(f"Downloaded sentence_meta.pkl ({meta_path.stat().st_size // 1024 // 1024} MB)")
     elif not legacy_path.exists():
-        # Fallback to legacy pkl
-        blob = bucket.blob(f"{prefix}/sentence_index.pkl")
-        blob.download_to_filename(str(legacy_path))
-        logger.info(f"Downloaded sentence_index.pkl ({legacy_path.stat().st_size // 1024 // 1024} MB)")
+        bucket.blob(f"{prefix}/sentence_index.pkl").download_to_filename(str(legacy_path))
 
 
 def get_agent() -> Agent:
@@ -102,40 +94,48 @@ def _init_agent() -> Agent:
     config = Config.from_env()
     data_dir = Path(os.getenv("DATA_DIR", "data"))
 
-    # Download from GCS if needed (for Cloud Run)
     if os.getenv("USE_GCS", "").lower() in ("1", "true", "yes"):
         _download_from_gcs(GCS_BUCKET, GCS_PREFIX, data_dir)
 
-    # Load chunks
-    chunks_path = data_dir / "chunks.json"
-    with open(chunks_path) as f:
-        chunks = json.load(f)
+    chunks = json.loads((data_dir / "chunks.json").read_text())
     logger.info(f"Loaded {len(chunks)} chunks")
 
-    # Init embedder
-    embedder = GeminiEmbedder(
-        api_key=config.embedding.api_key,
-        model=config.embedding.model,
-    )
+    corpus = ChunkCorpus(chunks)
+    embedder = create_embedder(config.embedding)
+    llm_client = LLMClient(config.llm)
 
-    # Init tools
     registry = ToolRegistry()
-    registry.register(KeywordSearchTool(chunks))
-    registry.register(SemanticSearchTool(
+    keyword_tool = KeywordSearchTool(corpus)
+    semantic_tool = SemanticSearchTool(
         index_path=str(data_dir / "index" / "sentence_index.pkl"),
         embed_fn=embedder.embed_query,
-    ))
-    registry.register(ReadChunkTool(chunks))
+        corpus=corpus,
+    )
+    if config.retrieval.reranker == "llm":
+        reranker = LLMReranker(llm_client)
+    elif config.retrieval.reranker == "none":
+        reranker = BaseReranker()
+    else:
+        reranker = HeuristicReranker()
+    registry.register(
+        HybridSearchTool(
+            semantic_tool=semantic_tool,
+            keyword_tool=keyword_tool,
+            query_expander=QueryExpander(config.retrieval, llm=llm_client),
+            reranker=reranker,
+            config=config.retrieval,
+        )
+    )
+    registry.register(keyword_tool)
+    registry.register(semantic_tool)
+    registry.register(ReadChunkTool(corpus))
     registry.register(ReadDocumentTool(chunks))
 
-    chunk_map = {c["id"]: c for c in chunks}
-
-    # Load PDF source URL mapping
-    pdf_sources_path = data_dir / "pdf_sources.json"
+    chunk_map = {chunk["id"]: chunk for chunk in chunks}
     pdf_sources = {}
+    pdf_sources_path = data_dir / "pdf_sources.json"
     if pdf_sources_path.exists():
-        with open(pdf_sources_path) as f:
-            pdf_sources = json.load(f)
+        pdf_sources = json.loads(pdf_sources_path.read_text())
         logger.info(f"Loaded {len(pdf_sources)} PDF source URLs")
 
     return Agent(config=config, tools=registry, chunk_map=chunk_map, pdf_sources=pdf_sources)
@@ -153,7 +153,6 @@ class QuestionRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Pre-load agent and index during startup, before serving requests."""
     logger.info("Pre-loading agent and index...")
     get_agent()
     logger.info("Agent ready")
@@ -161,7 +160,6 @@ async def startup_event():
 
 @app.post("/api/ask")
 async def ask_question(req: QuestionRequest):
-    """Non-streaming endpoint."""
     agent = get_agent()
     result = await agent.arun(req.question, history=req.history)
     return {
@@ -178,7 +176,6 @@ async def ask_question(req: QuestionRequest):
 
 @app.post("/api/ask/stream")
 async def ask_question_stream(req: QuestionRequest):
-    """SSE streaming endpoint."""
     agent = get_agent()
 
     async def event_generator():
@@ -187,8 +184,7 @@ async def ask_question_stream(req: QuestionRequest):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.exception(f"Stream error: {e}")
-            error_event = {"type": "error", "data": f"エラーが発生しました: {str(e)}"}
-            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'data': f'エラーが発生しました: {str(e)}'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -202,7 +198,6 @@ async def health():
     return {"status": "ok"}
 
 
-# Mount static files for frontend (built Svelte)
 static_dir = Path("frontend/build")
 if static_dir.exists():
     app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
