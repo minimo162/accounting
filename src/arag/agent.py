@@ -226,6 +226,7 @@ class Agent:
                 for ref in self._get_referenced_chunks(context):
                     yield {"type": "reference", "data": ref}
                 summary = context.get_summary()
+                summary["read_chunk_count"] = summary.get("chunks_read_count", 0)
                 summary["chunks_read_count"] = self._count_cited_references(answer)
                 yield {
                     "type": "done",
@@ -420,6 +421,7 @@ class Agent:
             "total_cost": total_cost,
             **context.get_summary(),
             "cited_reference_count": self._count_cited_references(sanitized_answer),
+            "read_chunk_count": len(context.read_chunk_ids),
             "trajectory": context.trajectory,
             "references": references,
         }

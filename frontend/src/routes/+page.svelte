@@ -12,6 +12,7 @@
     metadata?: {
       loops?: number;
       chunks_read_count?: number;
+      read_chunk_count?: number;
       total_cost?: number;
       references?: Reference[];
     };
@@ -32,8 +33,12 @@
     }
   }
 
-  function getDisplayedReferenceCount(message: Message): number | string {
-    return message.metadata?.chunks_read_count ?? message.metadata?.references?.length ?? '?';
+  function getDisplayedCitationCount(message: Message): number | string {
+    return message.metadata?.chunks_read_count ?? '?';
+  }
+
+  function getDisplayedReadCount(message: Message): number | string {
+    return message.metadata?.references?.length ?? message.metadata?.read_chunk_count ?? '?';
   }
 
   function scrollToMessage(idx: number) {
@@ -498,7 +503,7 @@
             {#if msg.metadata?.references?.length}
               <div class="references">
                 <details>
-                  <summary>参照した条文 ({getDisplayedReferenceCount(msg)}件)</summary>
+                  <summary>読んだ候補条文 ({getDisplayedReadCount(msg)}件)</summary>
                   <div class="ref-list">
                     {#each msg.metadata.references as ref}
                       <div class="ref-item">
@@ -525,7 +530,8 @@
             {#if msg.metadata}
               <div class="meta">
                 検索ステップ: {msg.metadata.loops ?? '?'} |
-                参照: {getDisplayedReferenceCount(msg)}件
+                引用: {getDisplayedCitationCount(msg)}件 |
+                候補: {getDisplayedReadCount(msg)}件
               </div>
             {/if}
           </div>
