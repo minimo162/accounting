@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from src.arag.config import Config
 from src.arag.agent import Agent
-from src.arag.tools import KeywordSearchTool, SemanticSearchTool, ReadChunkTool, ToolRegistry
+from src.arag.tools import KeywordSearchTool, SemanticSearchTool, ReadChunkTool, ReadDocumentTool, ToolRegistry
 from src.embedding.gemini import GeminiEmbedder
 
 logging.basicConfig(level=logging.INFO)
@@ -126,6 +126,7 @@ def _init_agent() -> Agent:
         embed_fn=embedder.embed_query,
     ))
     registry.register(ReadChunkTool(chunks))
+    registry.register(ReadDocumentTool(chunks))
 
     chunk_map = {c["id"]: c for c in chunks}
 

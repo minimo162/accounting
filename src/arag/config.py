@@ -41,7 +41,7 @@ class EmbeddingConfig:
 
 @dataclass
 class AgentConfig:
-    max_loops: int = 15
+    max_loops: int = 25
     max_token_budget: int = 128000
     verbose: bool = False
 

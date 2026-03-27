@@ -120,11 +120,11 @@ def process_law(xml_path: Path, source_name: str, file_name: str) -> list[dict]:
                 })
                 page_counter += 1
 
-    # Add overlap: prepend tail of previous chunk to each chunk
+    # Store overlap as separate field (not embedded in text)
     prev_tail = ""
     for chunk in chunks:
         if prev_tail:
-            chunk["text"] = prev_tail + "\n...\n" + chunk["text"]
+            chunk["overlap_prefix"] = prev_tail
         prev_tail = chunk["text"][-_OVERLAP_CHARS:]
 
     return chunks

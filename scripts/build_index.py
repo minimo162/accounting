@@ -18,21 +18,36 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.embedding.gemini import GeminiEmbedder
 
 
 def _compute_file_checksum(file_chunks: list[dict]) -> str:
-    """チャンクのIDとテキストからMD5チェックサムを計算する。
+    """チャンクのID・テキスト・コンテキストからMD5チェックサムを計算する。
 
-    チャンク内容が変わればチェックサムも変わるため、再埋め込みが必要かを判定できる。
+    チャンク内容またはコンテキストが変わればチェックサムも変わるため、再埋め込みが必要かを判定できる。
     """
     content = "||".join(
-        f"{c['id']}\x00{c['text']}"
+        f"{c['id']}\x00{c['text']}\x00{c.get('context', '')}"
         for c in sorted(file_chunks, key=lambda c: c["id"])
     )
     return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+
+def _embedding_text(chunk: dict) -> str:
+    """埋め込みに使用するテキストを返す。
+
+    Contextual Retrieval: contextフィールドがあれば、context + text を結合して
+    埋め込むことで、チャンクが文書全体のどこに位置するかをembeddingに反映する。
+    """
+    context = chunk.get("context", "")
+    if context:
+        return context + "\n\n" + chunk["text"]
+    return chunk["text"]
 
 
 def _chunk_file(chunk_id: str) -> str:
@@ -203,14 +218,16 @@ def build_index(chunks_path: str, output_dir: str, api_key: str):
 
     for file_idx, file_name in enumerate(files_to_reindex):
         file_chunks = chunks_by_file[file_name]
-        file_texts = [c["text"] for c in file_chunks]
+        file_texts = [_embedding_text(c) for c in file_chunks]
         file_ids = [c["id"] for c in file_chunks]
 
         print(f"  [{file_idx+1}/{len(files_to_reindex)}] {file_name}: {len(file_chunks)} chunks...", end="", flush=True)
 
         file_embeddings = embedder.embed_batch(file_texts)
 
-        all_texts.extend(file_texts)
+        # Store original text in metadata (for display), not contextualized text
+        file_original_texts = [c["text"] for c in file_chunks]
+        all_texts.extend(file_original_texts)
         all_embeddings.extend(file_embeddings)
         all_chunk_ids.extend(file_ids)
         indexed_files.add(file_name)

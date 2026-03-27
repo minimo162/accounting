@@ -71,6 +71,22 @@ def _remove_page_numbers(text: str) -> str:
     return text
 
 
+# OCR artifacts: lines consisting only of isolated non-CJK symbols (e.g. "rf  Tf  Q  &")
+_OCR_JUNK_LINE_RE = re.compile(
+    r'^[\s]*(?:[a-zA-Z]{1,3}[\s]+){1,}[a-zA-Z]{0,3}[\s]*$',
+    re.MULTILINE,
+)
+
+
+def _clean_ocr_artifacts(text: str) -> str:
+    """Remove OCR rendering artifacts and collapse excessive whitespace."""
+    # Remove lines that look like PDF rendering operator remnants (rf, Tf, Q, BT, ET, etc.)
+    text = _OCR_JUNK_LINE_RE.sub('', text)
+    # Collapse 3+ consecutive blank lines into 2
+    text = re.sub(r'\n\s*\n\s*\n(\s*\n)*', '\n\n\n', text)
+    return text
+
+
 def _extract_title(text: str) -> str:
     """Extract document title from first non-junk lines."""
     std_patterns = ['企業会計基準', '適用指針', '実務対応報告', '監査基準', '中間監査',
@@ -232,39 +248,59 @@ def _split_by_blank_lines_with_positions(
     return _merge_and_size(raw_sections, max_chars, min_chars)
 
 
+
+def _fitz_extract(pdf_path: Path) -> tuple[str, list[tuple[int, int]]]:
+    """PyMuPDF でページごとにテキスト抽出する。"""
+    import fitz
+    doc = fitz.open(str(pdf_path))
+    page_data: list[tuple[int, str]] = []
+    for i in range(len(doc)):
+        t = doc[i].get_text("text").strip()
+        if t:
+            page_data.append((i + 1, t))
+    doc.close()
+    return _join_pages(page_data)
+
+
 def _parse_pdf(lp: LiteParse, pdf_path: Path) -> tuple[str, list[tuple[int, int]]]:
     """Extract spatial text from PDF.
+
+    LiteParse を優先し、テキストが空の場合は fitz にフォールバック。
 
     Returns:
         (full_text, page_breaks) where page_breaks is a list of
         (char_offset, pdf_page_num) indicating where each PDF page starts
         in full_text (1-indexed page numbers).
     """
+    # --- LiteParse で抽出 ---
+    lp_text, lp_breaks = "", []
     try:
         result = lp.parse(str(pdf_path))
+        page_data = []
+        for page_num, page in enumerate(result.pages, 1):
+            # fontName='OCR' のみのページはOCRレイヤーの残骸（数字だけ）なのでスキップ
+            if page.textItems and all(item.fontName == "OCR" for item in page.textItems):
+                continue
+            cleaned = _clean_ocr_artifacts(_remove_page_numbers(page.text)).rstrip()
+            if cleaned.strip():
+                page_data.append((page_num, cleaned))
+        lp_text, lp_breaks = _join_pages(page_data)
     except Exception as e:
         print(f"  Warning: LiteParse failed for {pdf_path.name}: {e}")
-        # Fallback to PyMuPDF — no per-page tracking in fallback
-        try:
-            import fitz
-            doc = fitz.open(str(pdf_path))
-            page_data: list[tuple[int, str]] = []
-            for i in range(len(doc)):
-                t = doc[i].get_text("text").strip()
-                if t:
-                    page_data.append((i + 1, t))
-            doc.close()
-            return _join_pages(page_data)
-        except Exception:
-            return "", []
 
-    page_data = []
-    for page_num, page in enumerate(result.pages, 1):
-        cleaned = _remove_page_numbers(page.text).rstrip()
-        if cleaned.strip():
-            page_data.append((page_num, cleaned))
+    if lp_text.strip():
+        return lp_text, lp_breaks
 
-    return _join_pages(page_data)
+    # LiteParse が空 → fitz にフォールバック
+    try:
+        fitz_text, fitz_breaks = _fitz_extract(pdf_path)
+        if fitz_text.strip():
+            print(f"  Note: LiteParse empty, using fitz for {pdf_path.name}")
+            return fitz_text, fitz_breaks
+    except Exception:
+        pass
+
+    return "", []
 
 
 def _join_pages(page_data: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int]]]:
@@ -298,22 +334,12 @@ def create_chunks(pdf_dir: str, output_path: str):
     # e-Gov XML でカバーされる PDF はスキップ (XML の方が構造的に正確)
     egov_covered = get_egov_covered_pdfs()
 
-    # スキャンPDFなどテキスト抽出不可のファイルを明示的に除外
-    SKIP_GARBLED = {
-        "bac_genson_kijun.pdf",   # 原価計算基準 — スキャンPDF、テキスト抽出不可
-        "bac_genson_iken.pdf",    # 企業会計審議会意見書 — スキャンPDF、テキスト抽出不可
-        "reg_chukan_guideline.pdf",  # 中間財務諸表等規則ガイドライン — スキャンPDF
-    }
-
     lp = LiteParse()
     chunks = []
 
     for pdf_path in pdf_files:
         if pdf_path.name in egov_covered:
             print(f"Skipping (covered by e-Gov XML): {pdf_path.name}")
-            continue
-        if pdf_path.name in SKIP_GARBLED:
-            print(f"Skipping (garbled scan PDF): {pdf_path.name}")
             continue
         print(f"Processing: {pdf_path.name}")
         full_text, page_breaks = _parse_pdf(lp, pdf_path)
@@ -345,12 +371,25 @@ def create_chunks(pdf_dir: str, output_path: str):
                 "pdf_page": pdf_page,
             })
 
-        # Add overlap: prepend tail of previous chunk to each chunk
+        # Store overlap as separate field (not embedded in text)
         prev_tail = ""
         for chunk in file_chunks:
             if prev_tail:
-                chunk["text"] = prev_tail + "\n...\n" + chunk["text"]
+                chunk["overlap_prefix"] = prev_tail
             prev_tail = chunk["text"][-_OVERLAP_CHARS:]
+
+        # Merge tiny leading/trailing chunks (< 150 chars)
+        if len(file_chunks) > 1 and len(file_chunks[0]["text"]) < 150:
+            file_chunks[1]["text"] = file_chunks[0]["text"] + "\n\n" + file_chunks[1]["text"]
+            file_chunks[1]["pdf_page"] = file_chunks[0]["pdf_page"]
+            file_chunks.pop(0)
+        if len(file_chunks) > 1 and len(file_chunks[-1]["text"]) < 150:
+            file_chunks[-2]["text"] = file_chunks[-2]["text"] + "\n\n" + file_chunks[-1]["text"]
+            file_chunks.pop()
+        # Renumber chunk IDs after merging
+        for j, fc in enumerate(file_chunks, 1):
+            fc["id"] = f"{pdf_path.name}:{j}"
+            fc["page"] = j
 
         chunks.extend(file_chunks)
         print(f"  {len(file_chunks)} chunks")
