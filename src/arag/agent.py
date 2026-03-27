@@ -225,12 +225,14 @@ class Agent:
                 # Send references individually to avoid oversized SSE events
                 for ref in self._get_referenced_chunks(context):
                     yield {"type": "reference", "data": ref}
+                summary = context.get_summary()
+                summary["chunks_read_count"] = self._count_cited_references(answer)
                 yield {
                     "type": "done",
                     "data": {
                         "loops": loop_idx + 1,
                         "stop_reason": "natural",
-                        **context.get_summary(),
+                        **summary,
                         "total_cost": total_cost,
                     },
                 }
