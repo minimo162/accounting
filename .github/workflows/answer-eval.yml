@@ -1,0 +1,48 @@
+name: answer-eval
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 22 * * 0"
+
+jobs:
+  answer-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run unit tests
+        run: uv run python -m unittest discover -s tests
+
+      - name: Run deployed answer eval
+        if: ${{ vars.ACCOUNTING_QA_API_URL != '' }}
+        run: |
+          mkdir -p eval/reports
+          uv run python scripts/eval_answers.py \
+            --backend api \
+            --api-url "${{ vars.ACCOUNTING_QA_API_URL }}" \
+            --cases eval/answer_eval_set.jsonl \
+            --format markdown \
+            --output eval/reports/answer_eval.md
+
+      - name: Repository variable hint
+        if: ${{ vars.ACCOUNTING_QA_API_URL == '' }}
+        run: echo "Set repository variable ACCOUNTING_QA_API_URL to enable deployed answer eval."
+
+      - name: Upload answer eval report
+        if: ${{ always() && vars.ACCOUNTING_QA_API_URL != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: answer-eval-report
+          path: eval/reports/answer_eval.md

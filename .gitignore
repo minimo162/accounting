@@ -57,3 +57,4 @@ node_modules/
 data/egov_cache/
 data/full_texts.json
 eng.traineddata
+eval/reports/

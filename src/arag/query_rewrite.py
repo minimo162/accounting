@@ -37,20 +37,93 @@ class QueryExpander:
         "比較", "違い", "それぞれ", "併せて", "また", "及び", "ならびに",
     )
     _SIMPLE_TERMS = ("とは", "何か", "意味", "定義", "概要", "趣旨")
+    _KEYWORD_PATTERNS = (
+        r"(企業会計基準第\d+号)",
+        r"(適用指針第\d+号)",
+        r"(実務対応報告第\d+号)",
+        r"(会計基準第\d+号)",
+        r"(第\d+項)",
+        r"(BC\d+)",
+        r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に関する会計基準(?:の適用指針)?)",
+        r"(ヘッジ会計の適用要件)",
+        r"(リスク管理方針文書(?:の記載事項)?)",
+        r"(繰延ヘッジ)",
+        r"(ヘッジ会計)",
+        r"(有効性)",
+        r"(事前テスト)",
+        r"(事後テスト)",
+        r"(使用権資産)",
+        r"(リース負債)",
+        r"(履行義務)",
+        r"(本人)",
+        r"(代理人)",
+        r"(税効果会計)",
+        r"(繰延税金資産)",
+        r"(繰延税金負債)",
+        r"(法定実効税率)",
+        r"(収益認識基準)",
+    )
+    _FILLER_PHRASES = (
+        "について",
+        "における",
+        "に関する",
+        "を教えてください",
+        "を教えて",
+        "教えてください",
+        "教えて",
+        "どのように",
+        "どう判断しますか",
+        "どう判断する",
+        "ですか",
+        "ますか",
+        "してください",
+        "するための",
+        "ための",
+        "主な",
+        "詳しく",
+        "それぞれ",
+    )
+    _SEPARATOR_CHARS = "、。・/()（）「」『』【】[]{}:：?？!！,."
 
     def __init__(self, config: RetrievalConfig, llm: LLMClient | None = None):
         self.config = config
         self.llm = llm
 
-    @staticmethod
-    def _extract_keywords(query: str) -> list[str]:
-        return list(dict.fromkeys(re.findall(r"(企業会計基準第\d+号|適用指針第\d+号|実務対応報告第\d+号|第\d+項|[一-龥ぁ-んァ-ヶーA-Za-z0-9]{2,})", query)))
+    @classmethod
+    def _extract_keywords(cls, query: str) -> list[str]:
+        keywords: list[str] = []
+
+        def add(term: str):
+            normalized = term.strip()
+            if normalized and normalized not in keywords:
+                keywords.append(normalized)
+
+        for pattern in cls._KEYWORD_PATTERNS:
+            for match in re.findall(pattern, query):
+                add(match)
+
+        reduced = query
+        for phrase in cls._FILLER_PHRASES:
+            reduced = reduced.replace(phrase, " ")
+        for ch in cls._SEPARATOR_CHARS:
+            reduced = reduced.replace(ch, " ")
+        for particle in ("は", "が", "を", "に", "で", "と", "の", "も", "へ", "や"):
+            reduced = reduced.replace(particle, " ")
+
+        for token in reduced.split():
+            if len(token) < 2 or len(token) > 24:
+                continue
+            if re.fullmatch(r"[ぁ-ん]{2,}", token):
+                continue
+            add(token)
+
+        return keywords[:8]
 
     @classmethod
     def profile(cls, query: str) -> QueryProfile:
         keywords = cls._extract_keywords(query)
         exact = cls.is_exact_query(query)
-        canonical_focus = cls._canonical_title_focus_variant(query)
+        canonical_focus = cls._domain_focus_variant(query) or cls._canonical_title_focus_variant(query)
         corrective_query = canonical_focus or cls._anchor_focus_variant(query)
         complexity = cls._infer_complexity(query, keywords, exact)
 
@@ -108,7 +181,7 @@ class QueryExpander:
     def _heuristic_variants(self, query: str) -> list[str]:
         keywords = self._extract_keywords(query)
         variants: list[str] = []
-        canonical_focus = self._canonical_title_focus_variant(query)
+        canonical_focus = self._domain_focus_variant(query) or self._canonical_title_focus_variant(query)
         if canonical_focus:
             variants.append(canonical_focus)
         if len(keywords) >= 2:
@@ -132,6 +205,17 @@ class QueryExpander:
         if len(query) >= 35 or len(keywords) >= 6:
             return "complex"
         return "moderate"
+
+    @classmethod
+    def _domain_focus_variant(cls, query: str) -> str | None:
+        if "繰延ヘッジ" in query or "ヘッジ会計" in query:
+            focus_parts = ["ヘッジ会計"]
+            if "繰延ヘッジ" in query:
+                focus_parts.append("繰延ヘッジ")
+            if any(term in query for term in ("要件", "適用")):
+                focus_parts.extend(["ヘッジ会計の適用要件", "正式な文書", "有効性", "事前テスト", "事後テスト"])
+            return " ".join(dict.fromkeys(focus_parts))
+        return None
 
     @staticmethod
     def _canonicalize_standard_aliases(query: str) -> str:
@@ -168,6 +252,7 @@ class QueryExpander:
         generic_terms = (
             "教えてください", "教えて", "改正点", "変更点", "違い", "比較",
             "概要", "内容", "ポイント", "会計基準", "基準", "について",
+            "どのように", "ですか", "ますか", "主な", "するための",
         )
         reduced = query
         for term in generic_terms:

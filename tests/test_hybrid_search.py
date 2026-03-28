@@ -109,6 +109,24 @@ class HybridSearchTests(unittest.TestCase):
         self.assertEqual(profile.complexity, "simple")
         self.assertEqual(profile.search_mode, "keyword_first")
 
+    def test_query_expansion_adds_hedge_accounting_focus_terms(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+
+        expansions = expander.expand("繰延ヘッジを適用するための主な要件を教えてください")
+        profile = QueryExpander.profile("繰延ヘッジを適用するための主な要件を教えてください")
+
+        self.assertEqual(
+            expansions,
+            [
+                "繰延ヘッジを適用するための主な要件を教えてください",
+                "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+            ],
+        )
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertEqual(profile.corrective_query, expansions[1])
+
     def test_search_uses_semantic_only_for_primary_non_exact_query(self):
         semantic = FakeSemanticTool({"リース 会計": [make_result("doc-a:p1", 0.9)]})
         keyword = FakeKeywordTool(
@@ -231,6 +249,68 @@ class HybridSearchTests(unittest.TestCase):
         ranked = tool._apply_change_intent_boosts("リース会計基準の改正点", [unchanged, changed])
 
         self.assertEqual([item.parent_id for item in ranked], ["new:p1", "old:p1"])
+
+    def test_search_filters_low_value_parent_results(self):
+        toc = SearchResult(
+            chunk_id="toc:p1",
+            parent_id="toc:p1",
+            score=0.9,
+            source="移管指針第9号 > 目 次",
+            snippet="目次",
+            text="目 次\nヘッジ会計の適用要件\nリスク管理方針文書の記載事項",
+            metadata={"doc_type": "適用指針"},
+        )
+        actual = SearchResult(
+            chunk_id="real:p30",
+            parent_id="real:p30",
+            score=0.7,
+            source="移管指針第9号 > （ヘッジ取引開始時（事前テスト））",
+            snippet="正式な文書による明確化",
+            text="企業はヘッジ取引開始時に正式な文書によって明確にしなければならない。",
+            metadata={"doc_type": "適用指針"},
+        )
+        tool = HybridSearchTool(
+            semantic_tool=FakeSemanticTool({}),
+            keyword_tool=FakeKeywordTool({}),
+            query_expander=FakeQueryExpander(["ヘッジ会計 要件"]),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        ranked = tool._filter_low_value_parent_results([toc, actual])
+
+        self.assertEqual([item.parent_id for item in ranked], ["real:p30"])
+
+    def test_focus_term_boosts_prioritize_core_hedge_requirement_sections(self):
+        peripheral = SearchResult(
+            chunk_id="qa:p24",
+            parent_id="qa:p24",
+            score=0.8,
+            source="移管指針第12号 > Q&A",
+            snippet="金利スワップをヘッジ取引として扱う場合のQ&A。",
+            text="Q&Aの断片。ヘッジ会計という語はあるが、有効性や正式な文書には触れない。",
+            metadata={"doc_type": "適用指針"},
+        )
+        core = SearchResult(
+            chunk_id="guidance:p30",
+            parent_id="guidance:p30",
+            score=0.6,
+            source="移管指針第9号 > （ヘッジ取引開始時（事前テスト））",
+            snippet="正式な文書によりヘッジ手段とヘッジ対象を明確にする。",
+            text="ヘッジ会計の適用要件として、正式な文書と有効性の事前テストが求められる。",
+            metadata={"doc_type": "適用指針", "section_title": "ヘッジ会計の適用要件"},
+        )
+        tool = HybridSearchTool(
+            semantic_tool=FakeSemanticTool({}),
+            keyword_tool=FakeKeywordTool({}),
+            query_expander=FakeQueryExpander(["繰延ヘッジ 要件"]),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        ranked = tool._apply_focus_term_boosts("繰延ヘッジを適用するための主な要件を教えてください", [peripheral, core])
+
+        self.assertEqual([item.parent_id for item in ranked], ["guidance:p30", "qa:p24"])
 
     def test_topic_alignment_boosts_exact_document_title_alias(self):
         standard = SearchResult(

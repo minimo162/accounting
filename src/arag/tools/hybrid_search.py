@@ -7,7 +7,7 @@ from typing import Any
 import tiktoken
 
 from .base import BaseTool
-from .filters import get_chunk_tag
+from .filters import get_chunk_tag, is_clearly_low_value
 from .keyword_search import KeywordSearchTool
 from .semantic_search import SemanticSearchTool
 from ..config import RetrievalConfig
@@ -176,6 +176,7 @@ class HybridSearchTool(BaseTool):
         if self._should_rerank(query, reranked, top_k):
             reranked = self.reranker.rerank(query, reranked)
         reranked = self._filter_change_delta_results(query, reranked)
+        reranked = self._filter_low_value_parent_results(reranked)
         final = reranked[:top_k]
         return final, expansions, hyde_doc, {
             "confidence": confidence,
@@ -204,6 +205,7 @@ class HybridSearchTool(BaseTool):
         fused = self._apply_exact_match_boosts(query, fused)
         fused = self._apply_change_intent_boosts(query, fused)
         fused = self._apply_topic_alignment_boosts(query, fused)
+        fused = self._apply_focus_term_boosts(query, fused)
         return fused[: self.config.rerank_top_n]
 
     def _estimate_confidence(self, query: str, results: list) -> float:
@@ -365,6 +367,11 @@ class HybridSearchTool(BaseTool):
 
     @staticmethod
     def _query_anchor_terms(query: str) -> list[str]:
+        focus_query = QueryExpander._domain_focus_variant(query) or query
+        anchors = QueryExpander._extract_keywords(focus_query)
+        if anchors:
+            return anchors[:4]
+
         generic_terms = (
             "改正点", "変更点", "会計基準", "改正", "変更", "見直し", "新基準", "改訂",
             "教えてください", "教えて", "内容", "記載", "取扱い", "方法", "基準",
@@ -379,6 +386,15 @@ class HybridSearchTool(BaseTool):
             if token not in anchors:
                 anchors.append(token)
         return anchors[:4]
+
+    @staticmethod
+    def _filter_low_value_parent_results(results: list) -> list:
+        filtered = [
+            item
+            for item in results
+            if not is_clearly_low_value(f"{item.source}\n{item.snippet}\n{item.text[:400]}")
+        ]
+        return filtered or results
 
     def _apply_topic_alignment_boosts(self, query: str, results: list) -> list:
         anchors = self._query_anchor_terms(query)
@@ -405,6 +421,44 @@ class HybridSearchTool(BaseTool):
             if canonical_titles and aliases:
                 if any(title in aliases for title in canonical_titles):
                     bonus += 1.0
+            boosted.append(
+                item.__class__(
+                    chunk_id=item.chunk_id,
+                    parent_id=item.parent_id,
+                    score=item.score + bonus,
+                    source=item.source,
+                    snippet=item.snippet,
+                    text=item.text,
+                    metadata=item.metadata,
+                )
+            )
+
+        boosted.sort(key=lambda item: item.score, reverse=True)
+        return boosted
+
+    @staticmethod
+    def _apply_focus_term_boosts(query: str, results: list) -> list:
+        focus_query = QueryExpander._domain_focus_variant(query)
+        if not focus_query:
+            return results
+
+        focus_terms = [term for term in focus_query.split() if len(term) >= 2]
+        boosted = []
+        for item in results:
+            meta = item.metadata or {}
+            title_window = " ".join(
+                [
+                    item.source,
+                    str(meta.get("doc_title", "")),
+                    str(meta.get("section_title", "")),
+                ]
+            )
+            body_window = f"{item.snippet[:260]} {item.text[:800]}"
+            title_hits = sum(1 for term in focus_terms if term in title_window)
+            body_hits = sum(1 for term in focus_terms if term in body_window)
+            bonus = title_hits * 0.45 + body_hits * 0.12
+            if title_hits == 0 and body_hits <= 1:
+                bonus -= 0.35
             boosted.append(
                 item.__class__(
                     chunk_id=item.chunk_id,

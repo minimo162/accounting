@@ -61,7 +61,10 @@ scripts/
   add_context.py           chunk に追加文脈を付与
   build_index.py           searchable chunk の埋め込み index 構築
   eval_retrieval.py        retrieval 評価
+  eval_answers.py          回答品質・速度評価
   deploy.sh                Cloud Run デプロイ
+eval/
+  answer_eval_set.jsonl    回答評価ケース
 data/
   chunks.json
   pdf_sources.json
@@ -163,6 +166,7 @@ python scripts/build_index.py
 
 - `build_index.py` はチェックポイント付きで差分更新に対応しています
 - retrieval 候補を評価したい場合は `python scripts/eval_retrieval.py --write-candidates` を使います
+- 回答品質と速度の回帰を見たい場合は `python scripts/eval_answers.py` と `eval/answer_eval_set.jsonl` を使います
 - Cloud Run では `USE_GCS=true` の場合、起動時に GCS から `chunks.json` と index 一式を取得します
 - `add_context.py` を実行して `context` が変わった場合も、`build_index.py` の checksum 判定で再埋め込み対象になります
 
@@ -201,6 +205,55 @@ gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
 - 実行環境で `gcloud auth login` と `gcloud config set project jp-accounting-chat` が済んでいる必要があります
 - Cloud Run 上では `DEEPSEEK_API_KEY` を別途設定しておく必要があります。`deploy.sh` では非シークレット設定のみ更新します
 - 別環境へ出す場合は、先に `scripts/deploy.sh` の定数と GCS 設定を見直してください
+
+## 評価
+
+retrieval のオフライン評価:
+
+```bash
+uv run python scripts/eval_retrieval.py --queries data/eval_queries.jsonl --mode hybrid
+```
+
+回答品質と速度の評価:
+
+```bash
+# ローカル agent に対して実行
+uv run python scripts/eval_answers.py \
+  --backend local \
+  --cases eval/answer_eval_set.jsonl \
+  --format markdown \
+  --output eval/reports/local_answer_eval.md
+
+# デプロイ済み API に対して実行
+uv run python scripts/eval_answers.py \
+  --backend api \
+  --api-url https://accounting-qa-xdt66erlqa-an.a.run.app \
+  --cases eval/answer_eval_set.jsonl \
+  --format markdown \
+  --output eval/reports/prod_answer_eval.md \
+  --fail-on-fail
+```
+
+`eval/answer_eval_set.jsonl` の主な項目:
+
+- `must_include_all`: 必ず含めたい語
+- `must_include_any`: どれか 1 つ以上含めたい語
+- `must_exclude`: 出してほしくない語
+- `min_citations`: 本文中の最低参照数
+- `max_loops`: 許容 loop 数の上限
+- `max_latency_sec`: 応答時間の上限
+- `max_retrieved_tokens`: retrieval で読んだ token 数の上限
+
+運用メモ:
+
+- しきい値は「理想値」ではなく、まず現行ベースラインを継続監視できる値に合わせています
+- retrieval を改善して baseline が下がったら、`eval/answer_eval_set.jsonl` の `max_loops` と `max_retrieved_tokens` を一緒に引き締めます
+
+GitHub Actions:
+
+- `.github/workflows/answer-eval.yml` は `workflow_dispatch` と週次 schedule で実行します
+- repository variable `ACCOUNTING_QA_API_URL` を設定すると、デプロイ済み API に対して `scripts/eval_answers.py` を走らせ、Markdown レポートを artifact に保存します
+- workflow 側はまず計測レポートの蓄積を優先し、常時失敗にはしません。quality gate にしたい場合は手元や別 workflow で `--fail-on-fail` を付けます
 
 ## トラブルシュート
 
