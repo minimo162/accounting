@@ -16,6 +16,10 @@ class AgentContext:
     """Tracks per-query state: which chunks have been read, token counts, retrieval logs."""
 
     def __init__(self):
+        self.question: str = ""
+        self.question_complexity: str = "moderate"
+        self.query_profile: dict[str, Any] = {}
+        self.current_search_query: str = ""
         self.read_chunk_ids: set[str] = set()
         self.searched_chunk_ids: list[str] = []  # ordered; preserves first-seen rank
         self.total_retrieved_tokens: int = 0
@@ -23,7 +27,23 @@ class AgentContext:
         self.search_history: list[dict[str, Any]] = []
         self.trajectory: list[dict[str, Any]] = []
         self.tool_cache: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+        self.evidence_notes: dict[str, str] = {}
         self.wrap_up_nudged: bool = False
+
+    def set_question(self, question: str, query_profile: dict[str, Any] | None = None):
+        self.question = question
+        self.query_profile = query_profile or {}
+        self.question_complexity = str(self.query_profile.get("complexity", "moderate"))
+        self.current_search_query = question
+
+    def set_current_search_query(self, query: str):
+        self.current_search_query = query
+
+    def add_search_entry(self, entry: dict[str, Any]):
+        self.search_history.append(entry)
+
+    def set_evidence_note(self, chunk_id: str, note: str):
+        self.evidence_notes[chunk_id] = note
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)
@@ -81,9 +101,14 @@ class AgentContext:
                 {"tool": log.tool_name, "tokens": log.tokens, **log.metadata}
                 for log in self.retrieval_logs
             ],
+            "question_complexity": self.question_complexity,
         }
 
     def reset(self):
+        self.question = ""
+        self.question_complexity = "moderate"
+        self.query_profile = {}
+        self.current_search_query = ""
         self.read_chunk_ids.clear()
         self.searched_chunk_ids.clear()
         self.total_retrieved_tokens = 0
@@ -91,4 +116,5 @@ class AgentContext:
         self.search_history.clear()
         self.trajectory.clear()
         self.tool_cache.clear()
+        self.evidence_notes.clear()
         self.wrap_up_nudged = False

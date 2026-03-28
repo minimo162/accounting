@@ -31,6 +31,13 @@ class SearchResult:
 class ChunkCorpus:
     """Access helpers for parent/child chunk structures."""
 
+    _TITLE_PATTERNS = (
+        re.compile(r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に関する会計基準)(?!の適用指針)"),
+        re.compile(r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+取引に関する会計基準)(?!の適用指針)"),
+        re.compile(r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に係る会計基準)"),
+        re.compile(r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に関する会計基準の適用指針)"),
+    )
+
     def __init__(self, chunks: list[dict]):
         self.chunk_map = {chunk["id"]: chunk for chunk in chunks}
         self.parent_chunks = [chunk for chunk in chunks if chunk.get("level", "parent") == "parent"]
@@ -46,6 +53,21 @@ class ChunkCorpus:
             self.parent_order_by_file.setdefault(chunk.get("file", ""), []).append(chunk["id"])
         for ids in self.parent_order_by_file.values():
             ids.sort(key=self._parent_sort_key)
+        self.document_aliases_by_file: dict[str, set[str]] = {}
+        for file_name, ids in self.parent_order_by_file.items():
+            aliases: set[str] = set()
+            for chunk_id in ids[:2]:
+                chunk = self.parent_map.get(chunk_id) or self.chunk_map.get(chunk_id)
+                if not chunk:
+                    continue
+                lines = chunk.get("text", "").splitlines()[:10]
+                for raw_line in lines:
+                    line = normalize_text(raw_line)
+                    if len(line) < 4 or len(line) > 60:
+                        continue
+                    for pattern in self._TITLE_PATTERNS:
+                        aliases.update(match.strip() for match in pattern.findall(line))
+            self.document_aliases_by_file[file_name] = aliases
 
     @staticmethod
     def _parent_sort_key(chunk_id: str) -> tuple[int, str]:
@@ -72,6 +94,9 @@ class ChunkCorpus:
         prev_id = ids[idx - 1] if idx > 0 else None
         next_id = ids[idx + 1] if idx + 1 < len(ids) else None
         return prev_id, next_id
+
+    def get_document_aliases(self, file_name: str) -> set[str]:
+        return self.document_aliases_by_file.get(file_name, set())
 
     def dedupe_to_parents(self, results: list[SearchResult], top_k: int) -> list[SearchResult]:
         best_by_parent: dict[str, SearchResult] = {}

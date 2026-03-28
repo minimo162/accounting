@@ -9,6 +9,7 @@ from .config import Config
 from .context import AgentContext
 from .llm import LLMClient
 from .prompt import SYSTEM_PROMPT
+from .query_rewrite import QueryExpander
 from .tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ WRAP_UP_HINT = (
 
 class Agent:
     NUDGE_AT_LOOP = 8  # After this many loops, hint the LLM to wrap up
+    SEARCH_TOOL_NAMES = {"hybrid_search", "keyword_search", "semantic_search"}
 
     def __init__(self, config: Config, tools: ToolRegistry, chunk_map: dict[str, dict] | None = None, pdf_sources: dict[str, str] | None = None):
         self.config = config
@@ -41,19 +43,47 @@ class Agent:
     def _count_tool_calls(self, context: AgentContext, tool_name: str) -> int:
         return sum(1 for log in context.retrieval_logs if log.tool_name == tool_name)
 
+    def _count_search_calls(self, context: AgentContext) -> int:
+        return sum(1 for log in context.retrieval_logs if log.tool_name in self.SEARCH_TOOL_NAMES)
+
+    @staticmethod
+    def _adaptive_budget(base: int, complexity: str) -> int:
+        if base <= 0:
+            return base
+        if complexity == "simple":
+            return max(1, base - 1)
+        return base
+
+    @staticmethod
+    def _has_high_confidence_evidence(context: AgentContext) -> bool:
+        recent = context.search_history[-2:]
+        if not recent:
+            return False
+        best_confidence = max(float(entry.get("confidence", 0.0)) for entry in recent)
+        return best_confidence >= 0.7 and len(context.evidence_notes) >= 4
+
     def _should_nudge_wrap_up(self, context: AgentContext) -> bool:
         if context.wrap_up_nudged or self.wrap_up_after_searches <= 0:
             return False
-        search_count = self._count_tool_calls(context, "hybrid_search")
+        search_count = self._count_search_calls(context)
         read_count = self._count_tool_calls(context, "read_chunk")
-        return search_count >= self.wrap_up_after_searches and read_count >= 2
+        complexity = context.question_complexity
+        search_budget = self._adaptive_budget(self.wrap_up_after_searches, complexity)
+        read_budget = self._adaptive_budget(2, complexity)
+        return search_count >= search_budget and read_count >= read_budget
 
     def _should_force_wrap_up(self, context: AgentContext) -> bool:
         if self.force_final_after_searches <= 0 or self.force_final_after_reads <= 0:
             return False
-        search_count = self._count_tool_calls(context, "hybrid_search")
+        search_count = self._count_search_calls(context)
         read_count = self._count_tool_calls(context, "read_chunk")
-        return search_count >= self.force_final_after_searches and read_count >= self.force_final_after_reads
+        complexity = context.question_complexity
+        search_budget = self._adaptive_budget(self.force_final_after_searches, complexity)
+        read_budget = self._adaptive_budget(self.force_final_after_reads, complexity)
+        if self._has_high_confidence_evidence(context):
+            search_budget = max(2, search_budget - 1)
+            read_budget = max(2, read_budget - 1)
+        return search_count >= search_budget and read_count >= read_budget
 
     def _maybe_nudge(self, messages: list[dict], loop_idx: int, context: AgentContext):
         """Inject a wrap-up hint if we've been searching too long."""
@@ -82,9 +112,14 @@ class Agent:
         messages.append({"role": "user", "content": question})
         return messages
 
+    def _seed_context(self, context: AgentContext, question: str):
+        profile = QueryExpander.profile(question)
+        context.set_question(question, profile.to_dict())
+
     def run(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Synchronous run: returns final answer with metadata."""
         context = AgentContext()
+        self._seed_context(context, question)
         messages = self._build_initial_messages(question, history)
         tool_schemas = self.tools.get_schemas()
         total_cost = 0.0
@@ -96,7 +131,7 @@ class Agent:
             self._maybe_nudge(messages, loop_idx, context)
 
             if self._should_force_wrap_up(context):
-                answer, cost = self._force_final_answer(messages)
+                answer, cost = self._force_final_answer(messages, context)
                 total_cost += cost
                 return self._build_result(
                     answer, context, loop_idx + 1, "retrieval_budget", total_cost
@@ -106,7 +141,7 @@ class Agent:
             current_tokens = self.llm.count_message_tokens(messages)
             if current_tokens > self.max_token_budget:
                 logger.info(f"Token budget exceeded: {current_tokens} > {self.max_token_budget}")
-                answer, cost = self._force_final_answer(messages)
+                answer, cost = self._force_final_answer(messages, context)
                 total_cost += cost
                 return self._build_result(
                     answer, context, loop_idx + 1, "budget_exceeded", total_cost
@@ -154,13 +189,14 @@ class Agent:
                 })
 
         # Max loops exceeded
-        answer, cost = self._force_final_answer(messages)
+        answer, cost = self._force_final_answer(messages, context)
         total_cost += cost
         return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
 
     async def arun(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Async run."""
         context = AgentContext()
+        self._seed_context(context, question)
         messages = self._build_initial_messages(question, history)
         tool_schemas = self.tools.get_schemas()
         total_cost = 0.0
@@ -169,7 +205,7 @@ class Agent:
             self._maybe_nudge(messages, loop_idx, context)
 
             if self._should_force_wrap_up(context):
-                answer, cost = await self._aforce_final_answer(messages)
+                answer, cost = await self._aforce_final_answer(messages, context)
                 total_cost += cost
                 return self._build_result(
                     answer, context, loop_idx + 1, "retrieval_budget", total_cost
@@ -178,7 +214,7 @@ class Agent:
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
             if current_tokens > self.max_token_budget:
-                answer, cost = await self._aforce_final_answer(messages)
+                answer, cost = await self._aforce_final_answer(messages, context)
                 total_cost += cost
                 return self._build_result(
                     answer, context, loop_idx + 1, "budget_exceeded", total_cost
@@ -219,7 +255,7 @@ class Agent:
                     "_func_name": func_name,
                 })
 
-        answer, cost = await self._aforce_final_answer(messages)
+        answer, cost = await self._aforce_final_answer(messages, context)
         total_cost += cost
         return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
 
@@ -230,6 +266,7 @@ class Agent:
         Final answer is streamed token-by-token via answer_delta events.
         """
         context = AgentContext()
+        self._seed_context(context, question)
         messages = self._build_initial_messages(question, history)
         tool_schemas = self.tools.get_schemas()
         total_cost = 0.0
@@ -325,7 +362,7 @@ class Agent:
         total_cost: float,
     ) -> AsyncGenerator[dict, None]:
         """Force a final answer and simulate streaming output."""
-        answer, cost = await self._aforce_final_answer(messages)
+        answer, cost = await self._aforce_final_answer(messages, context)
         answer, refs, source_url_map = self._finalize_answer(answer, context)
         total_cost += cost
 
@@ -347,7 +384,69 @@ class Agent:
             },
         }
 
-    def _force_final_answer(self, messages: list[dict]) -> tuple[str, float]:
+    @staticmethod
+    def _note_limits(complexity: str) -> tuple[int, int, int]:
+        if complexity == "complex":
+            return 6, 900, 5200
+        if complexity == "simple":
+            return 4, 500, 2400
+        return 5, 700, 3600
+
+    def _ordered_evidence_note_ids(self, context: AgentContext) -> list[str]:
+        ordered_ids: list[str] = []
+        seen: set[str] = set()
+        for chunk_id in context.searched_chunk_ids:
+            if chunk_id in context.evidence_notes and chunk_id not in seen:
+                ordered_ids.append(chunk_id)
+                seen.add(chunk_id)
+        for chunk_id in context.evidence_notes:
+            if chunk_id not in seen:
+                ordered_ids.append(chunk_id)
+                seen.add(chunk_id)
+        return ordered_ids
+
+    def _build_evidence_note_message(self, context: AgentContext) -> dict[str, str] | None:
+        if not context.evidence_notes:
+            return None
+
+        max_notes, per_note_chars, total_chars = self._note_limits(context.question_complexity)
+        used_chars = 0
+        sections: list[str] = []
+
+        for chunk_id in self._ordered_evidence_note_ids(context):
+            note = context.evidence_notes.get(chunk_id, "").strip()
+            if not note:
+                continue
+            note = note.replace("\n[抜粋]", "").replace("[抜粋]", "").strip()
+            if len(note) > per_note_chars:
+                note = note[:per_note_chars].rstrip() + "..."
+            chunk = self.chunk_map.get(chunk_id, {})
+            source = str(chunk.get("source", "")).strip()
+            header = f"- {chunk_id}"
+            if source:
+                header = f"{header} | {source}"
+            section = f"{header}\n{note}"
+            if sections and used_chars + len(section) > total_chars:
+                break
+            sections.append(section)
+            used_chars += len(section)
+            if len(sections) >= max_notes:
+                break
+
+        if not sections:
+            return None
+
+        content = (
+            "以下は read_chunk で抽出済みの重要箇所メモです。"
+            "追加検索は行わず、このメモを優先して最終回答を作成してください。\n"
+            "長文質問では、このメモに含まれる具体的な変更点・例外・経過措置を落とさずに整理してください。\n"
+            "各記述の末尾には、見出し行に書かれた chunk ID をそのまま付けてください。\n\n"
+            "## 重要箇所メモ\n"
+            + "\n\n".join(sections)
+        )
+        return {"role": "user", "content": content}
+
+    def _build_final_answer_messages(self, messages: list[dict], context: AgentContext) -> list[dict]:
         """Force the LLM to produce a final answer without tool calls."""
         force_prompt = (
             "これ以上ツールを呼び出さないでください。"
@@ -355,21 +454,23 @@ class Agent:
             "情報が不十分な場合は、その旨を明記した上で、得られた情報の範囲で回答してください。"
             "推測は避け、文書に基づいた回答のみを行ってください。"
             "見出し以外の本文、箇条書き、まとめ文の末尾には必ず参照したチャンクIDを付け、付けられない文は出力しないでください。"
+            "既に抽出済みの重要箇所メモがあれば、それを優先して detail を保って回答してください。"
         )
-        messages_copy = messages + [{"role": "user", "content": force_prompt}]
+        messages_copy = list(messages)
+        note_message = self._build_evidence_note_message(context)
+        if note_message is not None:
+            messages_copy.append(note_message)
+        messages_copy.append({"role": "user", "content": force_prompt})
+        return messages_copy
+
+    def _force_final_answer(self, messages: list[dict], context: AgentContext) -> tuple[str, float]:
+        messages_copy = self._build_final_answer_messages(messages, context)
         response = self.llm.chat(messages=messages_copy, tools=None, temperature=0.0)
         return response["message"].get("content", ""), response.get("cost", 0.0)
 
-    async def _aforce_final_answer(self, messages: list[dict]) -> tuple[str, float]:
+    async def _aforce_final_answer(self, messages: list[dict], context: AgentContext) -> tuple[str, float]:
         """Async force final answer."""
-        force_prompt = (
-            "これ以上ツールを呼び出さないでください。"
-            "これまでに収集した情報に基づいて、最終的な回答を提供してください。"
-            "情報が不十分な場合は、その旨を明記した上で、得られた情報の範囲で回答してください。"
-            "推測は避け、文書に基づいた回答のみを行ってください。"
-            "見出し以外の本文、箇条書き、まとめ文の末尾には必ず参照したチャンクIDを付け、付けられない文は出力しないでください。"
-        )
-        messages_copy = messages + [{"role": "user", "content": force_prompt}]
+        messages_copy = self._build_final_answer_messages(messages, context)
         response = await self.llm.achat(messages=messages_copy, tools=None, temperature=0.0)
         return response["message"].get("content", ""), response.get("cost", 0.0)
 

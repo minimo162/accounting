@@ -78,6 +78,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.retrieval.rerank_top_n, 12)
         self.assertEqual(config.retrieval.semantic_top_k, 18)
         self.assertEqual(config.retrieval.keyword_top_k, 18)
+        self.assertEqual(config.retrieval.final_top_k, 6)
         self.assertEqual(config.agent.nudge_at_loop, 4)
         self.assertEqual(config.agent.max_loops, 12)
         self.assertEqual(config.agent.wrap_up_after_searches, 2)

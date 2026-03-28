@@ -12,7 +12,7 @@ from .keyword_search import KeywordSearchTool
 from .semantic_search import SemanticSearchTool
 from ..config import RetrievalConfig
 from ..context import AgentContext
-from ..query_rewrite import QueryExpander
+from ..query_rewrite import QueryExpander, QueryProfile
 from ..reranker import BaseReranker
 from ..retrieval import reciprocal_rank_fusion, tokenize_for_bm25
 
@@ -57,6 +57,7 @@ class HybridSearchTool(BaseTool):
         top_k = min(int(kwargs.get("top_k", self.config.final_top_k)), 30)
         if not query:
             return "検索クエリを指定してください。", {"error": "no query"}
+        context.set_current_search_query(query)
 
         cache_key = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False, sort_keys=True)
         cached = context.get_cached_tool_result(self.name, cache_key)
@@ -64,7 +65,7 @@ class HybridSearchTool(BaseTool):
             result_text, tool_log = cached
             return result_text, {**tool_log, "cached": True}
 
-        final, expansions, hyde_doc = self.search(query, top_k)
+        final, expansions, hyde_doc, search_info = self._search_with_details(query, top_k)
         if not final:
             return "関連する文書が見つかりませんでした。", {"matches": 0}
 
@@ -82,8 +83,22 @@ class HybridSearchTool(BaseTool):
         unread_ids = [cid for cid in chunk_ids if not context.is_chunk_read(cid) and not get_chunk_tag((self.semantic_tool._corpus.get_parent(cid) or {}).get("text", ""))]
         if unread_ids:
             lines.append(f"\n--- {len(unread_ids)}件の未読チャンクがあります。read_chunkで全文を取得してください ---")
+        confidence_score = float(search_info.get("confidence", 0.0))
+        confidence_label = "高" if confidence_score >= 0.7 else "中" if confidence_score >= 0.45 else "低"
+        lines.append(f"[検索信頼度: {confidence_label}]")
+        if search_info.get("corrective_query"):
+            lines.append(f"[補正検索: {search_info['corrective_query']}]")
 
         context.add_searched_chunks(chunk_ids)
+        context.add_search_entry(
+            {
+                "query": query,
+                "profile": search_info.get("profile", {}),
+                "confidence": confidence_score,
+                "corrective_query": search_info.get("corrective_query"),
+                "chunk_ids": chunk_ids,
+            }
+        )
         retrieved_tokens = len(_tokenizer.encode("\n".join(snippets))) if snippets else 0
         context.add_retrieval_log(
             tool_name=self.name,
@@ -94,6 +109,9 @@ class HybridSearchTool(BaseTool):
                 "hyde_used": bool(hyde_doc),
                 "chunks_found": len(final),
                 "chunk_ids": chunk_ids,
+                "confidence": confidence_score,
+                "corrective_query": search_info.get("corrective_query"),
+                "query_complexity": search_info.get("profile", {}).get("complexity"),
             },
         )
         result_text = "\n".join(lines)
@@ -103,43 +121,76 @@ class HybridSearchTool(BaseTool):
             "expansions": expansions,
             "retrieved_tokens": retrieved_tokens,
             "chunk_ids": chunk_ids,
+            "confidence": confidence_score,
+            "corrective_query": search_info.get("corrective_query"),
+            "profile": search_info.get("profile", {}),
         }
         context.set_cached_tool_result(self.name, cache_key, result_text, tool_log)
         return result_text, tool_log
 
     def search(self, query: str, top_k: int) -> tuple[list, list[str], str | None]:
+        final, expansions, hyde_doc, _ = self._search_with_details(query, top_k)
+        return final, expansions, hyde_doc
+
+    def _search_with_details(self, query: str, top_k: int) -> tuple[list, list[str], str | None, dict[str, Any]]:
+        profile = self.query_expander.profile(query)
         expansions = self.query_expander.expand(query)
         is_exact_query = self.query_expander.is_exact_query(query)
         hyde_doc = None if is_exact_query else self.query_expander.generate_hypothetical_document(query)
+        semantic_query = self._select_semantic_query(query, expansions)
 
         semantic_rankings = []
         keyword_rankings = []
         keyword_limit = min(self.config.keyword_top_k, max(top_k * 2, 8))
         semantic_limit = min(self.config.semantic_top_k, max(top_k * 2, 8))
 
-        if is_exact_query:
-            primary_keyword = self.keyword_tool.search([query], keyword_limit)
+        if is_exact_query or profile.search_mode == "keyword_first":
+            primary_keyword_query = profile.canonical_focus_query or query
+            primary_keyword = self.keyword_tool.search([primary_keyword_query], keyword_limit)
             if primary_keyword:
                 keyword_rankings.append(primary_keyword)
-            else:
-                semantic_rankings.append(self.semantic_tool.search(query, semantic_limit))
+            if not primary_keyword or (profile.complexity == "complex" and not is_exact_query):
+                semantic_rankings.append(self.semantic_tool.search(semantic_query, semantic_limit))
         else:
-            semantic_rankings.append(self.semantic_tool.search(query, semantic_limit))
+            if profile.search_mode != "keyword_first":
+                semantic_rankings.append(self.semantic_tool.search(semantic_query, semantic_limit))
             for expanded in expansions:
                 keyword_rankings.append(self.keyword_tool.search([expanded], keyword_limit))
             if hyde_doc:
                 semantic_rankings.append(self.semantic_tool.search(hyde_doc, semantic_limit))
 
-        fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
-        fused = self._apply_exact_match_boosts(query, fused)
-        fused = self._apply_change_intent_boosts(query, fused)
-        fused = self._apply_topic_alignment_boosts(query, fused)
-        reranked = fused[: self.config.rerank_top_n]
+        reranked = self._rank_results(query, semantic_rankings, keyword_rankings)
+        confidence = self._estimate_confidence(query, reranked)
+        corrective_query = None
+        if self._should_run_corrective_search(profile, reranked, confidence):
+            corrective_query = profile.corrective_query
+            if corrective_query and corrective_query != query:
+                corrective_keyword = self.keyword_tool.search([corrective_query], keyword_limit)
+                if corrective_keyword:
+                    keyword_rankings.append(corrective_keyword)
+                elif profile.search_mode != "keyword_first":
+                    semantic_rankings.append(self.semantic_tool.search(corrective_query, semantic_limit))
+                reranked = self._rank_results(query, semantic_rankings, keyword_rankings)
+                confidence = max(confidence, self._estimate_confidence(query, reranked))
+
         if self._should_rerank(query, reranked, top_k):
             reranked = self.reranker.rerank(query, reranked)
         reranked = self._filter_change_delta_results(query, reranked)
         final = reranked[:top_k]
-        return final, expansions, hyde_doc
+        return final, expansions, hyde_doc, {
+            "confidence": confidence,
+            "corrective_query": corrective_query,
+            "profile": profile.to_dict(),
+        }
+
+    @staticmethod
+    def _select_semantic_query(query: str, expansions: list[str]) -> str:
+        if "会計基準" not in query:
+            return query
+        for variant in expansions:
+            if "に関する会計基準" in variant:
+                return variant
+        return query
 
     def _should_rerank(self, query: str, results: list, top_k: int) -> bool:
         if not results or len(results) <= top_k:
@@ -147,6 +198,64 @@ class HybridSearchTool(BaseTool):
         if getattr(self.reranker, "is_expensive", False) and self.query_expander.is_exact_query(query):
             return False
         return True
+
+    def _rank_results(self, query: str, semantic_rankings: list[list], keyword_rankings: list[list]) -> list:
+        fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
+        fused = self._apply_exact_match_boosts(query, fused)
+        fused = self._apply_change_intent_boosts(query, fused)
+        fused = self._apply_topic_alignment_boosts(query, fused)
+        return fused[: self.config.rerank_top_n]
+
+    def _estimate_confidence(self, query: str, results: list) -> float:
+        if not results:
+            return 0.0
+
+        top = results[0]
+        anchors = self._query_anchor_terms(query)
+        top_window = f"{top.source} {top.snippet[:260]} {top.text[:800]}"
+        anchor_hits = sum(1 for term in anchors if term in top_window)
+        exact_hit = any(term in top_window for term in self._extract_exact_terms(query))
+        doc_type_match = self._doc_type_matches(
+            self._target_doc_type(query),
+            top.metadata or {},
+            top.source,
+        ) if self._target_doc_type(query) else False
+        canonical_titles = self._canonical_title_phrases(query)
+        file_name = str((top.metadata or {}).get("file", ""))
+        aliases = self.semantic_tool._corpus.get_document_aliases(file_name) if file_name else set()
+        title_hit = bool(canonical_titles and aliases and any(title in aliases for title in canonical_titles))
+        gap = top.score - (results[1].score if len(results) > 1 else 0.0)
+
+        confidence = 0.15
+        if anchor_hits >= 1:
+            confidence += 0.2
+        if anchor_hits >= 2:
+            confidence += 0.1
+        if exact_hit:
+            confidence += 0.25
+        if doc_type_match:
+            confidence += 0.1
+        if title_hit:
+            confidence += 0.25
+        if gap >= 0.35:
+            confidence += 0.1
+        elif gap >= 0.15:
+            confidence += 0.05
+        return min(confidence, 1.0)
+
+    @staticmethod
+    def _should_run_corrective_search(profile: QueryProfile, results: list, confidence: float) -> bool:
+        if not results:
+            return bool(profile.corrective_query)
+        if not profile.corrective_query:
+            return False
+        if profile.corrective_query == profile.query:
+            return False
+        if confidence < 0.45:
+            return True
+        if profile.complexity == "complex" and confidence < 0.6:
+            return True
+        return False
 
     @staticmethod
     def _extract_exact_terms(query: str) -> list[str]:
@@ -207,8 +316,18 @@ class HybridSearchTool(BaseTool):
         if not self._is_change_query(query):
             return results
 
-        positive_terms = ("改正", "変更", "見直し", "導入", "廃止", "新た", "経過措置", "適用初年度")
+        positive_terms = (
+            "改正", "変更", "見直し", "導入", "廃止", "新た", "新設",
+            "追加", "修正", "経過措置", "適用初年度", "適用時期",
+        )
         negative_terms = ("議決", "委員", "名簿")
+        unchanged_terms = (
+            "変更していない",
+            "変更してません",
+            "改正前会計基準における定義を変更していない",
+            "改正前会計基準の方法を変更していない",
+        )
+        soft_negative_terms = ("従来どおり", "従来通り", "踏襲", "同様")
         boosted = []
 
         for item in results:
@@ -222,6 +341,12 @@ class HybridSearchTool(BaseTool):
             for term in negative_terms:
                 if term in text_window:
                     bonus -= 0.5
+            for term in unchanged_terms:
+                if term in text_window:
+                    bonus -= 0.8
+            for term in soft_negative_terms:
+                if term in text_window:
+                    bonus -= 0.2
 
             boosted.append(
                 item.__class__(
@@ -260,6 +385,8 @@ class HybridSearchTool(BaseTool):
         if not anchors:
             return results
 
+        target_doc_type = self._target_doc_type(query)
+        canonical_titles = self._canonical_title_phrases(query)
         boosted = []
         for item in results:
             text_window = f"{item.source} {item.snippet[:260]} {item.text[:800]}"
@@ -267,6 +394,17 @@ class HybridSearchTool(BaseTool):
             bonus = hits * 0.2
             if hits == 0:
                 bonus -= 0.35
+            if target_doc_type:
+                meta = item.metadata or {}
+                if self._doc_type_matches(target_doc_type, meta, item.source):
+                    bonus += 0.25
+                elif meta:
+                    bonus -= 0.6
+            file_name = str((item.metadata or {}).get("file", ""))
+            aliases = self.semantic_tool._corpus.get_document_aliases(file_name) if file_name else set()
+            if canonical_titles and aliases:
+                if any(title in aliases for title in canonical_titles):
+                    bonus += 1.0
             boosted.append(
                 item.__class__(
                     chunk_id=item.chunk_id,
@@ -281,6 +419,34 @@ class HybridSearchTool(BaseTool):
 
         boosted.sort(key=lambda item: item.score, reverse=True)
         return boosted
+
+    @staticmethod
+    def _target_doc_type(query: str) -> str | None:
+        if "実務対応報告" in query:
+            return "実務対応報告"
+        if "適用指針" in query:
+            return "適用指針"
+        if "会計基準" in query:
+            return "企業会計基準"
+        return None
+
+    @staticmethod
+    def _doc_type_matches(target_doc_type: str, metadata: dict, source: str) -> bool:
+        haystack = " ".join(
+            [
+                str(metadata.get("doc_type", "")),
+                str(metadata.get("standard_no", "")),
+                str(metadata.get("doc_title", "")),
+                source,
+            ]
+        ).strip()
+        if target_doc_type == "企業会計基準":
+            return "企業会計基準" in haystack and "適用指針" not in haystack and "実務対応報告" not in haystack
+        return target_doc_type in haystack
+
+    def _canonical_title_phrases(self, query: str) -> list[str]:
+        canonical = QueryExpander._canonicalize_standard_aliases(query)
+        return re.findall(r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に関する会計基準)", canonical)
 
     def _filter_change_delta_results(self, query: str, results: list) -> list:
         if not self._is_change_query(query):

@@ -186,6 +186,8 @@ class Config:
             self.retrieval.semantic_top_k = min(self.retrieval.semantic_top_k, 18)
         if "RETRIEVAL_KEYWORD_TOP_K" not in os.environ:
             self.retrieval.keyword_top_k = min(self.retrieval.keyword_top_k, 18)
+        if "RETRIEVAL_FINAL_TOP_K" not in os.environ:
+            self.retrieval.final_top_k = min(self.retrieval.final_top_k, 6)
         if "AGENT_NUDGE_AT_LOOP" not in os.environ:
             self.agent.nudge_at_loop = min(self.agent.nudge_at_loop, 4)
         if "AGENT_MAX_LOOPS" not in os.environ:
