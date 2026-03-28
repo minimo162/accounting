@@ -1,0 +1,17 @@
+.gcloudignore
+.git
+.gitignore
+.venv/
+**/__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+data/
+scripts/
+tests/
+.taskmaster/
+.tmp/
+docs/
+README.md
+eng.traineddata

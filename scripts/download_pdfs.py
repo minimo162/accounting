@@ -15,11 +15,11 @@ async def download_pdfs(output_dir: str):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Use Cerebras-compatible or any available LLM for browser agent
+    # Use DeepSeek's OpenAI-compatible API for the browser agent
     llm = ChatOpenAI(
-        model="gpt-oss-120b",
-        api_key=os.getenv("CEREBRAS_API_KEY"),
-        base_url="https://api.cerebras.ai/v1",
+        model=os.getenv("LLM_MODEL", "deepseek-chat"),
+        api_key=os.getenv("DEEPSEEK_API_KEY"),
+        base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
     )
 
     task = """

@@ -38,8 +38,12 @@
     return message.metadata?.chunks_read_count ?? '?';
   }
 
+  function getDisplayedReferenceCount(message: Message): number | string {
+    return message.metadata?.references?.length ?? message.metadata?.chunks_read_count ?? '?';
+  }
+
   function getDisplayedReadCount(message: Message): number | string {
-    return message.metadata?.references?.length ?? message.metadata?.read_chunk_count ?? '?';
+    return message.metadata?.read_chunk_count ?? '?';
   }
 
   function getChunkUrl(ref: Reference): string {
@@ -271,7 +275,13 @@
 </script>
 
 <script lang="ts" module>
-  function formatMarkdown(text: string, refs: Reference[] = [], sourceUrlMap: Record<string, string> = {}): string {
+  interface MarkdownReference {
+    url?: string;
+    source: string;
+    text: string;
+  }
+
+  function formatMarkdown(text: string, refs: MarkdownReference[] = []): string {
     if (!text) return '';
 
     // Pre-process: convert literal <br> tags to newlines, but preserve them inside table rows
@@ -336,7 +346,7 @@
 
       const flushParagraph = () => {
         if (currentParagraph.length > 0) {
-          const escaped = currentParagraph.map(l => inlineFormat(escapeHtml(l), refs, sourceUrlMap)).join('<br>');
+          const escaped = currentParagraph.map(l => inlineFormat(escapeHtml(l), refs)).join('<br>');
           html.push(`<p>${escaped}</p>`);
           currentParagraph = [];
         }
@@ -382,7 +392,7 @@
               break;
             }
             const content = ll.replace(/^\s*[-・•*]\s*/, '').replace(/^\s*\d+\.\s*/, '');
-            listItems.push(`<li>${inlineFormat(escapeHtml(content), refs, sourceUrlMap)}</li>`);
+            listItems.push(`<li>${inlineFormat(escapeHtml(content), refs)}</li>`);
             li++;
           }
           li--; // Back up one since the for loop will increment
@@ -407,34 +417,26 @@
       .replace(/>/g, '&gt;');
   }
 
-  function findCiteUrl(inner: string, refs: Reference[], sourceUrlMap: Record<string, string>): string {
-    const stdMatch = inner.match(/第(\d+)\s*号/);
-    const stdKey = stdMatch ? `第${stdMatch[1]}号` : null;
-
-    // 1. Article-number match against chunk text — most precise (finds actual page)
-    //    Optionally constrain to chunks from the same standard when 第N号 is present
-    const nums = [...inner.matchAll(/第(\d+)[項条]/g)].map(m => m[1]);
-    for (const n of nums) {
-      const pat = new RegExp(`第${n}[項条]`);
-      // Prefer a chunk from the same standard if possible
-      const hit = stdKey
-        ? refs.find(r => r.url && pat.test(r.text) && sourceUrlMap[stdKey]?.split('#')[0] === r.url?.split('#')[0])
-          ?? refs.find(r => r.url && pat.test(r.text))
-        : refs.find(r => r.url && pat.test(r.text));
-      if (hit?.url) return hit.url;
-    }
-    // 2. Standard-number match from source_url_map (first chunk of that standard)
-    if (stdKey && sourceUrlMap[stdKey]) return sourceUrlMap[stdKey];
-    // 3. Fallback: first ref with a URL
-    return refs.find(r => r.url)?.url ?? '';
+  function escapeAttribute(text: string): string {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   }
 
-  function inlineFormat(text: string, refs: Reference[] = [], sourceUrlMap: Record<string, string> = {}): string {
+  function inlineFormat(text: string, refs: MarkdownReference[] = []): string {
     return text
       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.*?)\*/g, '<em>$1</em>')
       .replace(/`(.*?)`/g, '<code>$1</code>')
-      .replace(/【(.*?)】/g, '<span class="ref-tag">$1</span>');
+      .replace(/【(.*?)】/g, '<span class="ref-tag">$1</span>')
+      .replace(/\[(\d+)\]/g, (match, num) => {
+        const ref = refs[Number(num) - 1];
+        if (!ref?.url) return match;
+        const safeUrl = escapeAttribute(ref.url);
+        return `<a class="ref-link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">[${num}]<span class="ref-link-icon">&#x2197;</span></a>`;
+      });
   }
 
   function isSeparatorLine(line: string): boolean {
@@ -551,15 +553,16 @@
       {:else}
         <div class="message assistant">
           <div class="bubble assistant-bubble">
-            {@html formatMarkdown(msg.content, msg.metadata?.references ?? [], msg.metadata?.source_url_map ?? {})}
+            {@html formatMarkdown(msg.content, msg.metadata?.references ?? [])}
 
             {#if msg.metadata?.references?.length}
               <div class="sources-section">
-                <div class="sources-label">参照チャンク ({getDisplayedReadCount(msg)}件)</div>
+                <div class="sources-label">参照 ({getDisplayedReferenceCount(msg)}件)</div>
                 <div class="sources-list">
-                  {#each msg.metadata.references as ref}
+                  {#each msg.metadata.references as ref, idx}
                     <div class="source-card">
                       <div class="source-card-header">
+                        <span class="source-ref-number">[{idx + 1}]</span>
                         {#if ref.url}
                           <a class="source-chip-link" href={getChunkUrl(ref)} target="_blank" rel="noopener noreferrer">
                             {ref.source.split('>')[0].trim()}<span class="ref-link-icon">&#x2197;</span>
@@ -800,78 +803,7 @@
     padding: 0.5rem 0;
   }
 
-  .references {
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid #2a2a35;
-  }
-
-  .references details {
-    cursor: pointer;
-  }
-
-  .references summary {
-    font-size: 0.8rem;
-    font-weight: 500;
-    color: #a1a1aa;
-    padding: 0.25rem 0;
-    user-select: none;
-  }
-
-  .references summary:hover {
-    color: #d4d4d8;
-  }
-
-  .ref-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
-    max-height: 400px;
-    overflow-y: auto;
-    scrollbar-width: thin;
-    scrollbar-color: #27272a transparent;
-  }
-
-  .ref-list::-webkit-scrollbar {
-    width: 4px;
-  }
-
-  .ref-list::-webkit-scrollbar-thumb {
-    background: #27272a;
-    border-radius: 2px;
-  }
-
-  .ref-item {
-    background: #131318;
-    border: 1px solid #2a2a35;
-    border-radius: 0.5rem;
-    padding: 0.75rem;
-    font-size: 0.8rem;
-  }
-
-  .ref-header {
-    margin-bottom: 0.35rem;
-    display: flex;
-    align-items: baseline;
-    gap: 0.4rem;
-  }
-
-  .ref-num {
-    font-size: 0.72rem;
-    font-weight: 700;
-    color: #60a5fa;
-    min-width: 1.6rem;
-    flex-shrink: 0;
-  }
-
-  .ref-source {
-    color: #d4d4d8;
-    font-size: 0.8rem;
-    font-weight: 500;
-  }
-
-  .ref-link {
+  :global(.ref-link) {
     color: #60a5fa;
     text-decoration: none;
     display: inline-flex;
@@ -880,52 +812,14 @@
     transition: color 0.15s ease;
   }
 
-  .ref-link:hover {
+  :global(.ref-link:hover) {
     color: #93bbfd;
     text-decoration: underline;
   }
 
-  .ref-link-icon {
+  :global(.ref-link-icon) {
     font-size: 0.7rem;
     opacity: 0.7;
-  }
-
-  .ref-details {
-    cursor: pointer;
-  }
-
-  .ref-details summary {
-    font-size: 0.7rem;
-    color: #60a5fa;
-    padding: 0.15rem 0;
-    user-select: none;
-  }
-
-  .ref-details summary:hover {
-    color: #93bbfd;
-  }
-
-  .ref-text {
-    color: #a1a1aa;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    font-size: 0.75rem;
-    max-height: 300px;
-    overflow-y: auto;
-    margin-top: 0.35rem;
-    padding-top: 0.35rem;
-    border-top: 1px solid #27272a;
-    scrollbar-width: thin;
-    scrollbar-color: #27272a transparent;
-  }
-
-  .ref-text::-webkit-scrollbar {
-    width: 4px;
-  }
-
-  .ref-text::-webkit-scrollbar-thumb {
-    background: #27272a;
-    border-radius: 2px;
   }
 
   .sources-section {
@@ -969,8 +863,15 @@
   .source-card-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: 0.45rem;
     margin-bottom: 0.3rem;
+  }
+
+  .source-ref-number {
+    color: #f4f4f5;
+    font-size: 0.73rem;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
   }
 
   .copy-btn {
@@ -981,6 +882,7 @@
     font-size: 0.8rem;
     padding: 0 0.1rem;
     line-height: 1;
+    margin-left: auto;
     flex-shrink: 0;
   }
   .copy-btn:hover { color: #a1a1aa; }

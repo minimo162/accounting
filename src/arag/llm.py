@@ -1,4 +1,4 @@
-"""LLM client supporting OpenAI-compatible APIs (Cerebras, etc.) and Gemini."""
+"""LLM client supporting OpenAI-compatible APIs (DeepSeek, Cerebras, etc.) and Gemini."""
 
 import json
 import logging

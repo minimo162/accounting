@@ -22,6 +22,8 @@ class AgentContext:
         self.retrieval_logs: list[RetrievalLog] = []
         self.search_history: list[dict[str, Any]] = []
         self.trajectory: list[dict[str, Any]] = []
+        self.tool_cache: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+        self.wrap_up_nudged: bool = False
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)
@@ -64,6 +66,12 @@ class AgentContext:
             **tool_log,
         })
 
+    def get_cached_tool_result(self, tool_name: str, cache_key: str) -> tuple[str, dict[str, Any]] | None:
+        return self.tool_cache.get((tool_name, cache_key))
+
+    def set_cached_tool_result(self, tool_name: str, cache_key: str, result_text: str, tool_log: dict[str, Any]):
+        self.tool_cache[(tool_name, cache_key)] = (result_text, tool_log)
+
     def get_summary(self) -> dict[str, Any]:
         return {
             "total_retrieved_tokens": self.total_retrieved_tokens,
@@ -82,3 +90,5 @@ class AgentContext:
         self.retrieval_logs.clear()
         self.search_history.clear()
         self.trajectory.clear()
+        self.tool_cache.clear()
+        self.wrap_up_nudged = False

@@ -1,5 +1,6 @@
 """Hybrid retrieval with query expansion and reranking."""
 
+import json
 import re
 from typing import Any
 
@@ -56,6 +57,13 @@ class HybridSearchTool(BaseTool):
         top_k = min(int(kwargs.get("top_k", self.config.final_top_k)), 30)
         if not query:
             return "検索クエリを指定してください。", {"error": "no query"}
+
+        cache_key = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False, sort_keys=True)
+        cached = context.get_cached_tool_result(self.name, cache_key)
+        if cached is not None:
+            result_text, tool_log = cached
+            return result_text, {**tool_log, "cached": True}
+
         final, expansions, hyde_doc = self.search(query, top_k)
         if not final:
             return "関連する文書が見つかりませんでした。", {"matches": 0}
@@ -88,34 +96,57 @@ class HybridSearchTool(BaseTool):
                 "chunk_ids": chunk_ids,
             },
         )
-        return "\n".join(lines), {
+        result_text = "\n".join(lines)
+        tool_log = {
             "matches": len(final),
             "query": query,
             "expansions": expansions,
             "retrieved_tokens": retrieved_tokens,
             "chunk_ids": chunk_ids,
         }
+        context.set_cached_tool_result(self.name, cache_key, result_text, tool_log)
+        return result_text, tool_log
 
     def search(self, query: str, top_k: int) -> tuple[list, list[str], str | None]:
         expansions = self.query_expander.expand(query)
-        hyde_doc = self.query_expander.generate_hypothetical_document(query)
+        is_exact_query = self.query_expander.is_exact_query(query)
+        hyde_doc = None if is_exact_query else self.query_expander.generate_hypothetical_document(query)
 
         semantic_rankings = []
         keyword_rankings = []
-        for expanded in expansions:
-            semantic_rankings.append(self.semantic_tool.search(expanded, self.config.semantic_top_k))
-            keyword_rankings.append(self.keyword_tool.search([expanded], self.config.keyword_top_k))
-        if hyde_doc:
-            semantic_rankings.append(self.semantic_tool.search(hyde_doc, self.config.semantic_top_k))
+        keyword_limit = min(self.config.keyword_top_k, max(top_k * 2, 8))
+        semantic_limit = min(self.config.semantic_top_k, max(top_k * 2, 8))
+
+        if is_exact_query:
+            primary_keyword = self.keyword_tool.search([query], keyword_limit)
+            if primary_keyword:
+                keyword_rankings.append(primary_keyword)
+            else:
+                semantic_rankings.append(self.semantic_tool.search(query, semantic_limit))
+        else:
+            semantic_rankings.append(self.semantic_tool.search(query, semantic_limit))
+            for expanded in expansions:
+                keyword_rankings.append(self.keyword_tool.search([expanded], keyword_limit))
+            if hyde_doc:
+                semantic_rankings.append(self.semantic_tool.search(hyde_doc, semantic_limit))
 
         fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
         fused = self._apply_exact_match_boosts(query, fused)
         fused = self._apply_change_intent_boosts(query, fused)
         fused = self._apply_topic_alignment_boosts(query, fused)
-        reranked = self.reranker.rerank(query, fused[: self.config.rerank_top_n])
+        reranked = fused[: self.config.rerank_top_n]
+        if self._should_rerank(query, reranked, top_k):
+            reranked = self.reranker.rerank(query, reranked)
         reranked = self._filter_change_delta_results(query, reranked)
         final = reranked[:top_k]
         return final, expansions, hyde_doc
+
+    def _should_rerank(self, query: str, results: list, top_k: int) -> bool:
+        if not results or len(results) <= top_k:
+            return False
+        if getattr(self.reranker, "is_expensive", False) and self.query_expander.is_exact_query(query):
+            return False
+        return True
 
     @staticmethod
     def _extract_exact_terms(query: str) -> list[str]:

@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 class BaseReranker:
+    is_expensive = False
+
     def rerank(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
         return results
 
@@ -46,6 +48,8 @@ class HeuristicReranker(BaseReranker):
 
 
 class LLMReranker(BaseReranker):
+    is_expensive = True
+
     def __init__(self, llm: LLMClient):
         self.llm = llm
         self.fallback = HeuristicReranker()

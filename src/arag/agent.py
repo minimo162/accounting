@@ -33,11 +33,35 @@ class Agent:
         self.max_loops = config.agent.max_loops
         self.max_token_budget = config.agent.max_token_budget
         self.verbose = config.agent.verbose
+        self.nudge_at_loop = config.agent.nudge_at_loop or self.NUDGE_AT_LOOP
+        self.wrap_up_after_searches = config.agent.wrap_up_after_searches
+        self.force_final_after_searches = config.agent.force_final_after_searches
+        self.force_final_after_reads = config.agent.force_final_after_reads
 
-    def _maybe_nudge(self, messages: list[dict], loop_idx: int):
+    def _count_tool_calls(self, context: AgentContext, tool_name: str) -> int:
+        return sum(1 for log in context.retrieval_logs if log.tool_name == tool_name)
+
+    def _should_nudge_wrap_up(self, context: AgentContext) -> bool:
+        if context.wrap_up_nudged or self.wrap_up_after_searches <= 0:
+            return False
+        search_count = self._count_tool_calls(context, "hybrid_search")
+        read_count = self._count_tool_calls(context, "read_chunk")
+        return search_count >= self.wrap_up_after_searches and read_count >= 2
+
+    def _should_force_wrap_up(self, context: AgentContext) -> bool:
+        if self.force_final_after_searches <= 0 or self.force_final_after_reads <= 0:
+            return False
+        search_count = self._count_tool_calls(context, "hybrid_search")
+        read_count = self._count_tool_calls(context, "read_chunk")
+        return search_count >= self.force_final_after_searches and read_count >= self.force_final_after_reads
+
+    def _maybe_nudge(self, messages: list[dict], loop_idx: int, context: AgentContext):
         """Inject a wrap-up hint if we've been searching too long."""
-        if loop_idx == self.NUDGE_AT_LOOP:
+        if context.wrap_up_nudged:
+            return
+        if loop_idx == self.nudge_at_loop or self._should_nudge_wrap_up(context):
             messages.append({"role": "user", "content": WRAP_UP_HINT})
+            context.wrap_up_nudged = True
 
     def _build_initial_messages(self, question: str, history: list[dict] | None = None) -> list[dict]:
         """Build initial messages with optional conversation history."""
@@ -69,7 +93,14 @@ class Agent:
             if self.verbose:
                 logger.info(f"Loop {loop_idx + 1}/{self.max_loops}")
 
-            self._maybe_nudge(messages, loop_idx)
+            self._maybe_nudge(messages, loop_idx, context)
+
+            if self._should_force_wrap_up(context):
+                answer, cost = self._force_final_answer(messages)
+                total_cost += cost
+                return self._build_result(
+                    answer, context, loop_idx + 1, "retrieval_budget", total_cost
+                )
 
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
@@ -135,7 +166,14 @@ class Agent:
         total_cost = 0.0
 
         for loop_idx in range(self.max_loops):
-            self._maybe_nudge(messages, loop_idx)
+            self._maybe_nudge(messages, loop_idx, context)
+
+            if self._should_force_wrap_up(context):
+                answer, cost = await self._aforce_final_answer(messages)
+                total_cost += cost
+                return self._build_result(
+                    answer, context, loop_idx + 1, "retrieval_budget", total_cost
+                )
 
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
@@ -200,7 +238,13 @@ class Agent:
             status_msg = "調査中..." if loop_idx == 0 else f"調査中... (ステップ {loop_idx + 1})"
             yield {"type": "status", "data": status_msg}
 
-            self._maybe_nudge(messages, loop_idx)
+            self._maybe_nudge(messages, loop_idx, context)
+
+            if self._should_force_wrap_up(context):
+                yield {"type": "status", "data": "回答を生成中..."}
+                async for event in self._astream_final_answer(messages, context, loop_idx + 1, "retrieval_budget", total_cost):
+                    yield event
+                return
 
             # Token budget check
             current_tokens = self.llm.count_message_tokens(messages)
@@ -217,18 +261,16 @@ class Agent:
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                answer = self._sanitize_answer(message.get("content", ""))
+                answer, cited_ids = self._sanitize_answer(message.get("content", ""), number_refs=True)
                 yield {"type": "status", "data": "回答を生成中..."}
                 chunk_size = 8
                 for i in range(0, len(answer), chunk_size):
                     yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
                 yield {"type": "answer_done", "data": answer}
-                refs, source_url_map = self._get_referenced_chunks(context)
+                refs, source_url_map = self._get_referenced_chunks(context, cited_ids)
                 for ref in refs:
                     yield {"type": "reference", "data": ref}
-                summary = context.get_summary()
-                summary["read_chunk_count"] = summary.get("chunks_read_count", 0)
-                summary["chunks_read_count"] = self._count_cited_references(answer)
+                summary = self._build_answer_summary(answer, context)
                 yield {
                     "type": "done",
                     "data": {
@@ -284,23 +326,23 @@ class Agent:
     ) -> AsyncGenerator[dict, None]:
         """Force a final answer and simulate streaming output."""
         answer, cost = await self._aforce_final_answer(messages)
-        answer = self._sanitize_answer(answer)
+        answer, refs, source_url_map = self._finalize_answer(answer, context)
         total_cost += cost
 
         chunk_size = 8
         for i in range(0, len(answer), chunk_size):
             yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
         yield {"type": "answer_done", "data": answer}
-        refs, source_url_map = self._get_referenced_chunks(context)
         for ref in refs:
             yield {"type": "reference", "data": ref}
+        summary = self._build_answer_summary(answer, context)
         yield {
             "type": "done",
             "data": {
                 "loops": loops,
                 "stop_reason": stop_reason,
                 "source_url_map": source_url_map,
-                **context.get_summary(),
+                **summary,
                 "total_cost": total_cost,
             },
         }
@@ -312,6 +354,7 @@ class Agent:
             "これまでに収集した情報に基づいて、最終的な回答を提供してください。"
             "情報が不十分な場合は、その旨を明記した上で、得られた情報の範囲で回答してください。"
             "推測は避け、文書に基づいた回答のみを行ってください。"
+            "見出し以外の本文、箇条書き、まとめ文の末尾には必ず参照したチャンクIDを付け、付けられない文は出力しないでください。"
         )
         messages_copy = messages + [{"role": "user", "content": force_prompt}]
         response = self.llm.chat(messages=messages_copy, tools=None, temperature=0.0)
@@ -324,6 +367,7 @@ class Agent:
             "これまでに収集した情報に基づいて、最終的な回答を提供してください。"
             "情報が不十分な場合は、その旨を明記した上で、得られた情報の範囲で回答してください。"
             "推測は避け、文書に基づいた回答のみを行ってください。"
+            "見出し以外の本文、箇条書き、まとめ文の末尾には必ず参照したチャンクIDを付け、付けられない文は出力しないでください。"
         )
         messages_copy = messages + [{"role": "user", "content": force_prompt}]
         response = await self.llm.achat(messages=messages_copy, tools=None, temperature=0.0)
@@ -333,37 +377,66 @@ class Agent:
     _CHUNK_SUFFIX = r':(?:p|c)?\d+(?:-\d+)*'
     _FILENAME = r'[\w\-]+\.(?:pdf|xml)'
 
-    @classmethod
-    def _number_chunk_refs(cls, text: str) -> tuple[str, list[str]]:
+    def _citation_group_key(self, chunk_id: str) -> str:
+        chunk = self.chunk_map.get(chunk_id)
+        if not chunk:
+            return chunk_id
+        return chunk.get("parent_id", chunk_id)
+
+    def _preferred_citation_chunk(self, current_id: str, candidate_id: str) -> str:
+        current = self.chunk_map.get(current_id)
+        candidate = self.chunk_map.get(candidate_id)
+        if not current or not candidate:
+            return candidate_id if candidate else current_id
+
+        current_parent = current.get("parent_id", current_id)
+        candidate_parent = candidate.get("parent_id", candidate_id)
+        current_is_parent = current_parent == current_id
+        candidate_is_parent = candidate_parent == candidate_id
+
+        # Prefer the more specific child chunk when the same parent is cited twice.
+        if current_is_parent and not candidate_is_parent:
+            return candidate_id
+        return current_id
+
+    def _number_chunk_refs(self, text: str) -> tuple[str, list[str]]:
         """Replace inline chunk ID refs with [N] citation markers.
 
         Scans the answer for bracketed chunk ID references and converts them to
         sequential `[1]`, `[2]` … markers.  Returns the modified text and an
-        ordered list of unique chunk IDs (index 0 → citation [1], etc.).
+        ordered list of displayed chunk IDs (index 0 → citation [1], etc.).
         """
         # Single ID in brackets: （filename.pdf:p5）→ [N]
         single = re.compile(
-            rf'[（\(\[【]\s*({cls._FILENAME}{cls._CHUNK_SUFFIX})\s*[）\)\]】]'
+            rf'[（\(\[【]\s*({self._FILENAME}{self._CHUNK_SUFFIX})\s*[）\)\]】]'
         )
         # Multiple IDs in one bracket: （id1、id2）→ [N][M]
         multi = re.compile(
-            rf'[（\(\[【]\s*({cls._FILENAME}{cls._CHUNK_SUFFIX}(?:\s*[、，;]\s*{cls._FILENAME}{cls._CHUNK_SUFFIX})+)\s*[）\)\]】]'
+            rf'[（\(\[【]\s*({self._FILENAME}{self._CHUNK_SUFFIX}(?:\s*[、，;]\s*{self._FILENAME}{self._CHUNK_SUFFIX})+)\s*[）\)\]】]'
         )
         参照_form = re.compile(
-            rf'参照:\s*({cls._FILENAME}{cls._CHUNK_SUFFIX})\s*;?'
+            rf'参照:\s*({self._FILENAME}{self._CHUNK_SUFFIX})\s*;?'
         )
 
-        ordered: list[str] = []
+        ordered_keys: list[str] = []
         num_map: dict[str, int] = {}
+        display_chunk_by_key: dict[str, str] = {}
 
         def _num(cid: str) -> str:
-            if cid not in num_map:
-                ordered.append(cid)
-                num_map[cid] = len(ordered)
-            return f'[{num_map[cid]}]'
+            key = self._citation_group_key(cid)
+            if key not in num_map:
+                ordered_keys.append(key)
+                num_map[key] = len(ordered_keys)
+                display_chunk_by_key[key] = cid
+            else:
+                display_chunk_by_key[key] = self._preferred_citation_chunk(
+                    display_chunk_by_key[key],
+                    cid,
+                )
+            return f'[{num_map[key]}]'
 
         def replace_multi(m: re.Match) -> str:
-            ids = re.findall(rf'{cls._FILENAME}{cls._CHUNK_SUFFIX}', m.group(1))
+            ids = re.findall(rf'{self._FILENAME}{self._CHUNK_SUFFIX}', m.group(1))
             return ''.join(_num(cid) for cid in ids)
 
         def replace_single(m: re.Match) -> str:
@@ -372,6 +445,8 @@ class Agent:
         text = multi.sub(replace_multi, text)
         text = single.sub(replace_single, text)
         text = 参照_form.sub(replace_single, text)
+        text = re.sub(r'(\[\d+\])(?:\s*\1)+', r'\1', text)
+        ordered = [display_chunk_by_key[key] for key in ordered_keys]
         return text, ordered
 
     @classmethod
@@ -395,9 +470,14 @@ class Agent:
         _dash = r'[-－−‐\u2011–—\u2212]?'
         _any_dash = r'[-－−‐\u2011–—\u2212]'
         _digs = r'[0-9０-９]+'
-        # Also covers square-bracket forms like [-21] or [p5]
+        # Keep numbered citation markers like [1], but strip bare page refs in parentheses.
         text = re.sub(
-            rf'[（(\[]\s*{_dash}\s*p?{_digs}(?:\s*{_any_dash}\s*p?{_digs})*\s*[）)\]]',
+            rf'[（(]\s*{_dash}\s*p?{_digs}(?:\s*{_any_dash}\s*p?{_digs})*\s*[）)]',
+            '', text
+        )
+        # Square-bracket cleanup only targets explicit page-like forms such as [p5] or [-21].
+        text = re.sub(
+            rf'\[\s*(?:{_any_dash}\s*p?{_digs}(?:\s*{_any_dash}\s*p?{_digs})*|p{_digs}(?:\s*{_any_dash}\s*p?{_digs})*)\s*\]',
             '', text
         )
         # Strip trailing Japanese/ASCII comma before closing paren: （第25項、） → （第25項）
@@ -407,6 +487,77 @@ class Agent:
         text = re.sub(r'  +', ' ', text)
         text = re.sub(r'\s+([。、，,.])', r'\1', text)
         return text
+
+    @classmethod
+    def _strip_inline_citation_labels(cls, text: str) -> str:
+        """Remove citation-only parentheticals and page labels from answer prose."""
+        dash = r'[-－−‐\u2011–—\u2212]'
+        standard = (
+            r'(?:企業会計基準適用指針|企業会計基準|実務対応報告|移管指針|監査基準|会計基準)'
+            r'\s*第\s*\d+(?:[\u2010\-]\d+)?\s*号'
+            r'|IFRS\s*第?\s*\d+(?:[\u2010\-]\d+)?\s*号?'
+        )
+        article = r'第\s*\d+\s*(?:項|条|号)'
+        bc = rf'BC\s*\d+(?:\s*{dash}\s*\d+)?'
+        page = rf'(?:[Pp]{{1,2}}\.?\s*\d+(?:\s*{dash}\s*\d+)?|(?:ページ|頁)\s*\d+)'
+        citation_content = rf'(?:{standard}|{article}|{bc}|{page}|[、，,・／/\s]+)+'
+
+        text = re.sub(rf'[（(]\s*(?:{citation_content})\s*[）)]', '', text)
+        text = re.sub(
+            rf'\s*[,、，]?\s*(?:[Pp]{{1,2}}\.?\s*\d+(?:\s*{dash}\s*\d+)?|#page=\d+)(?=\s*\[\d+\])',
+            '',
+            text,
+        )
+        text = re.sub(r'\s+(\[\d+\])', r'\1', text)
+        text = re.sub(r'  +', ' ', text)
+        text = re.sub(r'\s+([。、，,.])', r'\1', text)
+        return text
+
+    @staticmethod
+    def _drop_uncited_lines(text: str) -> str:
+        """Keep only headings that lead to cited content and cited body lines."""
+        kept_lines: list[str] = []
+        pending_headings: list[str] = []
+        heading_only_bullet = re.compile(
+            r"^-\s+\*\*(?P<label>[^*]+)\*\*(?P<suffix>（[^）]+）)?$"
+        )
+
+        def flush_pending_headings() -> None:
+            nonlocal pending_headings
+            if not pending_headings:
+                return
+            if kept_lines and kept_lines[-1] != "":
+                kept_lines.append("")
+            kept_lines.extend(pending_headings)
+            pending_headings = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+
+            if not stripped:
+                if kept_lines and kept_lines[-1] != "":
+                    kept_lines.append("")
+                continue
+
+            heading_bullet_match = heading_only_bullet.match(stripped)
+            if heading_bullet_match:
+                label = heading_bullet_match.group("label").strip()
+                suffix = (heading_bullet_match.group("suffix") or "").strip()
+                pending_headings.append(f"## {label}{suffix}".rstrip())
+                continue
+
+            if re.match(r"^#{1,6}\s+", stripped):
+                pending_headings.append(stripped)
+                continue
+
+            if re.search(r"\[\d+\]", stripped):
+                flush_pending_headings()
+                kept_lines.append(stripped)
+
+        while kept_lines and kept_lines[-1] == "":
+            kept_lines.pop()
+        return "\n".join(kept_lines)
 
     @staticmethod
     def _strip_reasoning_preamble(text: str) -> str:
@@ -447,19 +598,21 @@ class Agent:
             text = text[inline_match.start(1):]
         return text
 
-    @classmethod
-    def _sanitize_answer(cls, text: str, *, number_refs: bool = False) -> tuple[str, list[str]] | str:
+    def _sanitize_answer(self, text: str, *, number_refs: bool = False) -> tuple[str, list[str]] | str:
         """Normalize answer formatting before returning it to clients.
 
         When ``number_refs=True`` returns ``(text, ordered_chunk_ids)`` so
         callers can build a numbered reference list matched to inline [N] markers.
         Otherwise returns just the text string (backward-compatible default).
         """
-        text = cls._strip_reasoning_preamble(text)
+        text = self._strip_reasoning_preamble(text)
         cited_ids: list[str] = []
         if number_refs:
-            text, cited_ids = cls._number_chunk_refs(text)
-        text = cls._strip_chunk_refs(text)
+            text, cited_ids = self._number_chunk_refs(text)
+        text = self._strip_chunk_refs(text)
+        text = self._strip_inline_citation_labels(text)
+        if number_refs:
+            text = self._drop_uncited_lines(text)
 
         heading_only_bullet = re.compile(
             r"^-\s+\*\*(?P<label>[^*]+)\*\*(?P<suffix>（[^）]+）)?$"
@@ -485,7 +638,16 @@ class Agent:
             return result, cited_ids
         return result
 
-    def _get_referenced_chunks(self, context: AgentContext, cited_ids: list[str] | None = None) -> list[dict]:
+    def _finalize_answer(self, answer: str, context: AgentContext) -> tuple[str, list[dict[str, Any]], dict[str, str]]:
+        sanitized_answer, cited_ids = self._sanitize_answer(answer, number_refs=True)
+        references, source_url_map = self._get_referenced_chunks(context, cited_ids)
+        return sanitized_answer, references, source_url_map
+
+    def _get_referenced_chunks(
+        self,
+        context: AgentContext,
+        cited_ids: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         """Get chunks for references panel in citation order.
 
         Priority:
@@ -502,13 +664,14 @@ class Agent:
                 ids_to_show.append(cid)
                 seen.add(cid)
 
-        # 2. read_chunk calls not already included
-        for cid in context.read_chunk_ids:
-            if cid not in seen:
-                ids_to_show.append(cid)
-                seen.add(cid)
+        # 2. read_chunk calls only when the answer has no inline citations
+        if not ids_to_show:
+            for cid in context.read_chunk_ids:
+                if cid not in seen:
+                    ids_to_show.append(cid)
+                    seen.add(cid)
 
-        # 3. Search fallback when nothing was explicitly cited/read
+        # 3. Search fallback when nothing was explicitly cited or read
         if not ids_to_show:
             for cid in context.searched_chunk_ids[:10]:
                 if cid not in seen:
@@ -517,7 +680,7 @@ class Agent:
 
         refs = []
         seen_parents: set[str] = set()
-        source_url_map: dict[str, str] = {}  # "第13号" -> base PDF URL
+        source_url_map: dict[str, str] = {}
         for chunk_id in ids_to_show:
             chunk = self.chunk_map.get(chunk_id)
             if not chunk:
@@ -536,8 +699,11 @@ class Agent:
                 base_url = self.pdf_sources[filename]
                 pdf_page = chunk.get("pdf_page")
                 ref["url"] = f"{base_url}#page={pdf_page}" if pdf_page and pdf_page > 1 else base_url
-                # Map "第N号" keys -> page-anchored URL of this chunk
                 source = chunk.get("source", "")
+                source_label = source.split(">")[0].strip()
+                if source_label and source_label not in source_url_map:
+                    source_url_map[source_label] = ref["url"]
+                # Also keep a generic "第N号" key for short citations.
                 for m in re.finditer(r"第\s*(\d+(?:[\u2010\-]\d+)?)\s*号", source):
                     key = f"第{m.group(1).replace(' ', '')}号"
                     if key not in source_url_map:
@@ -547,7 +713,16 @@ class Agent:
 
     @staticmethod
     def _count_cited_references(answer: str) -> int:
-        """Count unique standards / section citations explicitly mentioned in the answer."""
+        """Count unique visible citations in the answer.
+
+        Prefer numbered markers like [1], [2] that the app renders inline.
+        Fall back to explicit standard/article patterns for answers without
+        numbered chunk refs.
+        """
+        numbered = {int(m) for m in re.findall(r"\[(\d+)\]", answer)}
+        if numbered:
+            return len(numbered)
+
         patterns = [
             r"企業会計基準第\s*\d+\s*号",
             r"企業会計基準適用指針第\s*\d+\s*号",
@@ -564,6 +739,12 @@ class Agent:
                 citations.add(normalized)
         return len(citations)
 
+    def _build_answer_summary(self, answer: str, context: AgentContext) -> dict[str, Any]:
+        summary = context.get_summary()
+        summary["read_chunk_count"] = len(context.read_chunk_ids)
+        summary["chunks_read_count"] = self._count_cited_references(answer)
+        return summary
+
     def _build_result(
         self,
         answer: str,
@@ -572,8 +753,7 @@ class Agent:
         stop_reason: str,
         total_cost: float,
     ) -> dict[str, Any]:
-        sanitized_answer = self._sanitize_answer(answer)
-        references, source_url_map = self._get_referenced_chunks(context)
+        sanitized_answer, references, source_url_map = self._finalize_answer(answer, context)
         return {
             "answer": sanitized_answer,
             "loops": loops,

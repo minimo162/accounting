@@ -10,7 +10,7 @@ producing embeddings that capture document-level meaning.
 Usage:
     python scripts/add_context.py [chunks.json] [full_texts.json]
 
-Requires CEREBRAS_API_KEY environment variable.
+Requires DEEPSEEK_API_KEY environment variable.
 Supports incremental processing — skips chunks that already have a `context` field.
 """
 
@@ -25,12 +25,12 @@ from openai import OpenAI
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Cerebras config
-_BASE_URL = "https://api.cerebras.ai/v1"
-_MODEL = "gpt-oss-120b"
+# DeepSeek config
+_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
+_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 
 # Maximum document chars to include as context
-# Cerebras gpt-oss-120b has 128K context — keep well within limit
+# DeepSeek V3.2 has a 128K context window — keep well within limit
 _MAX_DOC_CHARS = 80_000
 
 # Prompt template (Japanese, tailored for accounting standards)
@@ -114,7 +114,7 @@ def generate_contexts(
     print(f"Total chunks: {len(chunks)}")
     print(f"Already have context: {len(chunks) - len(pending)}")
     print(f"Need context: {len(pending)}")
-    print(f"Model: {_MODEL} via Cerebras API")
+    print(f"Model: {_MODEL} via DeepSeek API")
 
     client = OpenAI(api_key=api_key, base_url=_BASE_URL)
     processed = 0
@@ -196,10 +196,10 @@ def generate_contexts(
 if __name__ == "__main__":
     chunks_path = sys.argv[1] if len(sys.argv) > 1 else "data/chunks.json"
     full_texts_path = sys.argv[2] if len(sys.argv) > 2 else "data/full_texts.json"
-    api_key = os.getenv("CEREBRAS_API_KEY", "")
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
 
     if not api_key:
-        print("Error: CEREBRAS_API_KEY environment variable not set")
+        print("Error: DEEPSEEK_API_KEY environment variable not set")
         sys.exit(1)
 
     generate_contexts(chunks_path, full_texts_path, api_key)

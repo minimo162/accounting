@@ -4,7 +4,7 @@
 
 - Backend: FastAPI + Agentic RAG
 - Frontend: SvelteKit + SSE ストリーミング
-- LLM: Cerebras `gpt-oss-120b` を既定利用、必要に応じて Gemini
+- LLM: DeepSeek V3.2（API model: `deepseek-chat`）を既定利用、必要に応じて Gemini / Cerebras
 - Retrieval: dense + BM25 + RRF + heuristic/LLM rerank + optional query expansion / HyDE
 - Chunking: parent/child chunking。検索は child、表示と引用は parent
 - Infra: Cloud Run + GCS
@@ -88,15 +88,18 @@ cd ..
 環境変数:
 
 ```bash
+export DEEPSEEK_API_KEY="your-api-key"
 export GEMINI_API_KEY="your-api-key"
-export CEREBRAS_API_KEY="your-api-key"
+export CEREBRAS_API_KEY="your-api-key"  # Cerebras に戻す場合のみ
 
 # OpenAI-compatible embeddings を使う場合
 export EMBEDDING_API_KEY="your-api-key"
 export EMBEDDING_BASE_URL="https://api.openai.com/v1"
 
 # 任意
-export LLM_PROVIDER="cerebras"   # or gemini
+export LLM_PROVIDER="deepseek"   # or gemini / cerebras
+export LLM_MODEL="deepseek-chat" # DeepSeek-V3.2 の非 thinking モード
+export LLM_BASE_URL="https://api.deepseek.com/v1"
 export USE_GCS="false"           # ローカル data/ を使う場合
 export DATA_DIR="data"
 export GCS_BUCKET="jp-accounting-chat-data"
@@ -105,7 +108,8 @@ export GCS_PREFIX="index"
 
 補足:
 
-- LLM 推論は `LLM_PROVIDER` に従って Cerebras または Gemini を使います
+- LLM 推論は `LLM_PROVIDER` に従って DeepSeek / Gemini / Cerebras を切り替えます
+- DeepSeek V3.2 は公式 API 上では `deepseek-chat` として公開されているため、既定値はその model ID を使っています
 - 埋め込みは常に Gemini を使うため、インデックス構築や `semantic_search` には `GEMINI_API_KEY` が必要です
 - `USE_GCS=true` の場合、起動時に `chunks.json` / `pdf_sources.json` / index 一式を GCS から取得します
 
@@ -195,7 +199,7 @@ gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
 
 - `scripts/deploy.sh` には `PROJECT_ID` `REGION` `SERVICE_NAME` `REPO` が固定値で入っています
 - 実行環境で `gcloud auth login` と `gcloud config set project jp-accounting-chat` が済んでいる必要があります
-- Cloud Run 上の API キーは既存設定を維持し、`deploy.sh` では非シークレット設定のみ更新します
+- Cloud Run 上では `DEEPSEEK_API_KEY` を別途設定しておく必要があります。`deploy.sh` では非シークレット設定のみ更新します
 - 別環境へ出す場合は、先に `scripts/deploy.sh` の定数と GCS 設定を見直してください
 
 ## トラブルシュート

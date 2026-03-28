@@ -31,7 +31,7 @@ class QueryExpander:
             if self.is_exact_query(query):
                 return variants
             variants.extend(self._heuristic_variants(query))
-            if self.llm is not None:
+            if self.llm is not None and self.config.enable_llm_query_expansion:
                 variants.extend(self._llm_variants(query))
         deduped: list[str] = []
         for variant in variants:

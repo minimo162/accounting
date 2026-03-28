@@ -2,9 +2,9 @@
 FROM node:22-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 COPY frontend/ ./
-RUN npm run build
+RUN npm run prepare && npm run build
 
 # Stage 2: Python backend
 FROM python:3.12-slim
