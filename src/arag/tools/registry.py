@@ -19,7 +19,7 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
-    def execute(self, name: str, context: AgentContext, **kwargs) -> tuple[str, dict]:
-        if name not in self._tools:
-            return f"Unknown tool: {name}", {"error": f"Unknown tool: {name}"}
-        return self._tools[name].execute(context, **kwargs)
+    def execute(self, tool_name: str, context: AgentContext, **kwargs) -> tuple[str, dict]:
+        if tool_name not in self._tools:
+            return f"Unknown tool: {tool_name}", {"error": f"Unknown tool: {tool_name}"}
+        return self._tools[tool_name].execute(context, **kwargs)

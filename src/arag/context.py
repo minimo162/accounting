@@ -17,6 +17,7 @@ class AgentContext:
 
     def __init__(self):
         self.read_chunk_ids: set[str] = set()
+        self.searched_chunk_ids: list[str] = []  # ordered; preserves first-seen rank
         self.total_retrieved_tokens: int = 0
         self.retrieval_logs: list[RetrievalLog] = []
         self.search_history: list[dict[str, Any]] = []
@@ -24,6 +25,14 @@ class AgentContext:
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)
+
+    def add_searched_chunks(self, chunk_ids: list[str]):
+        """Record chunk IDs returned by a search (for fallback references)."""
+        seen = set(self.searched_chunk_ids)
+        for cid in chunk_ids:
+            if cid not in seen:
+                self.searched_chunk_ids.append(cid)
+                seen.add(cid)
 
     def is_chunk_read(self, chunk_id: str) -> bool:
         return chunk_id in self.read_chunk_ids
@@ -68,6 +77,7 @@ class AgentContext:
 
     def reset(self):
         self.read_chunk_ids.clear()
+        self.searched_chunk_ids.clear()
         self.total_retrieved_tokens = 0
         self.retrieval_logs.clear()
         self.search_history.clear()

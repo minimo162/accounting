@@ -197,7 +197,8 @@ class Agent:
         total_cost = 0.0
 
         for loop_idx in range(self.max_loops):
-            yield {"type": "status", "data": f"検索中... (ステップ {loop_idx + 1})"}
+            status_msg = "調査中..." if loop_idx == 0 else f"調査中... (ステップ {loop_idx + 1})"
+            yield {"type": "status", "data": status_msg}
 
             self._maybe_nudge(messages, loop_idx)
 
@@ -222,8 +223,8 @@ class Agent:
                 for i in range(0, len(answer), chunk_size):
                     yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
                 yield {"type": "answer_done", "data": answer}
-                # Send references individually to avoid oversized SSE events
-                for ref in self._get_referenced_chunks(context):
+                refs, source_url_map = self._get_referenced_chunks(context)
+                for ref in refs:
                     yield {"type": "reference", "data": ref}
                 summary = context.get_summary()
                 summary["read_chunk_count"] = summary.get("chunks_read_count", 0)
@@ -233,6 +234,7 @@ class Agent:
                     "data": {
                         "loops": loop_idx + 1,
                         "stop_reason": "natural",
+                        "source_url_map": source_url_map,
                         **summary,
                         "total_cost": total_cost,
                     },
@@ -289,13 +291,15 @@ class Agent:
         for i in range(0, len(answer), chunk_size):
             yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
         yield {"type": "answer_done", "data": answer}
-        for ref in self._get_referenced_chunks(context):
+        refs, source_url_map = self._get_referenced_chunks(context)
+        for ref in refs:
             yield {"type": "reference", "data": ref}
         yield {
             "type": "done",
             "data": {
                 "loops": loops,
                 "stop_reason": stop_reason,
+                "source_url_map": source_url_map,
                 **context.get_summary(),
                 "total_cost": total_cost,
             },
@@ -325,22 +329,136 @@ class Agent:
         response = await self.llm.achat(messages=messages_copy, tools=None, temperature=0.0)
         return response["message"].get("content", ""), response.get("cost", 0.0)
 
-    @staticmethod
-    def _strip_chunk_refs(text: str) -> str:
-        """Remove any remaining Chunk ID references from the answer."""
-        # Remove old format: 【Chunk 123】, [Chunk 123], (Chunk 123), Chunk123, Chunk 123
-        text = re.sub(r'[【\[\(]\s*Chunk\s*\d+\s*[】\]\)]', '', text)
+    # Chunk ID patterns shared across ref-handling methods
+    _CHUNK_SUFFIX = r':(?:p|c)?\d+(?:-\d+)*'
+    _FILENAME = r'[\w\-]+\.(?:pdf|xml)'
+
+    @classmethod
+    def _number_chunk_refs(cls, text: str) -> tuple[str, list[str]]:
+        """Replace inline chunk ID refs with [N] citation markers.
+
+        Scans the answer for bracketed chunk ID references and converts them to
+        sequential `[1]`, `[2]` … markers.  Returns the modified text and an
+        ordered list of unique chunk IDs (index 0 → citation [1], etc.).
+        """
+        # Single ID in brackets: （filename.pdf:p5）→ [N]
+        single = re.compile(
+            rf'[（\(\[【]\s*({cls._FILENAME}{cls._CHUNK_SUFFIX})\s*[）\)\]】]'
+        )
+        # Multiple IDs in one bracket: （id1、id2）→ [N][M]
+        multi = re.compile(
+            rf'[（\(\[【]\s*({cls._FILENAME}{cls._CHUNK_SUFFIX}(?:\s*[、，;]\s*{cls._FILENAME}{cls._CHUNK_SUFFIX})+)\s*[）\)\]】]'
+        )
+        参照_form = re.compile(
+            rf'参照:\s*({cls._FILENAME}{cls._CHUNK_SUFFIX})\s*;?'
+        )
+
+        ordered: list[str] = []
+        num_map: dict[str, int] = {}
+
+        def _num(cid: str) -> str:
+            if cid not in num_map:
+                ordered.append(cid)
+                num_map[cid] = len(ordered)
+            return f'[{num_map[cid]}]'
+
+        def replace_multi(m: re.Match) -> str:
+            ids = re.findall(rf'{cls._FILENAME}{cls._CHUNK_SUFFIX}', m.group(1))
+            return ''.join(_num(cid) for cid in ids)
+
+        def replace_single(m: re.Match) -> str:
+            return _num(m.group(1))
+
+        text = multi.sub(replace_multi, text)
+        text = single.sub(replace_single, text)
+        text = 参照_form.sub(replace_single, text)
+        return text, ordered
+
+    @classmethod
+    def _strip_chunk_refs(cls, text: str) -> str:
+        """Remove any remaining un-numbered chunk ID references from the answer."""
+        _s = cls._CHUNK_SUFFIX
+        _f = cls._FILENAME
+
+        # Any leftover bracketed forms
+        text = re.sub(rf'[（\(\[【]\s*{_f}{_s}\s*[）\)\]】]', '', text)
+        # Bare Chunk keyword refs
+        text = re.sub(r'[【\[\(]\s*Chunk\s*[\w\-:\.]+\s*[】\]\)]', '', text)
         text = re.sub(r'\bChunk\s*\d+\b', '', text)
-        # Remove new format: filename.pdf:123, filename.xml:45 (file:page IDs)
-        text = re.sub(r'\b[\w\-]+\.(pdf|xml):\d+\b', '', text)
-        # Clean up any resulting double spaces or orphaned punctuation
+        # Bare filename:page refs
+        text = re.sub(rf'\b{_f}{_s}\b', '', text)
+        # Orphaned 参照:
+        text = re.sub(r'参照:\s*;?', '', text)
+        # Orphaned bare page-number refs like (-40), （-39）, (p40), （-40-41） left by model
+        # Handle ASCII and full-width parens, various dash/minus chars, ASCII and full-width digits
+        # All dash/minus variants including U+2011 NON-BREAKING HYPHEN used by some models
+        _dash = r'[-－−‐\u2011–—\u2212]?'
+        _any_dash = r'[-－−‐\u2011–—\u2212]'
+        _digs = r'[0-9０-９]+'
+        # Also covers square-bracket forms like [-21] or [p5]
+        text = re.sub(
+            rf'[（(\[]\s*{_dash}\s*p?{_digs}(?:\s*{_any_dash}\s*p?{_digs})*\s*[）)\]]',
+            '', text
+        )
+        # Strip trailing Japanese/ASCII comma before closing paren: （第25項、） → （第25項）
+        text = re.sub(r'([（(][^）)\n]{2,})[、，,]\s*([）)])', r'\1\2', text)
+        # Clean up residual empty or punctuation-only parentheses like （、）（;）（ ）
+        text = re.sub(r'[（(][\s、;,・]*[）)]', '', text)
         text = re.sub(r'  +', ' ', text)
-        text = re.sub(r' ([。、，,.])', r'\1', text)
+        text = re.sub(r'\s+([。、，,.])', r'\1', text)
+        return text
+
+    @staticmethod
+    def _strip_reasoning_preamble(text: str) -> str:
+        """Remove model internal reasoning/tool-call leakage before the actual answer.
+
+        Some LLMs emit planning text like "We have many chunks. Need to read them."
+        or raw JSON tool-call arguments as part of the final text content.
+        Detect these patterns and strip everything up to the start of the real answer.
+        """
+        # Remove JSON blobs that look like tool call arguments
+        text = re.sub(r'\{[^{}]*"chunk_ids"[^{}]*\}', '', text, flags=re.DOTALL)
+        text = re.sub(r'\{[^{}]*"query"[^{}]*\}', '', text, flags=re.DOTALL)
+        text = re.sub(r'\{[^{}]*"ids"[^{}]*\}', '', text, flags=re.DOTALL)
+        # Remove common English reasoning phrases emitted by the LLM
+        text = re.sub(r'We(?:\s+have|\s+need\s+to|\s+got)[^\n.]*\.', '', text)
+        text = re.sub(r'Need\s+to\s+\w+[^\n.]*\.', '', text)
+        text = re.sub(r'Let\s+me\s+\w+[^\n.]*\.', '', text)
+        # If there's still a block of ASCII-only preamble before the Japanese answer,
+        # find the first line with Japanese text or a ## heading and discard everything before it.
+        lines = text.splitlines()
+        japanese_start = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith('##') or re.search(r'[\u3040-\u9fff\u30a0-\u30ff\u4e00-\u9fff]', stripped):
+                japanese_start = i
+                break
+        if japanese_start is not None and japanese_start > 0:
+            preamble = '\n'.join(lines[:japanese_start])
+            # Only strip preamble if it looks like leaked reasoning (contains JSON chars or English words)
+            if re.search(r'[{}\[\]]', preamble) or re.search(r'\b[A-Za-z]{4,}\b', preamble):
+                text = '\n'.join(lines[japanese_start:])
+        # Handle the case where ASCII planning text and Japanese answer are on the same line
+        # e.g. "We have the content.## 減損の注記様式" or "We have the content.減損..."
+        inline_match = re.match(r'^[A-Za-z\s.,!?:;\[\]{}"\']+?(##\s|\S*[\u3040-\u9fff\u30a0-\u30ff\u4e00-\u9fff])', text)
+        if inline_match:
+            text = text[inline_match.start(1):]
         return text
 
     @classmethod
-    def _sanitize_answer(cls, text: str) -> str:
-        """Normalize answer formatting before returning it to clients."""
+    def _sanitize_answer(cls, text: str, *, number_refs: bool = False) -> tuple[str, list[str]] | str:
+        """Normalize answer formatting before returning it to clients.
+
+        When ``number_refs=True`` returns ``(text, ordered_chunk_ids)`` so
+        callers can build a numbered reference list matched to inline [N] markers.
+        Otherwise returns just the text string (backward-compatible default).
+        """
+        text = cls._strip_reasoning_preamble(text)
+        cited_ids: list[str] = []
+        if number_refs:
+            text, cited_ids = cls._number_chunk_refs(text)
         text = cls._strip_chunk_refs(text)
 
         heading_only_bullet = re.compile(
@@ -362,28 +480,70 @@ class Agent:
             normalized_lines.append("" if is_blank else line)
             previous_blank = is_blank
 
-        return "\n".join(normalized_lines).strip()
+        result = "\n".join(normalized_lines).strip()
+        if number_refs:
+            return result, cited_ids
+        return result
 
-    def _get_referenced_chunks(self, context: AgentContext) -> list[dict]:
-        """Get full text of chunks the agent explicitly read via read_chunk."""
+    def _get_referenced_chunks(self, context: AgentContext, cited_ids: list[str] | None = None) -> list[dict]:
+        """Get chunks for references panel in citation order.
+
+        Priority:
+        1. Inline-cited chunk IDs (from [N] markers in answer) — in citation order
+        2. Explicitly read via read_chunk tool
+        3. Fallback: top search results
+        """
+        seen: set[str] = set()
+        ids_to_show: list[str] = []
+
+        # 1. Inline citations from answer body (determines [N] numbering)
+        for cid in (cited_ids or []):
+            if cid not in seen:
+                ids_to_show.append(cid)
+                seen.add(cid)
+
+        # 2. read_chunk calls not already included
+        for cid in context.read_chunk_ids:
+            if cid not in seen:
+                ids_to_show.append(cid)
+                seen.add(cid)
+
+        # 3. Search fallback when nothing was explicitly cited/read
+        if not ids_to_show:
+            for cid in context.searched_chunk_ids[:10]:
+                if cid not in seen:
+                    ids_to_show.append(cid)
+                    seen.add(cid)
+
         refs = []
-        for chunk_id in context.read_chunk_ids:
+        seen_parents: set[str] = set()
+        source_url_map: dict[str, str] = {}  # "第13号" -> base PDF URL
+        for chunk_id in ids_to_show:
             chunk = self.chunk_map.get(chunk_id)
-            if chunk:
-                ref = {
-                    "id": chunk_id,
-                    "source": chunk.get("source", ""),
-                    "text": chunk["text"],
-                }
-                filename = chunk.get("file", "")
-                if filename and filename in self.pdf_sources:
-                    url = self.pdf_sources[filename]
-                    pdf_page = chunk.get("pdf_page")
-                    if pdf_page and pdf_page > 1:
-                        url = f"{url}#page={pdf_page}"
-                    ref["url"] = url
-                refs.append(ref)
-        return refs
+            if not chunk:
+                continue
+            parent_id = chunk.get("parent_id", chunk_id)
+            if parent_id in seen_parents:
+                continue
+            seen_parents.add(parent_id)
+            ref = {
+                "id": chunk_id,
+                "source": chunk.get("source", ""),
+                "text": chunk["text"],
+            }
+            filename = chunk.get("file", "")
+            if filename and filename in self.pdf_sources:
+                base_url = self.pdf_sources[filename]
+                pdf_page = chunk.get("pdf_page")
+                ref["url"] = f"{base_url}#page={pdf_page}" if pdf_page and pdf_page > 1 else base_url
+                # Map "第N号" keys -> page-anchored URL of this chunk
+                source = chunk.get("source", "")
+                for m in re.finditer(r"第\s*(\d+(?:[\u2010\-]\d+)?)\s*号", source):
+                    key = f"第{m.group(1).replace(' ', '')}号"
+                    if key not in source_url_map:
+                        source_url_map[key] = ref["url"]
+            refs.append(ref)
+        return refs, source_url_map
 
     @staticmethod
     def _count_cited_references(answer: str) -> int:
@@ -413,7 +573,7 @@ class Agent:
         total_cost: float,
     ) -> dict[str, Any]:
         sanitized_answer = self._sanitize_answer(answer)
-        references = self._get_referenced_chunks(context)
+        references, source_url_map = self._get_referenced_chunks(context)
         return {
             "answer": sanitized_answer,
             "loops": loops,
@@ -424,4 +584,5 @@ class Agent:
             "read_chunk_count": len(context.read_chunk_ids),
             "trajectory": context.trajectory,
             "references": references,
+            "source_url_map": source_url_map,
         }

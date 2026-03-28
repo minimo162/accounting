@@ -13,6 +13,7 @@ dependencies = [
     { name = "google-genai" },
     { name = "google-generativeai" },
     { name = "httpx" },
+    { name = "liteparse" },
     { name = "numpy" },
     { name = "openai" },
     { name = "playwright" },
@@ -30,6 +31,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=1.65.0" },
     { name = "google-generativeai", specifier = ">=0.8.6" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "liteparse", specifier = ">=1.2.0" },
     { name = "numpy", specifier = ">=2.4.3" },
     { name = "openai", specifier = ">=2.16.0" },
     { name = "playwright", specifier = ">=1.58.0" },
@@ -890,6 +892,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/19/74/a633ee74eb36c44aa6d1095e7cc5569bebf04342ee146178e2d36600708b/jsonschema_specifications-2025.9.1.tar.gz", hash = "sha256:b540987f239e745613c7a9176f3edb72b832a4ac465cf02712288397832b5e8d", size = 32855, upload-time = "2025-09-08T01:34:59.186Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl", hash = "sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe", size = 18437, upload-time = "2025-09-08T01:34:57.871Z" },
+]
+
+[[package]]
+name = "liteparse"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e9/26/b6c9d0e5da1f913327b7eecfea33063eecd1fbcefc49cb8c0d53c263a03b/liteparse-1.2.0.tar.gz", hash = "sha256:c6709e657905b39e72e1be03d75c650e157d41ee2ea4749389141712e1f5eaaf", size = 29460, upload-time = "2026-03-26T15:40:57.885Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/fc/6678c63b9e4d859b3e0058acb8c5d332a172073fd425b64cfe7a7375ae9c/liteparse-1.2.0-py3-none-any.whl", hash = "sha256:8ed166e94e909beef2b65860efa1b17792207c3e8e1a8e158d86c0e9fc155199", size = 8687, upload-time = "2026-03-26T15:40:57.01Z" },
 ]
 
 [[package]]

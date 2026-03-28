@@ -194,7 +194,9 @@ gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
 デプロイ時の前提:
 
 - `scripts/deploy.sh` には `PROJECT_ID` `REGION` `SERVICE_NAME` `REPO` が固定値で入っています
-- 別環境へ出す場合は、先に `scripts/deploy.sh` の定数と `--set-env-vars` の GCS 設定を見直してください
+- 実行環境で `gcloud auth login` と `gcloud config set project jp-accounting-chat` が済んでいる必要があります
+- Cloud Run 上の API キーは既存設定を維持し、`deploy.sh` では非シークレット設定のみ更新します
+- 別環境へ出す場合は、先に `scripts/deploy.sh` の定数と GCS 設定を見直してください
 
 ## トラブルシュート
 
@@ -213,3 +215,50 @@ gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
 - `src/arag/tools/hybrid_search.py` で dense / keyword / rerank を統合
 - embedding provider は Gemini と OpenAI-compatible backend を切り替え可能
 - 埋め込みは `npz + float16` で圧縮保存し、起動コストを抑制
+
+## 引き継ぎ（2026-03-28）
+
+### 直近セッションで行った主な変更
+
+#### `scripts/process_pdfs.py`
+
+- **物理ページ番号の正確な紐付け**: 全チャンクに `pdf_page` フィールドを付与。ページ境界マーカー `\x01PAGE:N\x01` をフルテキストに埋め込み、セクション分割時に `current_pdf_page` を順追跡することで 1 ページずれ問題を解消
+- **タイトル抽出の改善 (`_extract_title`)**:
+  - `第N号` を含む行を最優先（機関名より先に返す）
+  - `移管指針` をキーワードに追加
+  - 機関名のみの行（`企業会計基準委員会` 等）を全ループでスキップ
+  - 検索行数を 50 → 150 に拡大
+- **自動重複除去 (`_dedup_pdf_files`)**:
+  - ファイル名から YYYYMMDD を抽出して新しい順にソート
+  - 同一 `doc_title`（NFKC 正規化済み）の旧バージョンを自動スキップ
+  - 199 → 148 PDF（51 ファイル削除）、17,088 → 11,226 チャンクに削減
+
+#### `src/arag/agent.py`
+
+- **`pdf_page` を使った `#page=N` アンカー付き URL 生成**: ソースカードのリンクが正確な PDF ページに飛ぶように
+- **`source_url_map` にページアンカー付き URL を格納**: `第N号` キーに対して `base_url#page=N` を保存
+- **重複引用の排除**: `_get_referenced_chunks` で `parent_id` による dedup を追加（親+子チャンクが同時に表示されていた問題を修正）
+- **`_strip_chunk_refs` の拡張**: `[-21]` `[-23]` 形式の孤立した角括弧参照も除去
+- **`ToolRegistry.execute` の引数名変更**: `name` → `tool_name`（LLM が `name=` 引数付きで `read_document` を呼ぶと TypeError になっていたバグを修正）
+
+#### `frontend/src/routes/+page.svelte`
+
+- **文中インラインリンクを廃止**: ページ推定の精度に限界があるためリンクを削除。ソースカードのみで引用ナビゲーションを提供
+- **ソースカード表示名の修正**: `source` フィールドの `>` 以降（セクション見出し）を切り捨て、文書名のみ表示
+- **コピーボタン（⎘）追加**: PDF 内 Ctrl+F 用にチャンクテキストをクリップボードにコピー
+- **`copiedRefId` を `$state()` に変更**: Svelte 5 での reactivity 警告を修正
+
+### 現在の既知課題
+
+- `lease_20240913_06.pdf`（第35号）、`lease_20240913_07.pdf`（第36号）、`lease_20240913_08.pdf`（第18号）、`lease_20240913_12.pdf`（第29号）、`lease_20240913_43.pdf`（第26号）はリース基準と同日公表された他の基準で、対応する新版が index に存在しないため残っている。将来的に新版が追加されれば自動的に除去される
+- `process_pdfs.py` のみ変更した場合、`build_index.py` の再実行（embedding 再構築）が必要。現在 GCS 上の `sentence_index.*` は古い chunks に対応しており、chunks の追加・削除があると検索精度に影響する可能性がある（今回の変更で大幅にチャンク数が減ったため、**index 再構築を推奨**）
+
+### index 再構築手順
+
+```bash
+python scripts/build_index.py
+gcloud storage cp data/index/sentence_index.npz gs://jp-accounting-chat-data/index/
+gcloud storage cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
+gcloud storage cp data/index/sentence_index.pkl gs://jp-accounting-chat-data/index/
+bash scripts/deploy.sh
+```

@@ -118,8 +118,8 @@ class SemanticSearchTool(BaseTool):
         unread_ids = [cid for cid in chunk_ids if not context.is_chunk_read(cid) and not get_chunk_tag((self._corpus.get_parent(cid) or {}).get("text", ""))]
         if unread_ids:
             lines.append(f"\n--- {len(unread_ids)}件の未読チャンクがあります。read_chunkで全文を取得してください ---")
-            lines.append(f"read_chunk(chunk_ids={unread_ids})")
 
+        context.add_searched_chunks(chunk_ids)
         retrieved_tokens = len(_tokenizer.encode("\n".join(snippets))) if snippets else 0
         context.add_retrieval_log(
             tool_name=self.name,

@@ -15,6 +15,7 @@
       read_chunk_count?: number;
       total_cost?: number;
       references?: Reference[];
+      source_url_map?: Record<string, string>;
     };
   }
 
@@ -39,6 +40,19 @@
 
   function getDisplayedReadCount(message: Message): number | string {
     return message.metadata?.references?.length ?? message.metadata?.read_chunk_count ?? '?';
+  }
+
+  function getChunkUrl(ref: Reference): string {
+    return ref.url ?? '';
+  }
+
+  let copiedRefId: string | null = $state(null);
+  async function copyChunkText(ref: { id?: string; text: string }) {
+    try {
+      await navigator.clipboard.writeText(ref.text);
+      copiedRefId = ref.id ?? null;
+      setTimeout(() => { copiedRefId = null; }, 1500);
+    } catch {}
   }
 
   function scrollToMessage(idx: number) {
@@ -122,14 +136,30 @@
               }
             } else if (event.type === 'tool_call') {
               const toolName = event.data.tool;
-              const toolLabels: Record<string, string> = {
-                keyword_search: 'キーワード検索',
-                semantic_search: '意味検索',
-                read_chunk: 'チャンク読取',
-              };
+              const args = event.data.args || {};
+              let statusContent = '';
+              if (toolName === 'hybrid_search' || toolName === 'keyword_search' || toolName === 'semantic_search') {
+                const labelMap: Record<string, string> = {
+                  hybrid_search: '検索',
+                  keyword_search: 'キーワード検索',
+                  semantic_search: '意味検索',
+                };
+                const label = labelMap[toolName];
+                const query = args.query ? `「${args.query}」` : '';
+                statusContent = `${label}中${query ? ' ' + query : ''}...`;
+              } else if (toolName === 'read_chunk') {
+                const ids = args.chunk_ids || [];
+                const count = Array.isArray(ids) ? ids.length : 1;
+                statusContent = `条文を読取中... (${count}件)`;
+              } else if (toolName === 'read_document') {
+                const docName = args.document_name || args.filename || '';
+                statusContent = `文書を読取中${docName ? ' — ' + docName : ''}...`;
+              } else {
+                statusContent = `${toolName}を実行中...`;
+              }
               messages[statusIdx] = {
                 role: 'status',
-                content: `${toolLabels[toolName] || toolName}を実行中...`,
+                content: statusContent,
               };
               messages = [...messages];
             } else if (event.type === 'answer_delta') {
@@ -241,7 +271,7 @@
 </script>
 
 <script lang="ts" module>
-  function formatMarkdown(text: string): string {
+  function formatMarkdown(text: string, refs: Reference[] = [], sourceUrlMap: Record<string, string> = {}): string {
     if (!text) return '';
 
     // Pre-process: convert literal <br> tags to newlines, but preserve them inside table rows
@@ -306,7 +336,7 @@
 
       const flushParagraph = () => {
         if (currentParagraph.length > 0) {
-          const escaped = currentParagraph.map(l => inlineFormat(escapeHtml(l))).join('<br>');
+          const escaped = currentParagraph.map(l => inlineFormat(escapeHtml(l), refs, sourceUrlMap)).join('<br>');
           html.push(`<p>${escaped}</p>`);
           currentParagraph = [];
         }
@@ -331,7 +361,7 @@
           flushParagraph();
           const level = headingMatch[1].length;
           const content = escapeHtml(headingMatch[2]);
-          html.push(`<h${level + 2}>${inlineFormat(content)}</h${level + 2}>`);
+          html.push(`<h${level + 2}>${inlineFormat(content, refs)}</h${level + 2}>`);
           continue;
         }
 
@@ -352,7 +382,7 @@
               break;
             }
             const content = ll.replace(/^\s*[-・•*]\s*/, '').replace(/^\s*\d+\.\s*/, '');
-            listItems.push(`<li>${inlineFormat(escapeHtml(content))}</li>`);
+            listItems.push(`<li>${inlineFormat(escapeHtml(content), refs, sourceUrlMap)}</li>`);
             li++;
           }
           li--; // Back up one since the for loop will increment
@@ -377,7 +407,29 @@
       .replace(/>/g, '&gt;');
   }
 
-  function inlineFormat(text: string): string {
+  function findCiteUrl(inner: string, refs: Reference[], sourceUrlMap: Record<string, string>): string {
+    const stdMatch = inner.match(/第(\d+)\s*号/);
+    const stdKey = stdMatch ? `第${stdMatch[1]}号` : null;
+
+    // 1. Article-number match against chunk text — most precise (finds actual page)
+    //    Optionally constrain to chunks from the same standard when 第N号 is present
+    const nums = [...inner.matchAll(/第(\d+)[項条]/g)].map(m => m[1]);
+    for (const n of nums) {
+      const pat = new RegExp(`第${n}[項条]`);
+      // Prefer a chunk from the same standard if possible
+      const hit = stdKey
+        ? refs.find(r => r.url && pat.test(r.text) && sourceUrlMap[stdKey]?.split('#')[0] === r.url?.split('#')[0])
+          ?? refs.find(r => r.url && pat.test(r.text))
+        : refs.find(r => r.url && pat.test(r.text));
+      if (hit?.url) return hit.url;
+    }
+    // 2. Standard-number match from source_url_map (first chunk of that standard)
+    if (stdKey && sourceUrlMap[stdKey]) return sourceUrlMap[stdKey];
+    // 3. Fallback: first ref with a URL
+    return refs.find(r => r.url)?.url ?? '';
+  }
+
+  function inlineFormat(text: string, refs: Reference[] = [], sourceUrlMap: Record<string, string> = {}): string {
     return text
       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.*?)\*/g, '<em>$1</em>')
@@ -499,32 +551,30 @@
       {:else}
         <div class="message assistant">
           <div class="bubble assistant-bubble">
-            {@html formatMarkdown(msg.content)}
+            {@html formatMarkdown(msg.content, msg.metadata?.references ?? [], msg.metadata?.source_url_map ?? {})}
+
             {#if msg.metadata?.references?.length}
-              <div class="references">
-                <details>
-                  <summary>読んだ候補条文 ({getDisplayedReadCount(msg)}件)</summary>
-                  <div class="ref-list">
-                    {#each msg.metadata.references as ref}
-                      <div class="ref-item">
-                        <div class="ref-header">
-                          {#if ref.url}
-                            <a class="ref-source ref-link" href={ref.url} target="_blank" rel="noopener noreferrer">
-                              {ref.source}
-                              <span class="ref-link-icon">&#x2197;</span>
-                            </a>
-                          {:else}
-                            <span class="ref-source">{ref.source}</span>
-                          {/if}
-                        </div>
-                        <details class="ref-details">
-                          <summary>原文を表示</summary>
-                          <div class="ref-text">{ref.text}</div>
-                        </details>
+              <div class="sources-section">
+                <div class="sources-label">参照チャンク ({getDisplayedReadCount(msg)}件)</div>
+                <div class="sources-list">
+                  {#each msg.metadata.references as ref}
+                    <div class="source-card">
+                      <div class="source-card-header">
+                        {#if ref.url}
+                          <a class="source-chip-link" href={getChunkUrl(ref)} target="_blank" rel="noopener noreferrer">
+                            {ref.source.split('>')[0].trim()}<span class="ref-link-icon">&#x2197;</span>
+                          </a>
+                        {:else}
+                          <span class="source-card-name">{ref.source.split('>')[0].trim()}</span>
+                        {/if}
+                        <button class="copy-btn" title="テキストをコピー（PDF内Ctrl+F用）" onclick={() => copyChunkText(ref)}>
+                          {copiedRefId === ref.id ? '✓' : '⎘'}
+                        </button>
                       </div>
-                    {/each}
-                  </div>
-                </details>
+                      <div class="source-card-text">{ref.text.slice(0, 200)}{ref.text.length > 200 ? '…' : ''}</div>
+                    </div>
+                  {/each}
+                </div>
               </div>
             {/if}
             {#if msg.metadata}
@@ -802,6 +852,17 @@
 
   .ref-header {
     margin-bottom: 0.35rem;
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+  }
+
+  .ref-num {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #60a5fa;
+    min-width: 1.6rem;
+    flex-shrink: 0;
   }
 
   .ref-source {
@@ -865,6 +926,76 @@
   .ref-text::-webkit-scrollbar-thumb {
     background: #27272a;
     border-radius: 2px;
+  }
+
+  .sources-section {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid #2a2a35;
+  }
+
+  .sources-label {
+    font-size: 0.7rem;
+    color: #52525b;
+    margin-bottom: 0.4rem;
+  }
+
+  .sources-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .source-chip-link {
+    color: #60a5fa;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    font-size: 0.73rem;
+    font-weight: 500;
+  }
+
+  .source-chip-link:hover { text-decoration: underline; }
+
+  .source-card {
+    background: #131318;
+    border: 1px solid #2a2a35;
+    border-radius: 0.5rem;
+    padding: 0.5rem 0.65rem;
+    width: 100%;
+  }
+
+  .source-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.3rem;
+  }
+
+  .copy-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #52525b;
+    font-size: 0.8rem;
+    padding: 0 0.1rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .copy-btn:hover { color: #a1a1aa; }
+
+  .source-card-name {
+    color: #a1a1aa;
+    font-size: 0.73rem;
+    font-weight: 500;
+  }
+
+  .source-card-text {
+    color: #71717a;
+    font-size: 0.7rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
   }
 
   .meta {
@@ -1003,6 +1134,27 @@
   :global(.ref-tag) {
     color: #60a5fa;
     font-size: 0.8em;
+  }
+
+  :global(.cite-link) {
+    color: #60a5fa;
+    text-decoration: none;
+    font-size: 0.78em;
+    font-weight: 600;
+    vertical-align: super;
+    line-height: 0;
+    transition: color 0.15s ease;
+  }
+
+  :global(.cite-link:hover) {
+    color: #93bbfd;
+    text-decoration: underline;
+  }
+
+  :global(.cite-num) {
+    color: #a1a1aa;
+    font-size: 0.78em;
+    font-weight: 600;
   }
 
   :global(.table-cards) {
