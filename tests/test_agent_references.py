@@ -60,6 +60,7 @@ class AgentReferenceTests(unittest.TestCase):
         self.assertIn("[1]", answer)
         self.assertIn("[2]", answer)
         self.assertEqual([ref["id"] for ref in refs], ["std13.pdf:c12", "std20.pdf:c2"])
+        self.assertEqual([ref["display_number"] for ref in refs], [1, 2])
         self.assertEqual(refs[0]["url"], "https://example.com/std13.pdf#page=5")
         self.assertEqual(refs[1]["url"], "https://example.com/std20.pdf")
         self.assertEqual(source_url_map["企業会計基準第13号"], "https://example.com/std13.pdf#page=5")
@@ -81,6 +82,7 @@ class AgentReferenceTests(unittest.TestCase):
         self.assertEqual(answer.count("[2]"), 0)
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0]["id"], "std13.pdf:c12")
+        self.assertEqual(refs[0]["display_number"], 1)
         self.assertEqual(refs[0]["url"], "https://example.com/std13.pdf#page=5")
 
     def test_finalize_answer_prefers_child_reference_when_parent_and_child_are_both_cited(self):
@@ -95,6 +97,7 @@ class AgentReferenceTests(unittest.TestCase):
         self.assertEqual(answer, "使用権資産を計上します[1]。")
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0]["id"], "std13.pdf:c12")
+        self.assertEqual(refs[0]["display_number"], 1)
         self.assertEqual(refs[0]["url"], "https://example.com/std13.pdf#page=5")
 
     def test_finalize_answer_shows_only_cited_references_when_other_chunks_were_read(self):

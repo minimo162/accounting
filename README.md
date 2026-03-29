@@ -243,17 +243,25 @@ uv run python scripts/eval_answers.py \
 - `max_loops`: 許容 loop 数の上限
 - `max_latency_sec`: 応答時間の上限
 - `max_retrieved_tokens`: retrieval で読んだ token 数の上限
+- `max_uncited_lines`: 見出し以外で引用番号が付いていない行の許容数。通常は `0`
+- `allowed_stop_reasons`: 許容する停止理由。`max_loops` で終わった回答を quality gate で落としたいときに使います
+- `require_inline_citations`: `[1]` 形式の本文引用を必須にするか。既定は `true`
+- `require_reference_alignment`: 本文の最大引用番号と `references` 件数の一致を必須にするか。既定は `true`
+- `require_reference_urls`: 参照カードに URL があることを必須にするか。既定は `true`
 
 運用メモ:
 
 - しきい値は「理想値」ではなく、まず現行ベースラインを継続監視できる値に合わせています
 - retrieval を改善して baseline が下がったら、`eval/answer_eval_set.jsonl` の `max_loops` と `max_retrieved_tokens` を一緒に引き締めます
+- baseline を更新するときは、少なくとも 2 回連続で full eval を回し、pass rate 100%、`max_uncited_lines=0` 維持、参照整合エラー 0 件を確認してから閾値を下げてください
+- `answer_eval` は本文品質だけでなく、無引用文、参照番号不整合、参照 URL 欠落も落とします。`/api/ask` は評価用に `references` と `source_url_map` も返します
 
 GitHub Actions:
 
 - `.github/workflows/answer-eval.yml` は `workflow_dispatch` と週次 schedule で実行します
 - repository variable `ACCOUNTING_QA_API_URL` を設定すると、デプロイ済み API に対して `scripts/eval_answers.py` を走らせ、Markdown レポートを artifact に保存します
 - workflow 側はまず計測レポートの蓄積を優先し、常時失敗にはしません。quality gate にしたい場合は手元や別 workflow で `--fail-on-fail` を付けます
+- レポートでは `Avg uncited lines`、`Reference alignment failures`、`Missing reference URL failures` を確認してください。これらが 0 でない場合は、pass rate だけ見てデプロイ判断しない方が安全です
 
 ## トラブルシュート
 

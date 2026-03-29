@@ -4,6 +4,7 @@
     source: string;
     text: string;
     url?: string;
+    display_number?: number;
   }
 
   interface Message {
@@ -48,6 +49,10 @@
 
   function getChunkUrl(ref: Reference): string {
     return ref.url ?? '';
+  }
+
+  function getDisplayNumber(ref: Reference, idx: number): number {
+    return ref.display_number ?? idx + 1;
   }
 
   let copiedRefId: string | null = $state(null);
@@ -279,6 +284,11 @@
     url?: string;
     source: string;
     text: string;
+    display_number?: number;
+  }
+
+  function getReferenceByNumber(refs: MarkdownReference[], displayNumber: number): MarkdownReference | undefined {
+    return refs.find((ref) => ref.display_number === displayNumber) ?? refs[displayNumber - 1];
   }
 
   function formatMarkdown(text: string, refs: MarkdownReference[] = []): string {
@@ -432,7 +442,7 @@
       .replace(/`(.*?)`/g, '<code>$1</code>')
       .replace(/【(.*?)】/g, '<span class="ref-tag">$1</span>')
       .replace(/\[(\d+)\]/g, (match, num) => {
-        const ref = refs[Number(num) - 1];
+        const ref = getReferenceByNumber(refs, Number(num));
         if (!ref?.url) return match;
         const safeUrl = escapeAttribute(ref.url);
         return `<a class="ref-link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">[${num}]<span class="ref-link-icon">&#x2197;</span></a>`;
@@ -552,19 +562,28 @@
         </div>
       {:else}
         <div class="message assistant">
-          <div class="bubble assistant-bubble">
-            {@html formatMarkdown(msg.content, msg.metadata?.references ?? [])}
+          <div class="bubble assistant-bubble" data-testid="assistant-message">
+            <div data-testid="answer-content">
+              {@html formatMarkdown(msg.content, msg.metadata?.references ?? [])}
+            </div>
 
             {#if msg.metadata?.references?.length}
-              <div class="sources-section">
+              <div class="sources-section" data-testid="references-section">
                 <div class="sources-label">参照 ({getDisplayedReferenceCount(msg)}件)</div>
                 <div class="sources-list">
                   {#each msg.metadata.references as ref, idx}
-                    <div class="source-card">
+                    <div class="source-card" data-testid="reference-card" data-reference-number={getDisplayNumber(ref, idx)}>
                       <div class="source-card-header">
-                        <span class="source-ref-number">[{idx + 1}]</span>
+                        <span class="source-ref-number">[{getDisplayNumber(ref, idx)}]</span>
                         {#if ref.url}
-                          <a class="source-chip-link" href={getChunkUrl(ref)} target="_blank" rel="noopener noreferrer">
+                          <a
+                            class="source-chip-link"
+                            data-testid="reference-link"
+                            data-reference-number={getDisplayNumber(ref, idx)}
+                            href={getChunkUrl(ref)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
                             {ref.source.split('>')[0].trim()}<span class="ref-link-icon">&#x2197;</span>
                           </a>
                         {:else}
@@ -598,12 +617,13 @@
     <div class="input-area">
       <textarea
         bind:value={input}
+        data-testid="question-input"
         onkeydown={handleKeydown}
         placeholder="会計基準について質問してください..."
         rows="1"
         disabled={loading}
       ></textarea>
-      <button class="send-btn" onclick={sendMessage} disabled={loading || !input.trim()}>
+      <button class="send-btn" data-testid="send-button" onclick={sendMessage} disabled={loading || !input.trim()}>
         {#if loading}
           <span class="spinner"></span>
         {:else}

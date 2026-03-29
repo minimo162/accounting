@@ -177,6 +177,8 @@ async def ask_question(req: QuestionRequest):
     result = await agent.arun(req.question, history=req.history)
     return {
         "answer": result["answer"],
+        "references": result.get("references", []),
+        "source_url_map": result.get("source_url_map", {}),
         "metadata": {
             "loops": result["loops"],
             "chunks_read_count": result.get("cited_reference_count", 0),

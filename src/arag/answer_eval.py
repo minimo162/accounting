@@ -10,14 +10,21 @@ from typing import Any
 
 _SPACE_RE = re.compile(r"\s+")
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+_HEADING_RE = re.compile(r"^#{1,6}\s+")
+_LIST_PREFIX_RE = re.compile(r"^(?:[-*+]\s+|\d+\.\s+)")
+_BOLD_ONLY_RE = re.compile(r"^\*\*[^*]+\*\*$")
 
 
 def normalize_answer_text(text: str) -> str:
     return _SPACE_RE.sub(" ", text.strip()).lower()
 
 
+def extract_visible_citation_numbers(answer: str) -> set[int]:
+    return {int(match) for match in _CITATION_RE.findall(answer)}
+
+
 def count_visible_citations(answer: str, metadata: dict[str, Any] | None = None) -> int:
-    numbered = {int(match) for match in _CITATION_RE.findall(answer)}
+    numbered = extract_visible_citation_numbers(answer)
     if numbered:
         return len(numbered)
     if metadata:
@@ -27,6 +34,58 @@ def count_visible_citations(answer: str, metadata: dict[str, Any] | None = None)
         except (TypeError, ValueError):
             return 0
     return 0
+
+
+def find_uncited_lines(answer: str) -> list[str]:
+    uncited: list[str] = []
+    in_code_block = False
+
+    for raw_line in answer.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        if _HEADING_RE.match(stripped):
+            continue
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            continue
+        if _CITATION_RE.search(stripped):
+            continue
+
+        candidate = _LIST_PREFIX_RE.sub("", stripped)
+        if _BOLD_ONLY_RE.fullmatch(candidate):
+            continue
+
+        candidate = re.sub(r"[>*_`~]", "", candidate).strip()
+        if not candidate:
+            continue
+        uncited.append(stripped)
+
+    return uncited
+
+
+def evaluate_reference_alignment(answer: str, references: list[dict[str, Any]]) -> tuple[bool, int]:
+    numbered = extract_visible_citation_numbers(answer)
+    if not numbered:
+        return len(references) == 0, 0
+
+    max_citation_number = max(numbered)
+    expected = set(range(1, max_citation_number + 1))
+    return numbered == expected and len(references) == max_citation_number, max_citation_number
+
+
+def find_missing_reference_urls(references: list[dict[str, Any]]) -> list[str]:
+    missing: list[str] = []
+    for ref in references:
+        if ref.get("url"):
+            continue
+        label = str(ref.get("source") or ref.get("id") or "unknown")
+        missing.append(label)
+    return missing
 
 
 @dataclass(frozen=True)
@@ -40,6 +99,11 @@ class AnswerEvalCase:
     max_loops: int | None = None
     max_latency_sec: float | None = None
     max_retrieved_tokens: int | None = None
+    max_uncited_lines: int = 0
+    require_inline_citations: bool = True
+    require_reference_alignment: bool = True
+    require_reference_urls: bool = True
+    allowed_stop_reasons: list[str] = field(default_factory=list)
     notes: str = ""
 
     @classmethod
@@ -56,6 +120,11 @@ class AnswerEvalCase:
             max_retrieved_tokens=(
                 int(payload["max_retrieved_tokens"]) if payload.get("max_retrieved_tokens") is not None else None
             ),
+            max_uncited_lines=int(payload.get("max_uncited_lines", 0)),
+            require_inline_citations=bool(payload.get("require_inline_citations", True)),
+            require_reference_alignment=bool(payload.get("require_reference_alignment", True)),
+            require_reference_urls=bool(payload.get("require_reference_urls", True)),
+            allowed_stop_reasons=[str(item) for item in payload.get("allowed_stop_reasons", [])],
             notes=str(payload.get("notes", "")),
         )
 
@@ -73,9 +142,16 @@ class AnswerEvalResult:
     read_chunk_count: int
     retrieved_tokens: int
     citation_count: int
+    inline_citation_count: int
+    reference_count: int
+    max_citation_number: int
+    uncited_line_count: int
+    reference_alignment_ok: bool
     missing_all: list[str] = field(default_factory=list)
     missing_any: list[str] = field(default_factory=list)
     excluded_hits: list[str] = field(default_factory=list)
+    uncited_lines: list[str] = field(default_factory=list)
+    missing_reference_urls: list[str] = field(default_factory=list)
     failure_reasons: list[str] = field(default_factory=list)
     stop_reason: str = ""
     answer_preview: str = ""
@@ -111,7 +187,14 @@ def evaluate_answer_case(
     loops = int(metadata.get("loops") or 0)
     read_chunk_count = int(metadata.get("read_chunk_count") or 0)
     retrieved_tokens = int(metadata.get("total_retrieved_tokens") or 0)
+    references_raw = metadata.get("references") or []
+    references = [ref for ref in references_raw if isinstance(ref, dict)]
+    inline_citation_numbers = extract_visible_citation_numbers(answer)
     citation_count = count_visible_citations(answer, metadata)
+    inline_citation_count = len(inline_citation_numbers)
+    reference_alignment_ok, max_citation_number = evaluate_reference_alignment(answer, references)
+    missing_reference_urls = find_missing_reference_urls(references)
+    uncited_lines = find_uncited_lines(answer)
     stop_reason = str(metadata.get("stop_reason") or "")
 
     failure_reasons: list[str] = []
@@ -123,12 +206,24 @@ def evaluate_answer_case(
         failure_reasons.append(f"must_exclude={excluded_hits}")
     if citation_count < case.min_citations:
         failure_reasons.append(f"citations<{case.min_citations} ({citation_count})")
+    if case.require_inline_citations and not inline_citation_numbers:
+        failure_reasons.append("missing_inline_citations")
     if case.max_loops is not None and loops > case.max_loops:
         failure_reasons.append(f"loops>{case.max_loops} ({loops})")
     if case.max_latency_sec is not None and elapsed_sec > case.max_latency_sec:
         failure_reasons.append(f"latency>{case.max_latency_sec:.1f}s ({elapsed_sec:.1f}s)")
     if case.max_retrieved_tokens is not None and retrieved_tokens > case.max_retrieved_tokens:
         failure_reasons.append(f"retrieved_tokens>{case.max_retrieved_tokens} ({retrieved_tokens})")
+    if len(uncited_lines) > case.max_uncited_lines:
+        failure_reasons.append(f"uncited_lines>{case.max_uncited_lines} ({len(uncited_lines)})")
+    if case.require_reference_alignment and not reference_alignment_ok:
+        failure_reasons.append(
+            f"reference_alignment_mismatch (inline={sorted(inline_citation_numbers)}, references={len(references)})"
+        )
+    if case.require_reference_urls and missing_reference_urls:
+        failure_reasons.append(f"missing_reference_urls={missing_reference_urls}")
+    if case.allowed_stop_reasons and stop_reason not in case.allowed_stop_reasons:
+        failure_reasons.append(f"stop_reason_not_allowed={stop_reason or '-'}")
 
     return AnswerEvalResult(
         case_id=case.case_id,
@@ -139,9 +234,16 @@ def evaluate_answer_case(
         read_chunk_count=read_chunk_count,
         retrieved_tokens=retrieved_tokens,
         citation_count=citation_count,
+        inline_citation_count=inline_citation_count,
+        reference_count=len(references),
+        max_citation_number=max_citation_number,
+        uncited_line_count=len(uncited_lines),
+        reference_alignment_ok=reference_alignment_ok,
         missing_all=missing_all,
         missing_any=missing_any,
         excluded_hits=excluded_hits,
+        uncited_lines=uncited_lines,
+        missing_reference_urls=missing_reference_urls,
         failure_reasons=failure_reasons,
         stop_reason=stop_reason,
         answer_preview=answer[:500],
@@ -162,6 +264,9 @@ def summarize_answer_eval(results: list[AnswerEvalResult]) -> dict[str, Any]:
             "avg_read_chunk_count": 0.0,
             "avg_retrieved_tokens": 0.0,
             "avg_citations": 0.0,
+            "avg_uncited_lines": 0.0,
+            "reference_alignment_failures": 0,
+            "missing_reference_url_failures": 0,
         }
 
     latencies = sorted(result.elapsed_sec for result in results)
@@ -178,6 +283,9 @@ def summarize_answer_eval(results: list[AnswerEvalResult]) -> dict[str, Any]:
         "avg_read_chunk_count": sum(result.read_chunk_count for result in results) / len(results),
         "avg_retrieved_tokens": sum(result.retrieved_tokens for result in results) / len(results),
         "avg_citations": sum(result.citation_count for result in results) / len(results),
+        "avg_uncited_lines": sum(result.uncited_line_count for result in results) / len(results),
+        "reference_alignment_failures": sum(1 for result in results if not result.reference_alignment_ok),
+        "missing_reference_url_failures": sum(1 for result in results if result.missing_reference_urls),
     }
 
 
@@ -194,6 +302,9 @@ def render_answer_eval_markdown(summary: dict[str, Any], results: list[AnswerEva
         f"- Avg loops: {summary['avg_loops']:.1f}",
         f"- Avg read_chunk calls: {summary['avg_read_chunk_count']:.1f}",
         f"- Avg retrieved tokens: {summary['avg_retrieved_tokens']:.0f}",
+        f"- Avg uncited lines: {summary['avg_uncited_lines']:.1f}",
+        f"- Reference alignment failures: {summary['reference_alignment_failures']}",
+        f"- Missing reference URL failures: {summary['missing_reference_url_failures']}",
         "",
         "## Cases",
     ]
@@ -209,11 +320,20 @@ def render_answer_eval_markdown(summary: dict[str, Any], results: list[AnswerEva
                 f"- read_chunk calls: {result.read_chunk_count}",
                 f"- Retrieved tokens: {result.retrieved_tokens}",
                 f"- Citations: {result.citation_count}",
+                f"- Inline citations: {result.inline_citation_count}",
+                f"- References: {result.reference_count}",
+                f"- Max citation number: {result.max_citation_number}",
+                f"- Uncited lines: {result.uncited_line_count}",
+                f"- Reference alignment: {'ok' if result.reference_alignment_ok else 'mismatch'}",
                 f"- Stop reason: {result.stop_reason or '-'}",
             ]
         )
         if result.failure_reasons:
             lines.append(f"- Failures: {', '.join(result.failure_reasons)}")
+            if result.uncited_lines:
+                lines.append(f"- Uncited lines detail: {' | '.join(result.uncited_lines[:5])}")
+            if result.missing_reference_urls:
+                lines.append(f"- Missing reference URLs: {', '.join(result.missing_reference_urls)}")
             if result.answer_preview:
                 lines.append(f"- Answer preview: {result.answer_preview}")
         if result.notes:

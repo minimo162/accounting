@@ -53,6 +53,8 @@ async def run_local_question(question: str) -> tuple[str, dict[str, Any]]:
         "total_cost": result.get("total_cost", 0.0),
         "total_retrieved_tokens": result.get("total_retrieved_tokens", 0),
         "cited_reference_count": result.get("cited_reference_count", 0),
+        "references": result.get("references", []),
+        "source_url_map": result.get("source_url_map", {}),
     }
     return result.get("answer", ""), metadata
 
@@ -69,7 +71,10 @@ def run_api_question(question: str, api_url: str, timeout: float) -> tuple[str, 
         response = client.post(api_url, json={"question": question, "history": []})
         response.raise_for_status()
         payload = response.json()
-    return payload.get("answer", ""), payload.get("metadata", {})
+    metadata = dict(payload.get("metadata", {}))
+    metadata["references"] = payload.get("references", metadata.get("references", []))
+    metadata["source_url_map"] = payload.get("source_url_map", metadata.get("source_url_map", {}))
+    return payload.get("answer", ""), metadata
 
 
 def select_cases(all_cases, selected_ids: set[str], limit: int | None):

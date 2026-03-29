@@ -809,6 +809,7 @@ class Agent:
                     key = f"第{m.group(1).replace(' ', '')}号"
                     if key not in source_url_map:
                         source_url_map[key] = ref["url"]
+            ref["display_number"] = len(refs) + 1
             refs.append(ref)
         return refs, source_url_map
 

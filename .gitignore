@@ -17,6 +17,8 @@ data/chunks_new.json
 frontend/node_modules/
 frontend/build/
 frontend/.svelte-kit/
+frontend/playwright-report/
+frontend/test-results/
 
 # IDE
 .vscode/
@@ -51,7 +53,6 @@ node_modules/
 *.sw?
 # OS specific
 
-# Task files
 .taskmaster/
 
 # Local generated data
@@ -59,3 +60,7 @@ data/egov_cache/
 data/full_texts.json
 eng.traineddata
 eval/reports/
+
+# Task files
+# tasks.json
+# tasks/ 

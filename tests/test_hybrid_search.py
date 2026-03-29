@@ -52,6 +52,13 @@ class FakeQueryExpander:
     def is_exact_query(self, query: str) -> bool:
         return self.exact
 
+    def exact_keyword_terms(self, query: str) -> list[str]:
+        if self.exact:
+            from src.arag.query_rewrite import QueryExpander
+
+            return QueryExpander.exact_keyword_terms(query)
+        return [query]
+
     def profile(self, query: str) -> QueryProfile:
         if self._profile is not None:
             return self._profile
@@ -108,6 +115,20 @@ class HybridSearchTests(unittest.TestCase):
 
         self.assertEqual(profile.complexity, "simple")
         self.assertEqual(profile.search_mode, "keyword_first")
+
+    def test_query_profile_treats_formal_title_as_exact_query(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        profile = QueryExpander.profile("固定資産の減損に係る会計基準では減損の兆候をどう判断しますか")
+
+        self.assertEqual(profile.search_mode, "keyword_first")
+
+    def test_exact_keyword_terms_split_standard_and_article(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        terms = QueryExpander.exact_keyword_terms("企業会計基準第13号 第10項では借手のリースをどのように扱いますか")
+
+        self.assertEqual(terms, ["企業会計基準第13号", "第10項"])
 
     def test_query_expansion_adds_hedge_accounting_focus_terms(self):
         from src.arag.query_rewrite import QueryExpander
@@ -174,7 +195,7 @@ class HybridSearchTests(unittest.TestCase):
         semantic = FakeSemanticTool({})
         keyword = FakeKeywordTool(
             {
-                ("企業会計基準第13号 第10項",): [
+                ("企業会計基準第13号", "第10項"): [
                     make_result("doc-a:p1", 0.95),
                     make_result("doc-b:p1", 0.85),
                 ]
@@ -192,11 +213,54 @@ class HybridSearchTests(unittest.TestCase):
         results, expansions, hyde_doc = tool.search("企業会計基準第13号 第10項", top_k=2)
 
         self.assertEqual([query for query, _ in semantic.calls], [])
-        self.assertEqual([keywords for keywords, _ in keyword.calls], [("企業会計基準第13号 第10項",)])
+        self.assertEqual([keywords for keywords, _ in keyword.calls], [("企業会計基準第13号", "第10項")])
         self.assertEqual(reranker.calls, [])
         self.assertEqual(len(results), 2)
         self.assertEqual(expansions, ["企業会計基準第13号 第10項"])
         self.assertIsNone(hyde_doc)
+
+    def test_exact_constraint_filter_keeps_only_matching_standard_and_article(self):
+        exact_match = SearchResult(
+            chunk_id="std13:p10",
+            parent_id="std13:p10",
+            score=0.8,
+            source="企業会計基準第13号 > 第10項",
+            snippet="第10項 使用権資産を計上する。",
+            text="第10項 使用権資産を計上する。",
+            metadata={"doc_type": "企業会計基準", "standard_no": "企業会計基準第13号", "section_title": "第10項"},
+        )
+        wrong_standard = SearchResult(
+            chunk_id="std20:p10",
+            parent_id="std20:p10",
+            score=1.2,
+            source="実務対応報告第20号 > 第10項",
+            snippet="第10項 注記を記載する。",
+            text="第10項 注記を記載する。",
+            metadata={"doc_type": "実務対応報告", "standard_no": "実務対応報告第20号", "section_title": "第10項"},
+        )
+        wrong_section = SearchResult(
+            chunk_id="std13:p11",
+            parent_id="std13:p11",
+            score=1.1,
+            source="企業会計基準第13号 > 第11項",
+            snippet="第11項 別の取扱い。",
+            text="第11項 別の取扱い。",
+            metadata={"doc_type": "企業会計基準", "standard_no": "企業会計基準第13号", "section_title": "第11項"},
+        )
+        tool = HybridSearchTool(
+            semantic_tool=FakeSemanticTool({}),
+            keyword_tool=FakeKeywordTool({}),
+            query_expander=FakeQueryExpander(["企業会計基準第13号 第10項"], exact=True),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        filtered = tool._filter_exact_mismatch_results(
+            "企業会計基準第13号 第10項では借手のリースをどのように扱いますか",
+            [wrong_standard, wrong_section, exact_match],
+        )
+
+        self.assertEqual([item.parent_id for item in filtered], ["std13:p10"])
 
     def test_execute_reuses_cached_results_for_same_query(self):
         semantic = FakeSemanticTool({"リース 会計": [make_result("doc-a:p1", 0.9)]})

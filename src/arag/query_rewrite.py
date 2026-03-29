@@ -32,6 +32,21 @@ class QueryProfile:
 
 
 class QueryExpander:
+    _EXACT_TITLE_PATTERNS = (
+        r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に関する会計基準(?:の適用指針)?)",
+        r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+取引に関する会計基準)",
+        r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に係る会計基準)",
+        r"([一-龥ぁ-んァ-ヶーA-Za-z0-9]+に関する実務指針)",
+    )
+    _EXACT_REFERENCE_PATTERNS = (
+        r"(企業会計基準第\s*\d+\s*号)",
+        r"(企業会計基準適用指針第\s*\d+\s*号)",
+        r"(適用指針第\s*\d+\s*号)",
+        r"(実務対応報告第\s*\d+\s*号)",
+        r"(会計基準第\s*\d+\s*号)",
+        r"(第\s*\d+\s*(?:項|条|号))",
+        r"(BC\s*\d+(?:\s*[-‑–]\s*\d+)?)",
+    )
     _COMPLEX_TERMS = (
         "改正", "変更", "見直し", "背景", "目的", "経過措置", "適用時期",
         "比較", "違い", "それぞれ", "併せて", "また", "及び", "ならびに",
@@ -147,9 +162,41 @@ class QueryExpander:
 
     @staticmethod
     def is_exact_query(query: str) -> bool:
-        return bool(
-            re.search(r"(企業会計基準第\d+号|適用指針第\d+号|実務対応報告第\d+号|会計基準第\d+号|第\d+項|BC\d+)", query)
-        )
+        return bool(QueryExpander.extract_exact_terms(query))
+
+    @classmethod
+    def extract_exact_terms(cls, query: str) -> list[str]:
+        terms: list[str] = []
+
+        def add(term: str):
+            normalized = re.sub(r"\s+", "", term.strip())
+            if normalized and normalized not in terms:
+                terms.append(normalized)
+
+        for pattern in cls._EXACT_REFERENCE_PATTERNS:
+            for match in re.findall(pattern, query):
+                add(match)
+        for pattern in cls._EXACT_TITLE_PATTERNS:
+            for match in re.findall(pattern, query):
+                add(match)
+        filtered: list[str] = []
+        for term in terms:
+            if any(term != other and term in other for other in terms):
+                continue
+            filtered.append(term)
+        return filtered
+
+    @classmethod
+    def exact_keyword_terms(cls, query: str) -> list[str]:
+        terms = cls.extract_exact_terms(query)
+        if terms:
+            return terms
+        canonical_title = cls._canonical_title_focus_variant(query)
+        if canonical_title:
+            title_terms = cls.extract_exact_terms(canonical_title)
+            if title_terms:
+                return title_terms
+        return [query.strip()]
 
     def expand(self, query: str) -> list[str]:
         variants = [query]

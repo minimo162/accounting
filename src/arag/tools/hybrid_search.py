@@ -146,7 +146,8 @@ class HybridSearchTool(BaseTool):
 
         if is_exact_query or profile.search_mode == "keyword_first":
             primary_keyword_query = profile.canonical_focus_query or query
-            primary_keyword = self.keyword_tool.search([primary_keyword_query], keyword_limit)
+            exact_keyword_terms = self.query_expander.exact_keyword_terms(primary_keyword_query) if is_exact_query else [primary_keyword_query]
+            primary_keyword = self.keyword_tool.search(exact_keyword_terms, keyword_limit)
             if primary_keyword:
                 keyword_rankings.append(primary_keyword)
             if not primary_keyword or (profile.complexity == "complex" and not is_exact_query):
@@ -162,7 +163,7 @@ class HybridSearchTool(BaseTool):
         reranked = self._rank_results(query, semantic_rankings, keyword_rankings)
         confidence = self._estimate_confidence(query, reranked)
         corrective_query = None
-        if self._should_run_corrective_search(profile, reranked, confidence):
+        if self._should_run_corrective_search(profile, reranked, confidence, is_exact_query):
             corrective_query = profile.corrective_query
             if corrective_query and corrective_query != query:
                 corrective_keyword = self.keyword_tool.search([corrective_query], keyword_limit)
@@ -175,6 +176,7 @@ class HybridSearchTool(BaseTool):
 
         if self._should_rerank(query, reranked, top_k):
             reranked = self.reranker.rerank(query, reranked)
+        reranked = self._filter_exact_mismatch_results(query, reranked)
         reranked = self._filter_change_delta_results(query, reranked)
         reranked = self._filter_low_value_parent_results(reranked)
         final = reranked[:top_k]
@@ -203,6 +205,7 @@ class HybridSearchTool(BaseTool):
     def _rank_results(self, query: str, semantic_rankings: list[list], keyword_rankings: list[list]) -> list:
         fused = reciprocal_rank_fusion(semantic_rankings + keyword_rankings, rrf_k=self.config.rrf_k)
         fused = self._apply_exact_match_boosts(query, fused)
+        fused = self._apply_exact_constraint_boosts(query, fused)
         fused = self._apply_change_intent_boosts(query, fused)
         fused = self._apply_topic_alignment_boosts(query, fused)
         fused = self._apply_focus_term_boosts(query, fused)
@@ -246,7 +249,9 @@ class HybridSearchTool(BaseTool):
         return min(confidence, 1.0)
 
     @staticmethod
-    def _should_run_corrective_search(profile: QueryProfile, results: list, confidence: float) -> bool:
+    def _should_run_corrective_search(profile: QueryProfile, results: list, confidence: float, is_exact_query: bool) -> bool:
+        if is_exact_query:
+            return False
         if not results:
             return bool(profile.corrective_query)
         if not profile.corrective_query:
@@ -261,20 +266,104 @@ class HybridSearchTool(BaseTool):
 
     @staticmethod
     def _extract_exact_terms(query: str) -> list[str]:
-        patterns = [
-            r"企業会計基準第\d+号",
-            r"適用指針第\d+号",
-            r"実務対応報告第\d+号",
-            r"会計基準第\d+号",
-            r"第\d+項",
-            r"BC\d+",
+        return QueryExpander.extract_exact_terms(query)
+
+    @staticmethod
+    def _normalize_exact_text(text: str) -> str:
+        return re.sub(r"[\s　]+", "", text or "")
+
+    @classmethod
+    def _split_exact_constraints(cls, query: str) -> tuple[list[str], list[str]]:
+        doc_terms: list[str] = []
+        section_terms: list[str] = []
+        for term in cls._extract_exact_terms(query):
+            if re.search(r"(第\d+(?:項|条)$|^BC\d+)", term):
+                section_terms.append(term)
+            else:
+                doc_terms.append(term)
+        return doc_terms, section_terms
+
+    def _exact_match_counts(self, query: str, item) -> tuple[int, int]:
+        doc_terms, section_terms = self._split_exact_constraints(query)
+        meta = item.metadata or {}
+        file_name = str(meta.get("file", ""))
+        aliases = self.semantic_tool._corpus.get_document_aliases(file_name) if file_name else set()
+
+        doc_haystacks = [
+            self._normalize_exact_text(item.source),
+            self._normalize_exact_text(str(meta.get("source", ""))),
+            self._normalize_exact_text(str(meta.get("doc_title", ""))),
+            self._normalize_exact_text(str(meta.get("standard_no", ""))),
+            *(self._normalize_exact_text(alias) for alias in aliases),
         ]
-        terms: list[str] = []
-        for pattern in patterns:
-            for match in re.findall(pattern, query):
-                if match not in terms:
-                    terms.append(match)
-        return terms
+        section_haystacks = [
+            self._normalize_exact_text(item.source),
+            self._normalize_exact_text(str(meta.get("section_title", ""))),
+            self._normalize_exact_text(item.snippet[:260]),
+            self._normalize_exact_text(item.text[:1200]),
+        ]
+
+        doc_hits = sum(
+            1 for term in doc_terms if any(self._normalize_exact_text(term) in haystack for haystack in doc_haystacks)
+        )
+        section_hits = sum(
+            1 for term in section_terms if any(self._normalize_exact_text(term) in haystack for haystack in section_haystacks)
+        )
+        return doc_hits, section_hits
+
+    def _apply_exact_constraint_boosts(self, query: str, results: list) -> list:
+        doc_terms, section_terms = self._split_exact_constraints(query)
+        if not doc_terms and not section_terms:
+            return results
+
+        boosted = []
+        for item in results:
+            doc_hits, section_hits = self._exact_match_counts(query, item)
+            bonus = doc_hits * 0.8 + section_hits * 0.55
+            if doc_terms and doc_hits == 0:
+                bonus -= 1.1
+            elif doc_terms and doc_hits < len(doc_terms):
+                bonus -= 0.35
+            if section_terms and section_hits == 0:
+                bonus -= 0.75
+            elif section_terms and section_hits < len(section_terms):
+                bonus -= 0.25
+            boosted.append(
+                item.__class__(
+                    chunk_id=item.chunk_id,
+                    parent_id=item.parent_id,
+                    score=item.score + bonus,
+                    source=item.source,
+                    snippet=item.snippet,
+                    text=item.text,
+                    metadata=item.metadata,
+                )
+            )
+
+        boosted.sort(key=lambda item: item.score, reverse=True)
+        return boosted
+
+    def _filter_exact_mismatch_results(self, query: str, results: list) -> list:
+        doc_terms, section_terms = self._split_exact_constraints(query)
+        if not doc_terms and not section_terms:
+            return results
+
+        fully_matching = []
+        doc_matching = []
+        for item in results:
+            doc_hits, section_hits = self._exact_match_counts(query, item)
+            doc_ok = not doc_terms or doc_hits == len(doc_terms)
+            section_ok = not section_terms or section_hits == len(section_terms)
+            if doc_ok:
+                doc_matching.append(item)
+            if doc_ok and section_ok:
+                fully_matching.append(item)
+
+        if fully_matching:
+            return fully_matching
+        if doc_matching:
+            return doc_matching
+        return results
 
     def _apply_exact_match_boosts(self, query: str, results: list) -> list:
         exact_terms = self._extract_exact_terms(query)
@@ -286,15 +375,16 @@ class HybridSearchTool(BaseTool):
             source = item.source or ""
             metadata = item.metadata or {}
             haystacks = [
-                source,
-                str(metadata.get("source", "")),
-                str(metadata.get("doc_title", "")),
-                str(metadata.get("section_title", "")),
-                str(metadata.get("standard_no", "")),
+                self._normalize_exact_text(source),
+                self._normalize_exact_text(str(metadata.get("source", ""))),
+                self._normalize_exact_text(str(metadata.get("doc_title", ""))),
+                self._normalize_exact_text(str(metadata.get("section_title", ""))),
+                self._normalize_exact_text(str(metadata.get("standard_no", ""))),
             ]
             bonus = 0.0
             for term in exact_terms:
-                if any(term in haystack for haystack in haystacks):
+                normalized_term = self._normalize_exact_text(term)
+                if any(normalized_term in haystack for haystack in haystacks):
                     bonus += 0.6
             boosted.append(
                 item.__class__(
