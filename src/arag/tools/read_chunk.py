@@ -87,7 +87,7 @@ class ReadChunkTool(BaseTool):
             compressed_any = compressed_any or compressed
 
             context.mark_chunk_read(parent_id, chunk_tokens)
-            context.set_evidence_note(parent_id, excerpt)
+            context.set_evidence_note(parent_id, excerpt, source=source)
             new_count += 1
 
             # Show adjacent chunk info for context expansion

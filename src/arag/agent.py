@@ -60,7 +60,122 @@ class Agent:
         if not recent:
             return False
         best_confidence = max(float(entry.get("confidence", 0.0)) for entry in recent)
-        return best_confidence >= 0.7 and len(context.evidence_notes) >= 4
+        coverage = context.get_evidence_coverage()
+        covered_slots = len(coverage.get("covered_slots", []))
+        return best_confidence >= 0.7 and (
+            len(context.evidence_notes) >= 4 or covered_slots >= max(2, len(coverage.get("slots", [])) - 1)
+        )
+
+    @staticmethod
+    def _best_search_confidence(context: AgentContext) -> float:
+        if not context.search_history:
+            return 0.0
+        recent = context.search_history[-3:]
+        return max(float(entry.get("confidence", 0.0)) for entry in recent)
+
+    def _evidence_requirements(self, context: AgentContext) -> dict[str, float | int]:
+        coverage = context.get_evidence_coverage()
+        slot_count = len(coverage["slots"])
+        complexity = context.question_complexity
+        keyword_first = str(context.query_profile.get("search_mode", "")) == "keyword_first"
+
+        if complexity == "simple":
+            min_searches = 1
+            min_reads = 1
+            min_notes = 1
+            required_slots = slot_count if slot_count <= 2 else 2
+            min_confidence = 0.45 if keyword_first else 0.55
+        elif complexity == "complex":
+            min_searches = 2
+            min_reads = 2 if slot_count <= 3 else 3
+            min_notes = 2 if slot_count <= 3 else 3
+            if slot_count == 0:
+                required_slots = 0
+            else:
+                required_slots = max(2, (slot_count * 3 + 3) // 4)
+            min_confidence = 0.6
+        else:
+            min_searches = 2
+            min_reads = 2
+            min_notes = 2
+            if slot_count <= 3:
+                required_slots = slot_count
+            else:
+                required_slots = max(2, (slot_count * 2 + 2) // 3)
+            min_confidence = 0.55
+
+        return {
+            "min_searches": min_searches,
+            "min_reads": min_reads,
+            "min_notes": min_notes,
+            "required_slots": required_slots,
+            "min_confidence": min_confidence,
+        }
+
+    def _has_sufficient_evidence(self, context: AgentContext) -> bool:
+        requirements = self._evidence_requirements(context)
+        search_count = self._count_search_calls(context)
+        read_count = self._count_tool_calls(context, "read_chunk")
+        coverage = context.get_evidence_coverage()
+        covered_slots = len(coverage["covered_slots"])
+        keyword_first = str(context.query_profile.get("search_mode", "")) == "keyword_first"
+
+        if search_count < int(requirements["min_searches"]):
+            return False
+        if read_count < int(requirements["min_reads"]):
+            return False
+        if len(context.evidence_notes) < int(requirements["min_notes"]):
+            return False
+
+        required_slots = int(requirements["required_slots"])
+        if required_slots > 0 and covered_slots < required_slots:
+            return False
+
+        if keyword_first and required_slots > 0:
+            return True
+
+        return self._best_search_confidence(context) >= float(requirements["min_confidence"])
+
+    def _build_coverage_gap_message(self, context: AgentContext) -> dict[str, str] | None:
+        coverage = context.get_evidence_coverage()
+        uncovered_slots = coverage["uncovered_slots"]
+        if not uncovered_slots:
+            return None
+
+        search_count = self._count_search_calls(context)
+        read_count = self._count_tool_calls(context, "read_chunk")
+        if search_count < 2 or read_count < 2:
+            return None
+
+        signature = "|".join(uncovered_slots)
+        if context.coverage_gap_nudge_signature == signature:
+            return None
+        context.coverage_gap_nudge_signature = signature
+        slot_text = "、".join(uncovered_slots[:4])
+        content = (
+            "【システム通知】まだ根拠メモが足りない論点があります: "
+            f"{slot_text}。追加検索する場合は、この未充足論点だけをクエリにしてください。"
+            "既に候補文書は見えているのに該当論点の evidence note が取れていない場合に限り、"
+            "read_document でその文書全体を確認してください。"
+        )
+        return {"role": "user", "content": content}
+
+    def _force_stop_reason(self, context: AgentContext) -> str | None:
+        if self._has_sufficient_evidence(context):
+            return "evidence_sufficient"
+        if self.force_final_after_searches <= 0 or self.force_final_after_reads <= 0:
+            return None
+        search_count = self._count_search_calls(context)
+        read_count = self._count_tool_calls(context, "read_chunk")
+        complexity = context.question_complexity
+        search_budget = self._adaptive_budget(self.force_final_after_searches, complexity)
+        read_budget = self._adaptive_budget(self.force_final_after_reads, complexity)
+        if self._has_high_confidence_evidence(context):
+            search_budget = max(2, search_budget - 1)
+            read_budget = max(2, read_budget - 1)
+        if search_count >= search_budget and read_count >= read_budget:
+            return "retrieval_budget"
+        return None
 
     def _should_nudge_wrap_up(self, context: AgentContext) -> bool:
         if context.wrap_up_nudged or self.wrap_up_after_searches <= 0:
@@ -73,20 +188,13 @@ class Agent:
         return search_count >= search_budget and read_count >= read_budget
 
     def _should_force_wrap_up(self, context: AgentContext) -> bool:
-        if self.force_final_after_searches <= 0 or self.force_final_after_reads <= 0:
-            return False
-        search_count = self._count_search_calls(context)
-        read_count = self._count_tool_calls(context, "read_chunk")
-        complexity = context.question_complexity
-        search_budget = self._adaptive_budget(self.force_final_after_searches, complexity)
-        read_budget = self._adaptive_budget(self.force_final_after_reads, complexity)
-        if self._has_high_confidence_evidence(context):
-            search_budget = max(2, search_budget - 1)
-            read_budget = max(2, read_budget - 1)
-        return search_count >= search_budget and read_count >= read_budget
+        return self._force_stop_reason(context) is not None
 
     def _maybe_nudge(self, messages: list[dict], loop_idx: int, context: AgentContext):
         """Inject a wrap-up hint if we've been searching too long."""
+        coverage_hint = self._build_coverage_gap_message(context)
+        if coverage_hint is not None:
+            messages.append(coverage_hint)
         if context.wrap_up_nudged:
             return
         if loop_idx == self.nudge_at_loop or self._should_nudge_wrap_up(context):
@@ -130,11 +238,12 @@ class Agent:
 
             self._maybe_nudge(messages, loop_idx, context)
 
-            if self._should_force_wrap_up(context):
+            stop_reason = self._force_stop_reason(context)
+            if stop_reason is not None:
                 answer, cost = self._force_final_answer(messages, context)
                 total_cost += cost
                 return self._build_result(
-                    answer, context, loop_idx + 1, "retrieval_budget", total_cost
+                    answer, context, loop_idx + 1, stop_reason, total_cost
                 )
 
             # Token budget check
@@ -204,11 +313,12 @@ class Agent:
         for loop_idx in range(self.max_loops):
             self._maybe_nudge(messages, loop_idx, context)
 
-            if self._should_force_wrap_up(context):
+            stop_reason = self._force_stop_reason(context)
+            if stop_reason is not None:
                 answer, cost = await self._aforce_final_answer(messages, context)
                 total_cost += cost
                 return self._build_result(
-                    answer, context, loop_idx + 1, "retrieval_budget", total_cost
+                    answer, context, loop_idx + 1, stop_reason, total_cost
                 )
 
             # Token budget check
@@ -277,9 +387,10 @@ class Agent:
 
             self._maybe_nudge(messages, loop_idx, context)
 
-            if self._should_force_wrap_up(context):
+            stop_reason = self._force_stop_reason(context)
+            if stop_reason is not None:
                 yield {"type": "status", "data": "回答を生成中..."}
-                async for event in self._astream_final_answer(messages, context, loop_idx + 1, "retrieval_budget", total_cost):
+                async for event in self._astream_final_answer(messages, context, loop_idx + 1, stop_reason, total_cost):
                     yield event
                 return
 
@@ -412,6 +523,7 @@ class Agent:
         max_notes, per_note_chars, total_chars = self._note_limits(context.question_complexity)
         used_chars = 0
         sections: list[str] = []
+        coverage = context.get_evidence_coverage()
 
         for chunk_id in self._ordered_evidence_note_ids(context):
             note = context.evidence_notes.get(chunk_id, "").strip()
@@ -441,6 +553,16 @@ class Agent:
             "追加検索は行わず、このメモを優先して最終回答を作成してください。\n"
             "長文質問では、このメモに含まれる具体的な変更点・例外・経過措置を落とさずに整理してください。\n"
             "各記述の末尾には、見出し行に書かれた chunk ID をそのまま付けてください。\n\n"
+        )
+        if coverage["covered_slots"]:
+            content += "## 充足済み論点\n" + "、".join(coverage["covered_slots"]) + "\n\n"
+        if coverage["uncovered_slots"]:
+            content += (
+                "## 未充足論点\n"
+                + "、".join(coverage["uncovered_slots"])
+                + "。この論点は十分な根拠メモがないため、断定せず不足として扱ってください。\n\n"
+            )
+        content += (
             "## 重要箇所メモ\n"
             + "\n\n".join(sections)
         )
