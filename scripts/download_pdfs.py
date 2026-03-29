@@ -1,48 +1,143 @@
-"""Download accounting standard PDFs from ASBJ using browser-use."""
+"""Synchronize known PDF sources into data/pdfs with manifest tracking."""
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import os
-import re
-import sys
+import hashlib
 from pathlib import Path
 
-from browser_use import Agent as BrowserAgent
-from langchain_openai import ChatOpenAI
+import httpx
+
+try:
+    from .source_manifest import load_url_lookup, manifest_path, sha256_file, upsert_source_record
+except ImportError:
+    from source_manifest import load_url_lookup, manifest_path, sha256_file, upsert_source_record
 
 
-async def download_pdfs(output_dir: str):
-    """Use browser-use to navigate ASBJ and download PDFs."""
+def _pdf_entries(source_map: dict[str, str]) -> list[tuple[str, str]]:
+    entries = [
+        (name, url)
+        for name, url in source_map.items()
+        if name.lower().endswith(".pdf")
+    ]
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+async def sync_pdfs(
+    output_dir: str = "data/pdfs",
+    *,
+    pdf_sources_path: str = "data/pdf_sources.json",
+    refresh_existing: bool = True,
+    limit: int | None = None,
+) -> dict[str, int]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    data_dir = output_path.parent
+    sources = load_url_lookup(Path(pdf_sources_path))
+    entries = _pdf_entries(sources)
+    if limit is not None:
+        entries = entries[:limit]
 
-    # Use DeepSeek's OpenAI-compatible API for the browser agent
-    llm = ChatOpenAI(
-        model=os.getenv("LLM_MODEL", "deepseek-chat"),
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+    summary = {
+        "checked": 0,
+        "downloaded": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+    manifest_file = manifest_path(data_dir)
+
+    async with httpx.AsyncClient(
+        timeout=180,
+        verify=False,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; AccountingBot/1.0)"},
+    ) as client:
+        for filename, url in entries:
+            summary["checked"] += 1
+            destination = output_path / filename
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[{summary['checked']}/{len(entries)}] {filename}")
+
+            if destination.exists() and not refresh_existing:
+                upsert_source_record(
+                    manifest_file,
+                    file_path=destination,
+                    data_dir=data_dir,
+                    url=url,
+                    source_group="pdfs",
+                    kind="pdf",
+                )
+                summary["skipped"] += 1
+                print("  Skip (existing, refresh disabled)")
+                continue
+
+            try:
+                response = await client.get(url, follow_redirects=True)
+                response.raise_for_status()
+                payload = response.content
+            except Exception as exc:
+                summary["failed"] += 1
+                print(f"  Failed: {exc}")
+                continue
+
+            existing_hash = sha256_file(destination) if destination.exists() else ""
+            new_hash = hashlib.sha256(payload).hexdigest()
+            if existing_hash == new_hash:
+                summary["unchanged"] += 1
+                print("  Unchanged")
+            else:
+                destination.write_bytes(payload)
+                if existing_hash:
+                    summary["updated"] += 1
+                    print(f"  Updated ({len(payload) // 1024} KB)")
+                else:
+                    summary["downloaded"] += 1
+                    print(f"  Downloaded ({len(payload) // 1024} KB)")
+
+            upsert_source_record(
+                manifest_file,
+                file_path=destination,
+                data_dir=data_dir,
+                url=url,
+                source_group="pdfs",
+                kind="pdf",
+            )
+
+    print(
+        "Summary:"
+        f" checked={summary['checked']}"
+        f" downloaded={summary['downloaded']}"
+        f" updated={summary['updated']}"
+        f" unchanged={summary['unchanged']}"
+        f" skipped={summary['skipped']}"
+        f" failed={summary['failed']}"
     )
+    return summary
 
-    task = """
-    https://www.asb-j.jp/jp/accounting_standards/ にアクセスして、
-    以下の会計基準文書のPDFリンクを全て収集してください：
 
-    1. 企業会計基準（全て）
-    2. 企業会計基準適用指針（全て）
-    3. 実務対応報告（全て）
-
-    各PDFのURLとタイトルをリストとして出力してください。
-    フォーマット: タイトル | URL
-    """
-
-    agent = BrowserAgent(task=task, llm=llm)
-    result = await agent.run()
-
-    # Parse result and save PDF URLs
-    print("Browser agent result:")
-    print(result)
-    return result
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output_dir", nargs="?", default="data/pdfs")
+    parser.add_argument("--pdf-sources", default="data/pdf_sources.json")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Do not refresh existing files; only download missing PDFs.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    output_dir = sys.argv[1] if len(sys.argv) > 1 else "data/pdfs"
-    asyncio.run(download_pdfs(output_dir))
+    args = _parse_args()
+    asyncio.run(
+        sync_pdfs(
+            args.output_dir,
+            pdf_sources_path=args.pdf_sources,
+            refresh_existing=not args.skip_existing,
+            limit=args.limit,
+        )
+    )

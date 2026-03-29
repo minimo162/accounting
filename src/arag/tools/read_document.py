@@ -10,7 +10,22 @@ from typing import Any
 from .base import BaseTool
 from ..context import AgentContext
 
-_MAX_CHARS = 40_000  # 1回に返す最大文字数（約10,000トークン相当）
+_DEFAULT_MAX_CHARS = 40_000  # 旧来の全文読取上限
+
+
+def _max_chars_for_context(context: AgentContext) -> int:
+    complexity = context.question_complexity or "moderate"
+    if complexity == "complex":
+        max_chars = 24_000
+    elif complexity == "simple":
+        max_chars = 16_000
+    else:
+        max_chars = 20_000
+
+    if len(context.read_chunk_ids) >= 2:
+        max_chars = int(max_chars * 0.75)
+
+    return max(8_000, min(max_chars, _DEFAULT_MAX_CHARS))
 
 
 def _build_doc_index(chunks: list[dict]) -> dict[str, dict]:
@@ -125,15 +140,16 @@ class ReadDocumentTool(BaseTool):
 
         # 文書内容を返す
         parts = []
+        max_chars = _max_chars_for_context(context)
         for filename, doc in matches:
             source = doc.get("source", filename)
             text = doc.get("text", "")
             total = len(text)
-            chunk = text[offset: offset + _MAX_CHARS]
+            chunk = text[offset: offset + max_chars]
             end = offset + len(chunk)
 
             header = f"=== {source} ({filename}) | 全{total:,}文字 ==="
-            if total > _MAX_CHARS or offset > 0:
+            if total > max_chars or offset > 0:
                 header += f"\n[読取範囲: {offset:,}〜{end:,}文字目]"
             if end < total:
                 header += (
@@ -147,6 +163,6 @@ class ReadDocumentTool(BaseTool):
         context.add_retrieval_log(
             tool_name="read_document",
             tokens=len(result) // 4,
-            metadata={"name": name, "matched": [fn for fn, _ in matches], "offset": offset},
+            metadata={"name": name, "matched": [fn for fn, _ in matches], "offset": offset, "max_chars": max_chars},
         )
-        return result, {"matched": [fn for fn, _ in matches], "offset": offset}
+        return result, {"matched": [fn for fn, _ in matches], "offset": offset, "max_chars": max_chars}

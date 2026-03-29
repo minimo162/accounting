@@ -1,5 +1,6 @@
 """ReAct-style agent loop for A-RAG with full context tracking."""
 
+from collections import Counter
 import json
 import logging
 import re
@@ -8,7 +9,8 @@ from typing import Any, AsyncGenerator
 from .config import Config
 from .context import AgentContext
 from .llm import LLMClient
-from .prompt import SYSTEM_PROMPT
+from .observability import get_monitor_case_id, get_request_id, question_sha1, structured_log
+from .prompt import FINAL_COVERAGE_RULES, SYSTEM_PROMPT
 from .query_rewrite import QueryExpander
 from .tools.registry import ToolRegistry
 
@@ -25,6 +27,12 @@ WRAP_UP_HINT = (
 class Agent:
     NUDGE_AT_LOOP = 8  # After this many loops, hint the LLM to wrap up
     SEARCH_TOOL_NAMES = {"hybrid_search", "keyword_search", "semantic_search"}
+    _SEARCH_STAGNATION_MIN_OVERLAP = 0.6
+    _DETAIL_NOTE_MARKERS = (
+        "場合", "とき", "要件", "条件", "例外", "ただし", "なお", "一方",
+        "また", "比較", "違い", "区分", "判断", "経過措置", "適用時期",
+        "別個", "見積り", "制約", "総額", "純額",
+    )
 
     def __init__(self, config: Config, tools: ToolRegistry, chunk_map: dict[str, dict] | None = None, pdf_sources: dict[str, str] | None = None):
         self.config = config
@@ -45,6 +53,101 @@ class Agent:
 
     def _count_search_calls(self, context: AgentContext) -> int:
         return sum(1 for log in context.retrieval_logs if log.tool_name in self.SEARCH_TOOL_NAMES)
+
+    @staticmethod
+    def _query_class(context: AgentContext) -> str:
+        if QueryExpander.is_exact_query(context.question):
+            return "exact"
+        return context.question_complexity or "unknown"
+
+    @staticmethod
+    def _tool_call_counts(context: AgentContext) -> dict[str, int]:
+        return dict(Counter(entry["tool_name"] for entry in context.trajectory))
+
+    def _build_exploration_signature(self, context: AgentContext) -> str:
+        segments: list[str] = []
+        for idx, entry in enumerate(context.search_history[:4], start=1):
+            query = str(entry.get("query", "")).strip()
+            query = re.sub(r"\s+", " ", query)
+            if len(query) > 36:
+                query = query[:33].rstrip() + "..."
+            segments.append(f"{idx}:{query or '-'}")
+        if not segments:
+            return "no_search"
+        return " | ".join(segments)
+
+    def _build_observability_summary(
+        self,
+        context: AgentContext,
+        loops: int,
+        stop_reason: str,
+        answer: str,
+        references: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        tool_call_counts = self._tool_call_counts(context)
+        search_queries = [str(entry.get("query", "")).strip() for entry in context.search_history if str(entry.get("query", "")).strip()]
+        confidences = [float(entry.get("confidence", 0.0)) for entry in context.search_history]
+        corrective_queries = [
+            str(entry.get("corrective_query", "")).strip()
+            for entry in context.search_history
+            if str(entry.get("corrective_query", "")).strip()
+        ]
+        coverage = context.get_evidence_coverage()
+        cited_reference_count = self._count_cited_references(answer)
+
+        return {
+            "request_id": get_request_id() or None,
+            "monitor_case_id": get_monitor_case_id() or None,
+            "query_class": self._query_class(context),
+            "query_complexity": context.question_complexity,
+            "search_mode": str(context.query_profile.get("search_mode", "")) or None,
+            "question_length": len(context.question),
+            "question_sha1": question_sha1(context.question) if context.question else None,
+            "loops": loops,
+            "stop_reason": stop_reason,
+            "tool_call_count": len(context.trajectory),
+            "tool_call_counts": tool_call_counts,
+            "search_count": self._count_search_calls(context),
+            "read_chunk_count": len(context.read_chunk_ids),
+            "read_document_count": tool_call_counts.get("read_document", 0),
+            "retrieved_tokens": context.total_retrieved_tokens,
+            "reference_count": len(references),
+            "cited_reference_count": cited_reference_count,
+            "zero_reference": cited_reference_count == 0,
+            "coverage_ratio": coverage["coverage_ratio"],
+            "covered_slot_count": len(coverage["covered_slots"]),
+            "uncovered_slot_count": len(coverage["uncovered_slots"]),
+            "search_queries": search_queries,
+            "search_query_count": len(search_queries),
+            "search_query_unique_count": len(set(search_queries)),
+            "search_confidence_max": max(confidences) if confidences else 0.0,
+            "search_confidence_min": min(confidences) if confidences else 0.0,
+            "corrective_query_count": len(corrective_queries),
+            "exploration_signature": self._build_exploration_signature(context),
+        }
+
+    def _log_completion(self, observability: dict[str, Any]) -> None:
+        structured_log(logger, logging.INFO, "agent_run_complete", **observability)
+
+    def _log_error(self, context: AgentContext, exc: Exception) -> None:
+        structured_log(
+            logger,
+            logging.ERROR,
+            "agent_run_error",
+            request_id=get_request_id() or None,
+            monitor_case_id=get_monitor_case_id() or None,
+            query_class=self._query_class(context) if context.question else None,
+            question_length=len(context.question or ""),
+            question_sha1=question_sha1(context.question) if context.question else None,
+            search_mode=str(context.query_profile.get("search_mode", "")) or None,
+            tool_call_count=len(context.trajectory),
+            search_count=self._count_search_calls(context),
+            read_chunk_count=len(context.read_chunk_ids),
+            retrieved_tokens=context.total_retrieved_tokens,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            exploration_signature=self._build_exploration_signature(context),
+        )
 
     @staticmethod
     def _adaptive_budget(base: int, complexity: str) -> int:
@@ -73,6 +176,39 @@ class Agent:
         recent = context.search_history[-3:]
         return max(float(entry.get("confidence", 0.0)) for entry in recent)
 
+    @classmethod
+    def _search_results_are_stagnating(cls, context: AgentContext) -> bool:
+        recent_entries = [entry for entry in context.search_history[-3:] if entry.get("chunk_ids")]
+        if len(recent_entries) < 2:
+            return False
+
+        overlaps: list[float] = []
+        for prev, curr in zip(recent_entries, recent_entries[1:]):
+            prev_ids = set(str(chunk_id) for chunk_id in prev.get("chunk_ids", [])[:5] if str(chunk_id))
+            curr_ids = set(str(chunk_id) for chunk_id in curr.get("chunk_ids", [])[:5] if str(chunk_id))
+            if not prev_ids or not curr_ids:
+                return False
+            overlap = len(prev_ids & curr_ids) / min(len(prev_ids), len(curr_ids))
+            overlaps.append(overlap)
+
+        if not overlaps or min(overlaps) < cls._SEARCH_STAGNATION_MIN_OVERLAP:
+            return False
+
+        normalized_queries: list[str] = []
+        for entry in recent_entries:
+            query = (
+                str(entry.get("effective_query", "")).strip()
+                or str(entry.get("corrective_query", "")).strip()
+                or str(entry.get("query", "")).strip()
+            )
+            if not query:
+                continue
+            normalized = re.sub(r"[\s　、。・/／()（）「」『』【】\[\]{}:：?？!！]+", " ", query)
+            tokens = [token for token in normalized.split() if len(token) >= 2]
+            normalized_queries.append(" ".join(tokens[:5]))
+
+        return len(set(normalized_queries)) <= max(1, len(normalized_queries) - 1)
+
     def _evidence_requirements(self, context: AgentContext) -> dict[str, float | int]:
         coverage = context.get_evidence_coverage()
         slot_count = len(coverage["slots"])
@@ -86,23 +222,23 @@ class Agent:
             required_slots = slot_count if slot_count <= 2 else 2
             min_confidence = 0.45 if keyword_first else 0.55
         elif complexity == "complex":
-            min_searches = 2
-            min_reads = 2 if slot_count <= 3 else 3
-            min_notes = 2 if slot_count <= 3 else 3
+            min_searches = 1 if keyword_first and slot_count <= 4 else 2
+            min_reads = 2 if slot_count <= 4 else 3
+            min_notes = 2 if slot_count <= 4 else 3
             if slot_count == 0:
                 required_slots = 0
             else:
                 required_slots = max(2, (slot_count * 3 + 3) // 4)
-            min_confidence = 0.6
+            min_confidence = 0.55 if keyword_first else 0.6
         else:
-            min_searches = 2
+            min_searches = 1 if keyword_first else 2
             min_reads = 2
             min_notes = 2
             if slot_count <= 3:
                 required_slots = slot_count
             else:
                 required_slots = max(2, (slot_count * 2 + 2) // 3)
-            min_confidence = 0.55
+            min_confidence = 0.5 if keyword_first else 0.55
 
         return {
             "min_searches": min_searches,
@@ -118,23 +254,72 @@ class Agent:
         read_count = self._count_tool_calls(context, "read_chunk")
         coverage = context.get_evidence_coverage()
         covered_slots = len(coverage["covered_slots"])
+        slot_count = len(coverage["slots"])
+        uncovered_slot_count = max(slot_count - covered_slots, 0)
         keyword_first = str(context.query_profile.get("search_mode", "")) == "keyword_first"
+        complexity = context.question_complexity
+        best_confidence = self._best_search_confidence(context)
+        required_slots = int(requirements["required_slots"])
+        allow_keyword_first_example_shortfall = (
+            keyword_first
+            and complexity == "moderate"
+            and slot_count >= 3
+            and uncovered_slot_count <= 1
+            and covered_slots >= max(2, required_slots - 1)
+            and search_count >= int(requirements["min_searches"])
+            and read_count >= int(requirements["min_reads"])
+            and len(context.evidence_notes) >= int(requirements["min_notes"])
+            and best_confidence >= 0.4
+        )
+        allow_one_slot_shortfall = (
+            complexity == "complex"
+            and required_slots > 0
+            and covered_slots >= required_slots
+            and uncovered_slot_count <= 1
+            and search_count >= 2
+            and len(context.evidence_notes) >= int(requirements["min_notes"])
+            and best_confidence >= 0.45
+        )
 
         if search_count < int(requirements["min_searches"]):
             return False
-        if read_count < int(requirements["min_reads"]):
+        min_reads = int(requirements["min_reads"])
+        if allow_one_slot_shortfall:
+            min_reads = max(2, min_reads - 1)
+        if read_count < min_reads:
             return False
         if len(context.evidence_notes) < int(requirements["min_notes"]):
             return False
 
-        required_slots = int(requirements["required_slots"])
-        if required_slots > 0 and covered_slots < required_slots:
+        if (
+            required_slots > 0
+            and covered_slots < required_slots
+            and not allow_keyword_first_example_shortfall
+        ):
             return False
+
+        if slot_count > 0 and covered_slots >= slot_count:
+            return True
 
         if keyword_first and required_slots > 0:
             return True
 
-        return self._best_search_confidence(context) >= float(requirements["min_confidence"])
+        if best_confidence >= float(requirements["min_confidence"]):
+            return True
+
+        if allow_one_slot_shortfall:
+            return True
+
+        if self._search_results_are_stagnating(context):
+            required_stagnation_slots = max(required_slots, slot_count - 1) if slot_count > 0 else required_slots
+            required_note_surplus = 1 if complexity == "complex" else 0
+            if (
+                covered_slots >= required_stagnation_slots
+                and len(context.evidence_notes) >= int(requirements["min_notes"]) + required_note_surplus
+            ):
+                return True
+
+        return False
 
     def _build_coverage_gap_message(self, context: AgentContext) -> dict[str, str] | None:
         coverage = context.get_evidence_coverage()
@@ -157,6 +342,80 @@ class Agent:
             f"{slot_text}。追加検索する場合は、この未充足論点だけをクエリにしてください。"
             "既に候補文書は見えているのに該当論点の evidence note が取れていない場合に限り、"
             "read_document でその文書全体を確認してください。"
+        )
+        return {"role": "user", "content": content}
+
+    def _coverage_focus_query(self, context: AgentContext) -> str:
+        exact_terms = QueryExpander.extract_exact_terms(context.question)
+        if exact_terms:
+            return " ".join(exact_terms[:2])
+        for key in ("canonical_focus_query", "corrective_query"):
+            value = str(context.query_profile.get(key, "")).strip()
+            if value:
+                return value
+        keywords = [str(keyword).strip() for keyword in context.query_profile.get("keywords", []) if str(keyword).strip()]
+        if keywords:
+            return " ".join(keywords[:4])
+        return context.question.strip()
+
+    def _coverage_plan_items(self, context: AgentContext) -> list[dict[str, Any]]:
+        if not context.evidence_slots:
+            return []
+
+        ordered_note_ids = self._ordered_evidence_note_ids(context)
+        fallback_ids = ordered_note_ids[:2] or context.searched_chunk_ids[:2]
+        focus_query = self._coverage_focus_query(context)
+        items: list[dict[str, Any]] = []
+
+        for slot in context.evidence_slots:
+            aliases = tuple(
+                term for term in context.evidence_slot_terms.get(slot, (slot,)) if str(term).strip()
+            ) or (slot,)
+            supporting_ids = [
+                chunk_id for chunk_id in ordered_note_ids if chunk_id in context.evidence_slot_hits.get(slot, set())
+            ]
+            items.append({
+                "label": slot,
+                "aliases": aliases,
+                "supporting_ids": supporting_ids,
+                "covered": bool(supporting_ids),
+                "fallback_ids": fallback_ids,
+                "search_query": " ".join(part for part in (focus_query, slot) if part).strip(),
+            })
+        return items
+
+    def _build_coverage_review_message(self, context: AgentContext, stop_reason: str | None) -> dict[str, str] | None:
+        if stop_reason is None or context.final_coverage_review_done:
+            return None
+
+        coverage = context.get_evidence_coverage()
+        if not coverage["uncovered_slots"]:
+            return None
+
+        search_count = self._count_search_calls(context)
+        read_count = self._count_tool_calls(context, "read_chunk")
+        if search_count < 1 or read_count < 1:
+            return None
+
+        plan_lines = []
+        for item in self._coverage_plan_items(context):
+            status = "根拠あり" if item["covered"] else "根拠不足"
+            refs = "、".join(item["supporting_ids"][:2]) if item["supporting_ids"] else "-"
+            line = f"- {item['label']}: {status} / 確認済み chunk: {refs}"
+            if not item["covered"] and item["search_query"]:
+                line += f" / 追加検索候補: {item['search_query']}"
+            plan_lines.append(line)
+
+        content = (
+            "【システム通知】最終回答の直前です。論点カバレッジを 1 回だけ再点検してください。\n"
+            "未充足論点が残る場合は、次のどちらかだけを選んでください。\n"
+            "- その未充足論点だけを対象に 1 回だけ追加検索し、必要なら read_chunk または read_document を続ける\n"
+            "- これ以上根拠が増えないと判断したら、最終回答でその論点を「今回確認できた根拠では不十分」と明示する\n"
+            "既に根拠がある論点は再検索しないでください。\n\n"
+            "## 論点カバレッジ\n"
+            + "\n".join(plan_lines)
+            + "\n\n"
+            + FINAL_COVERAGE_RULES.strip()
         )
         return {"role": "user", "content": content}
 
@@ -220,6 +479,9 @@ class Agent:
         messages.append({"role": "user", "content": question})
         return messages
 
+    def _tool_schemas(self, context: AgentContext) -> list[dict[str, Any]]:
+        return self.tools.get_schemas(context)
+
     def _seed_context(self, context: AgentContext, question: str):
         profile = QueryExpander.profile(question)
         context.set_question(question, profile.to_dict())
@@ -227,147 +489,181 @@ class Agent:
     def run(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Synchronous run: returns final answer with metadata."""
         context = AgentContext()
-        self._seed_context(context, question)
-        messages = self._build_initial_messages(question, history)
-        tool_schemas = self.tools.get_schemas()
-        total_cost = 0.0
+        try:
+            self._seed_context(context, question)
+            messages = self._build_initial_messages(question, history)
+            total_cost = 0.0
 
-        for loop_idx in range(self.max_loops):
-            if self.verbose:
-                logger.info(f"Loop {loop_idx + 1}/{self.max_loops}")
-
-            self._maybe_nudge(messages, loop_idx, context)
-
-            stop_reason = self._force_stop_reason(context)
-            if stop_reason is not None:
-                answer, cost = self._force_final_answer(messages, context)
-                total_cost += cost
-                return self._build_result(
-                    answer, context, loop_idx + 1, stop_reason, total_cost
-                )
-
-            # Token budget check
-            current_tokens = self.llm.count_message_tokens(messages)
-            if current_tokens > self.max_token_budget:
-                logger.info(f"Token budget exceeded: {current_tokens} > {self.max_token_budget}")
-                answer, cost = self._force_final_answer(messages, context)
-                total_cost += cost
-                return self._build_result(
-                    answer, context, loop_idx + 1, "budget_exceeded", total_cost
-                )
-
-            response = self.llm.chat(messages=messages, tools=tool_schemas)
-            message = response["message"]
-            total_cost += response.get("cost", 0.0)
-            messages.append(message)
-
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                return self._build_result(
-                    message.get("content", ""), context, loop_idx + 1, "natural", total_cost
-                )
-
-            # Execute tool calls
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                try:
-                    func_args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
-                    func_args = {}
-                    logger.warning(f"Failed to parse tool arguments: {tc['function']['arguments']}")
-
+            for loop_idx in range(self.max_loops):
                 if self.verbose:
-                    logger.info(f"  Tool: {func_name}({func_args})")
+                    logger.info(f"Loop {loop_idx + 1}/{self.max_loops}")
 
-                result_text, tool_log = self.tools.execute(func_name, context, **func_args)
+                self._maybe_nudge(messages, loop_idx, context)
 
-                # Trajectory logging
-                context.add_trajectory_entry(
-                    loop=loop_idx + 1,
-                    tool_name=func_name,
-                    arguments=func_args,
-                    tool_result=result_text,
-                    tool_log=tool_log,
-                )
+                stop_reason = self._force_stop_reason(context)
+                coverage_review = self._build_coverage_review_message(context, stop_reason)
+                if coverage_review is not None:
+                    messages.append(coverage_review)
+                    context.final_coverage_review_done = True
+                    stop_reason = None
+                if stop_reason is not None:
+                    answer, cost = self._force_final_answer(messages, context)
+                    total_cost += cost
+                    result = self._build_result(answer, context, loop_idx + 1, stop_reason, total_cost)
+                    self._log_completion(result["observability"])
+                    return result
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_text,
-                    "_func_name": func_name,
-                })
+                # Token budget check
+                current_tokens = self.llm.count_message_tokens(messages)
+                if current_tokens > self.max_token_budget:
+                    logger.info(f"Token budget exceeded: {current_tokens} > {self.max_token_budget}")
+                    answer, cost = self._force_final_answer(messages, context)
+                    total_cost += cost
+                    result = self._build_result(answer, context, loop_idx + 1, "budget_exceeded", total_cost)
+                    self._log_completion(result["observability"])
+                    return result
 
-        # Max loops exceeded
-        answer, cost = self._force_final_answer(messages, context)
-        total_cost += cost
-        return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
+                tool_schemas = self._tool_schemas(context)
+                response = self.llm.chat(messages=messages, tools=tool_schemas)
+                message = response["message"]
+                total_cost += response.get("cost", 0.0)
+                messages.append(message)
+
+                tool_calls = message.get("tool_calls")
+                if not tool_calls:
+                    result = self._build_result(
+                        message.get("content", ""), context, loop_idx + 1, "natural", total_cost
+                    )
+                    if self._should_retry_natural_answer(result, context):
+                        answer, cost = self._force_final_answer(messages, context)
+                        total_cost += cost
+                        result = self._build_result(answer, context, loop_idx + 1, "natural", total_cost)
+                    self._log_completion(result["observability"])
+                    return result
+
+                # Execute tool calls
+                for tc in tool_calls:
+                    func_name = tc["function"]["name"]
+                    try:
+                        func_args = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        func_args = {}
+                        logger.warning(f"Failed to parse tool arguments: {tc['function']['arguments']}")
+
+                    if self.verbose:
+                        logger.info(f"  Tool: {func_name}({func_args})")
+
+                    result_text, tool_log = self.tools.execute(func_name, context, **func_args)
+
+                    # Trajectory logging
+                    context.add_trajectory_entry(
+                        loop=loop_idx + 1,
+                        tool_name=func_name,
+                        arguments=func_args,
+                        tool_result=result_text,
+                        tool_log=tool_log,
+                    )
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_text,
+                        "_func_name": func_name,
+                    })
+
+            # Max loops exceeded
+            answer, cost = self._force_final_answer(messages, context)
+            total_cost += cost
+            result = self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
+            self._log_completion(result["observability"])
+            return result
+        except Exception as exc:
+            self._log_error(context, exc)
+            raise
 
     async def arun(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Async run."""
         context = AgentContext()
-        self._seed_context(context, question)
-        messages = self._build_initial_messages(question, history)
-        tool_schemas = self.tools.get_schemas()
-        total_cost = 0.0
+        try:
+            self._seed_context(context, question)
+            messages = self._build_initial_messages(question, history)
+            total_cost = 0.0
 
-        for loop_idx in range(self.max_loops):
-            self._maybe_nudge(messages, loop_idx, context)
+            for loop_idx in range(self.max_loops):
+                self._maybe_nudge(messages, loop_idx, context)
 
-            stop_reason = self._force_stop_reason(context)
-            if stop_reason is not None:
-                answer, cost = await self._aforce_final_answer(messages, context)
-                total_cost += cost
-                return self._build_result(
-                    answer, context, loop_idx + 1, stop_reason, total_cost
-                )
+                stop_reason = self._force_stop_reason(context)
+                coverage_review = self._build_coverage_review_message(context, stop_reason)
+                if coverage_review is not None:
+                    messages.append(coverage_review)
+                    context.final_coverage_review_done = True
+                    stop_reason = None
+                if stop_reason is not None:
+                    answer, cost = await self._aforce_final_answer(messages, context)
+                    total_cost += cost
+                    result = self._build_result(answer, context, loop_idx + 1, stop_reason, total_cost)
+                    self._log_completion(result["observability"])
+                    return result
 
-            # Token budget check
-            current_tokens = self.llm.count_message_tokens(messages)
-            if current_tokens > self.max_token_budget:
-                answer, cost = await self._aforce_final_answer(messages, context)
-                total_cost += cost
-                return self._build_result(
-                    answer, context, loop_idx + 1, "budget_exceeded", total_cost
-                )
+                # Token budget check
+                current_tokens = self.llm.count_message_tokens(messages)
+                if current_tokens > self.max_token_budget:
+                    answer, cost = await self._aforce_final_answer(messages, context)
+                    total_cost += cost
+                    result = self._build_result(answer, context, loop_idx + 1, "budget_exceeded", total_cost)
+                    self._log_completion(result["observability"])
+                    return result
 
-            response = await self.llm.achat(messages=messages, tools=tool_schemas)
-            message = response["message"]
-            total_cost += response.get("cost", 0.0)
-            messages.append(message)
+                tool_schemas = self._tool_schemas(context)
+                response = await self.llm.achat(messages=messages, tools=tool_schemas)
+                message = response["message"]
+                total_cost += response.get("cost", 0.0)
+                messages.append(message)
 
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                return self._build_result(
-                    message.get("content", ""), context, loop_idx + 1, "natural", total_cost
-                )
+                tool_calls = message.get("tool_calls")
+                if not tool_calls:
+                    result = self._build_result(
+                        message.get("content", ""), context, loop_idx + 1, "natural", total_cost
+                    )
+                    if self._should_retry_natural_answer(result, context):
+                        answer, cost = await self._aforce_final_answer(messages, context)
+                        total_cost += cost
+                        result = self._build_result(answer, context, loop_idx + 1, "natural", total_cost)
+                    self._log_completion(result["observability"])
+                    return result
 
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                try:
-                    func_args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
-                    func_args = {}
+                for tc in tool_calls:
+                    func_name = tc["function"]["name"]
+                    try:
+                        func_args = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        func_args = {}
 
-                result_text, tool_log = self.tools.execute(func_name, context, **func_args)
+                    result_text, tool_log = self.tools.execute(func_name, context, **func_args)
 
-                context.add_trajectory_entry(
-                    loop=loop_idx + 1,
-                    tool_name=func_name,
-                    arguments=func_args,
-                    tool_result=result_text,
-                    tool_log=tool_log,
-                )
+                    context.add_trajectory_entry(
+                        loop=loop_idx + 1,
+                        tool_name=func_name,
+                        arguments=func_args,
+                        tool_result=result_text,
+                        tool_log=tool_log,
+                    )
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_text,
-                    "_func_name": func_name,
-                })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_text,
+                        "_func_name": func_name,
+                    })
 
-        answer, cost = await self._aforce_final_answer(messages, context)
-        total_cost += cost
-        return self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
+            answer, cost = await self._aforce_final_answer(messages, context)
+            total_cost += cost
+            result = self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
+            self._log_completion(result["observability"])
+            return result
+        except Exception as exc:
+            self._log_error(context, exc)
+            raise
 
     async def arun_stream(self, question: str, history: list[dict] | None = None) -> AsyncGenerator[dict, None]:
         """Async streaming run - yields events for SSE.
@@ -376,93 +672,123 @@ class Agent:
         Final answer is streamed token-by-token via answer_delta events.
         """
         context = AgentContext()
-        self._seed_context(context, question)
-        messages = self._build_initial_messages(question, history)
-        tool_schemas = self.tools.get_schemas()
-        total_cost = 0.0
+        try:
+            self._seed_context(context, question)
+            messages = self._build_initial_messages(question, history)
+            total_cost = 0.0
 
-        for loop_idx in range(self.max_loops):
-            status_msg = "調査中..." if loop_idx == 0 else f"調査中... (ステップ {loop_idx + 1})"
-            yield {"type": "status", "data": status_msg}
+            for loop_idx in range(self.max_loops):
+                status_msg = "調査中..." if loop_idx == 0 else f"調査中... (ステップ {loop_idx + 1})"
+                yield {"type": "status", "data": status_msg}
 
-            self._maybe_nudge(messages, loop_idx, context)
+                self._maybe_nudge(messages, loop_idx, context)
 
-            stop_reason = self._force_stop_reason(context)
-            if stop_reason is not None:
-                yield {"type": "status", "data": "回答を生成中..."}
-                async for event in self._astream_final_answer(messages, context, loop_idx + 1, stop_reason, total_cost):
-                    yield event
-                return
+                stop_reason = self._force_stop_reason(context)
+                coverage_review = self._build_coverage_review_message(context, stop_reason)
+                if coverage_review is not None:
+                    messages.append(coverage_review)
+                    context.final_coverage_review_done = True
+                    stop_reason = None
+                if stop_reason is not None:
+                    yield {"type": "status", "data": "回答を生成中..."}
+                    async for event in self._astream_final_answer(messages, context, loop_idx + 1, stop_reason, total_cost):
+                        yield event
+                    return
 
-            # Token budget check
-            current_tokens = self.llm.count_message_tokens(messages)
-            if current_tokens > self.max_token_budget:
-                yield {"type": "status", "data": "回答を生成中..."}
-                async for event in self._astream_final_answer(messages, context, loop_idx + 1, "budget_exceeded", total_cost):
-                    yield event
-                return
+                # Token budget check
+                current_tokens = self.llm.count_message_tokens(messages)
+                if current_tokens > self.max_token_budget:
+                    yield {"type": "status", "data": "回答を生成中..."}
+                    async for event in self._astream_final_answer(messages, context, loop_idx + 1, "budget_exceeded", total_cost):
+                        yield event
+                    return
 
-            response = await self.llm.achat(messages=messages, tools=tool_schemas)
-            message = response["message"]
-            total_cost += response.get("cost", 0.0)
-            messages.append(message)
+                tool_schemas = self._tool_schemas(context)
+                response = await self.llm.achat(messages=messages, tools=tool_schemas)
+                message = response["message"]
+                total_cost += response.get("cost", 0.0)
+                messages.append(message)
 
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                answer, cited_ids = self._sanitize_answer(message.get("content", ""), number_refs=True)
-                yield {"type": "status", "data": "回答を生成中..."}
-                chunk_size = 8
-                for i in range(0, len(answer), chunk_size):
-                    yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
-                yield {"type": "answer_done", "data": answer}
-                refs, source_url_map = self._get_referenced_chunks(context, cited_ids)
-                for ref in refs:
-                    yield {"type": "reference", "data": ref}
-                summary = self._build_answer_summary(answer, context)
-                yield {
-                    "type": "done",
-                    "data": {
-                        "loops": loop_idx + 1,
-                        "stop_reason": "natural",
-                        "source_url_map": source_url_map,
-                        **summary,
-                        "total_cost": total_cost,
-                    },
-                }
-                return
+                tool_calls = message.get("tool_calls")
+                if not tool_calls:
+                    result = self._build_completed_result(
+                        message.get("content", ""),
+                        context,
+                        loop_idx + 1,
+                        "natural",
+                        total_cost,
+                    )
+                    if self._should_retry_natural_answer(result, context):
+                        answer, cost = await self._aforce_final_answer(messages, context)
+                        total_cost += cost
+                        result = self._build_completed_result(
+                            answer,
+                            context,
+                            loop_idx + 1,
+                            "natural",
+                            total_cost,
+                        )
+                    yield {"type": "status", "data": "回答を生成中..."}
+                    chunk_size = 8
+                    for i in range(0, len(result["answer"]), chunk_size):
+                        yield {"type": "answer_delta", "data": result["answer"][i:i + chunk_size]}
+                    yield {"type": "answer_done", "data": result["answer"]}
+                    for ref in result["references"]:
+                        yield {"type": "reference", "data": ref}
+                    self._log_completion(result["observability"])
+                    yield {
+                        "type": "done",
+                        "data": {
+                            "loops": result["loops"],
+                            "stop_reason": result["stop_reason"],
+                            "source_url_map": result["source_url_map"],
+                            "chunks_read_count": result["chunks_read_count"],
+                            "read_chunk_count": result["read_chunk_count"],
+                            "total_cost": result["total_cost"],
+                            "total_retrieved_tokens": result["total_retrieved_tokens"],
+                            "evidence_coverage": result.get("evidence_coverage", {}),
+                            "uncertainty": result.get("uncertainty", {}),
+                            "request_id": result.get("request_id"),
+                            "query_class": result.get("query_class"),
+                        },
+                    }
+                    return
 
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                try:
-                    func_args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
-                    func_args = {}
+                for tc in tool_calls:
+                    func_name = tc["function"]["name"]
+                    try:
+                        func_args = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        func_args = {}
 
-                yield {
-                    "type": "tool_call",
-                    "data": {"tool": func_name, "args": func_args},
-                }
-                result_text, tool_log = self.tools.execute(func_name, context, **func_args)
+                    yield {
+                        "type": "tool_call",
+                        "data": {"tool": func_name, "args": func_args},
+                    }
+                    result_text, tool_log = self.tools.execute(func_name, context, **func_args)
 
-                context.add_trajectory_entry(
-                    loop=loop_idx + 1,
-                    tool_name=func_name,
-                    arguments=func_args,
-                    tool_result=result_text,
-                    tool_log=tool_log,
-                )
+                    context.add_trajectory_entry(
+                        loop=loop_idx + 1,
+                        tool_name=func_name,
+                        arguments=func_args,
+                        tool_result=result_text,
+                        tool_log=tool_log,
+                    )
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_text,
-                    "_func_name": func_name,
-                })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_text,
+                        "_func_name": func_name,
+                    })
 
-        # Max loops - force final answer with streaming
-        yield {"type": "status", "data": "回答を生成中..."}
-        async for event in self._astream_final_answer(messages, context, self.max_loops, "max_loops", total_cost):
-            yield event
+            # Max loops - force final answer with streaming
+            yield {"type": "status", "data": "回答を生成中..."}
+            async for event in self._astream_final_answer(messages, context, self.max_loops, "max_loops", total_cost):
+                yield event
+        except Exception as exc:
+            self._log_error(context, exc)
+            raise
 
     async def _astream_final_answer(
         self,
@@ -474,34 +800,44 @@ class Agent:
     ) -> AsyncGenerator[dict, None]:
         """Force a final answer and simulate streaming output."""
         answer, cost = await self._aforce_final_answer(messages, context)
-        answer, refs, source_url_map = self._finalize_answer(answer, context)
         total_cost += cost
+        result = self._build_completed_result(answer, context, loops, stop_reason, total_cost)
 
         chunk_size = 8
-        for i in range(0, len(answer), chunk_size):
-            yield {"type": "answer_delta", "data": answer[i:i + chunk_size]}
-        yield {"type": "answer_done", "data": answer}
-        for ref in refs:
+        for i in range(0, len(result["answer"]), chunk_size):
+            yield {"type": "answer_delta", "data": result["answer"][i:i + chunk_size]}
+        yield {"type": "answer_done", "data": result["answer"]}
+        for ref in result["references"]:
             yield {"type": "reference", "data": ref}
-        summary = self._build_answer_summary(answer, context)
+        self._log_completion(result["observability"])
         yield {
             "type": "done",
             "data": {
-                "loops": loops,
-                "stop_reason": stop_reason,
-                "source_url_map": source_url_map,
-                **summary,
-                "total_cost": total_cost,
+                "loops": result["loops"],
+                "stop_reason": result["stop_reason"],
+                "source_url_map": result["source_url_map"],
+                "chunks_read_count": result["chunks_read_count"],
+                "read_chunk_count": result["read_chunk_count"],
+                "total_cost": result["total_cost"],
+                "total_retrieved_tokens": result["total_retrieved_tokens"],
+                "evidence_coverage": result.get("evidence_coverage", {}),
+                "uncertainty": result.get("uncertainty", {}),
+                "request_id": result.get("request_id"),
+                "query_class": result.get("query_class"),
             },
         }
 
     @staticmethod
-    def _note_limits(complexity: str) -> tuple[int, int, int]:
+    def _note_limits(complexity: str, *, detail_seeking: bool = False) -> tuple[int, int, int]:
         if complexity == "complex":
-            return 6, 900, 5200
+            return (7, 1200, 6800) if detail_seeking else (6, 900, 5200)
         if complexity == "simple":
             return 4, 500, 2400
-        return 5, 700, 3600
+        return (6, 950, 4700) if detail_seeking else (5, 700, 3600)
+
+    @staticmethod
+    def _is_detail_seeking_context(context: AgentContext) -> bool:
+        return bool(context.query_profile.get("detail_seeking")) or context.question_complexity == "complex"
 
     def _ordered_evidence_note_ids(self, context: AgentContext) -> list[str]:
         ordered_ids: list[str] = []
@@ -516,16 +852,78 @@ class Agent:
                 seen.add(chunk_id)
         return ordered_ids
 
+    def _slot_focused_evidence_sections(
+        self,
+        context: AgentContext,
+        per_note_chars: int,
+        total_chars: int,
+    ) -> list[str]:
+        sections: list[str] = []
+        used_chars = 0
+        used_chunk_ids: set[str] = set()
+
+        for item in self._coverage_plan_items(context):
+            supporting_ids = [str(chunk_id) for chunk_id in item["supporting_ids"]]
+            if not supporting_ids:
+                continue
+            chunk_id = supporting_ids[0]
+            if chunk_id in used_chunk_ids:
+                continue
+            note = context.evidence_notes.get(chunk_id, "").strip()
+            if not note:
+                continue
+            aliases = tuple(str(alias) for alias in item["aliases"])
+            snippet = self._extract_slot_snippet(
+                note,
+                aliases,
+                prefer_detail=self._is_detail_seeking_context(context),
+            ).replace("[抜粋]", "").strip()
+            if not snippet:
+                continue
+            if len(snippet) > per_note_chars:
+                snippet = snippet[:per_note_chars].rstrip() + "..."
+            chunk = self.chunk_map.get(chunk_id, {})
+            source = str(chunk.get("source", "")).strip()
+            header = f"- {item['label']} | {chunk_id}"
+            if source:
+                header = f"{header} | {source}"
+            section = f"{header}\n{snippet}"
+            if sections and used_chars + len(section) > total_chars:
+                break
+            sections.append(section)
+            used_chars += len(section)
+            used_chunk_ids.add(chunk_id)
+
+        return sections
+
     def _build_evidence_note_message(self, context: AgentContext) -> dict[str, str] | None:
         if not context.evidence_notes:
             return None
 
-        max_notes, per_note_chars, total_chars = self._note_limits(context.question_complexity)
+        detail_seeking = self._is_detail_seeking_context(context)
+        max_notes, per_note_chars, total_chars = self._note_limits(
+            context.question_complexity,
+            detail_seeking=detail_seeking,
+        )
         used_chars = 0
-        sections: list[str] = []
+        sections = self._slot_focused_evidence_sections(context, per_note_chars, total_chars)
+        if sections:
+            used_chars = sum(len(section) for section in sections)
+        used_chunk_ids = {
+            match.group(1)
+            for section in sections
+            for match in re.finditer(r"- [^\n|]+\| ([^\s|]+)", section)
+        }
         coverage = context.get_evidence_coverage()
+        allow_fallback_note_dump = not sections or (
+            context.question_complexity == "complex" and len(sections) < 2
+        )
 
         for chunk_id in self._ordered_evidence_note_ids(context):
+            if not allow_fallback_note_dump:
+                break
+            if chunk_id in used_chunk_ids:
+                continue
             note = context.evidence_notes.get(chunk_id, "").strip()
             if not note:
                 continue
@@ -551,7 +949,7 @@ class Agent:
         content = (
             "以下は read_chunk で抽出済みの重要箇所メモです。"
             "追加検索は行わず、このメモを優先して最終回答を作成してください。\n"
-            "長文質問では、このメモに含まれる具体的な変更点・例外・経過措置を落とさずに整理してください。\n"
+            "長文質問や詳説要求では、このメモに含まれる具体的な変更点・要件・条件・例外・経過措置を落とさずに整理してください。\n"
             "各記述の末尾には、見出し行に書かれた chunk ID をそのまま付けてください。\n\n"
         )
         if coverage["covered_slots"]:
@@ -568,6 +966,29 @@ class Agent:
         )
         return {"role": "user", "content": content}
 
+    def _build_coverage_plan_message(self, context: AgentContext) -> dict[str, str] | None:
+        items = self._coverage_plan_items(context)
+        if not items:
+            return None
+
+        lines = []
+        for item in items:
+            status = "根拠あり" if item["covered"] else "根拠不足"
+            refs = "、".join(item["supporting_ids"][:2]) if item["supporting_ids"] else "-"
+            line = f"- {item['label']}: {status} / 根拠 chunk: {refs}"
+            if not item["covered"] and item["search_query"]:
+                line += f" / 追加検索候補: {item['search_query']}"
+            lines.append(line)
+
+        content = (
+            "以下は質問から抽出した想定論点です。最終回答では、この論点順に coverage を点検してください。\n\n"
+            "## 想定論点\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + FINAL_COVERAGE_RULES.strip()
+        )
+        return {"role": "user", "content": content}
+
     def _build_final_answer_messages(self, messages: list[dict], context: AgentContext) -> list[dict]:
         """Force the LLM to produce a final answer without tool calls."""
         force_prompt = (
@@ -577,11 +998,26 @@ class Agent:
             "推測は避け、文書に基づいた回答のみを行ってください。"
             "見出し以外の本文、箇条書き、まとめ文の末尾には必ず参照したチャンクIDを付け、付けられない文は出力しないでください。"
             "既に抽出済みの重要箇所メモがあれば、それを優先して detail を保って回答してください。"
+            "複合質問では、想定論点ごとに少なくとも 1 行は残し、根拠が不足する論点は推測せず不足を明示してください。"
         )
         messages_copy = list(messages)
+        coverage_message = self._build_coverage_plan_message(context)
+        if coverage_message is not None:
+            messages_copy.append(coverage_message)
         note_message = self._build_evidence_note_message(context)
         if note_message is not None:
             messages_copy.append(note_message)
+        if self._is_detail_seeking_context(context):
+            messages_copy.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "【詳細回答ルール】詳しく/違い/どのような場合といった質問です。"
+                        "各論点では、原則だけで終わらせず、確認できた範囲で条件・例外・判断基準・比較観点のうち"
+                        "該当するものを少なくとも 1 つ含めてください。"
+                    ),
+                }
+            )
         messages_copy.append({"role": "user", "content": force_prompt})
         return messages_copy
 
@@ -821,6 +1257,113 @@ class Agent:
             text = text[inline_match.start(1):]
         return text
 
+    @staticmethod
+    def _note_units(note: str) -> list[str]:
+        return [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[。！？])\s+|(?<=。)|(?<=！)|(?<=？)|\n+", note)
+            if sentence.strip() and sentence.strip() != "[抜粋]"
+        ]
+
+    @classmethod
+    def _extract_slot_snippet(
+        cls,
+        note: str,
+        aliases: tuple[str, ...],
+        *,
+        prefer_detail: bool = False,
+    ) -> str:
+        sentences = cls._note_units(note)
+        if not sentences:
+            return note.strip().replace("[抜粋]", "")
+        focus_idx = 0
+        for idx, sentence in enumerate(sentences):
+            if any(alias in sentence for alias in aliases):
+                focus_idx = idx
+                break
+        if not prefer_detail:
+            return sentences[focus_idx]
+
+        selected_indexes: list[int] = [focus_idx]
+        for idx in (focus_idx - 1, focus_idx + 1, focus_idx + 2):
+            if idx < 0 or idx >= len(sentences) or idx in selected_indexes:
+                continue
+            sentence = sentences[idx]
+            if any(marker in sentence for marker in cls._DETAIL_NOTE_MARKERS):
+                selected_indexes.append(idx)
+        if len(selected_indexes) == 1 and focus_idx + 1 < len(sentences):
+            selected_indexes.append(focus_idx + 1)
+        return "\n".join(sentences[idx] for idx in sorted(selected_indexes[:3]))
+
+    def _answer_mentions_slot_with_citation(self, text: str, aliases: tuple[str, ...]) -> bool:
+        chunk_ref_re = re.compile(rf"{self._FILENAME}{self._CHUNK_SUFFIX}|\[\d+\]")
+        in_slot_section = False
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                in_slot_section = any(alias in stripped for alias in aliases)
+                continue
+            if any(alias in stripped for alias in aliases) and chunk_ref_re.search(stripped):
+                return True
+            if in_slot_section and chunk_ref_re.search(stripped):
+                return True
+        return False
+
+    def _build_slot_repair_line(self, item: dict[str, Any], context: AgentContext) -> str | None:
+        label = str(item["label"])
+        aliases = tuple(str(alias) for alias in item["aliases"])
+        supporting_ids = [str(chunk_id) for chunk_id in item["supporting_ids"]]
+        if supporting_ids:
+            chunk_id = supporting_ids[0]
+            note = context.evidence_notes.get(chunk_id, "").strip()
+            if not note:
+                return None
+            snippet = self._extract_slot_snippet(
+                note,
+                aliases,
+                prefer_detail=self._is_detail_seeking_context(context),
+            ).replace("[抜粋]", "").strip()
+            snippet = snippet.rstrip("。！？")
+            if not snippet:
+                return None
+            if not any(alias in snippet for alias in aliases):
+                snippet = f"{label}については、{snippet}"
+            return f"- {snippet}[{chunk_id}]。"
+
+        fallback_ids = [str(chunk_id) for chunk_id in item.get("fallback_ids", []) if str(chunk_id)]
+        if not fallback_ids:
+            return None
+        refs = "".join(f"[{chunk_id}]" for chunk_id in fallback_ids[:2])
+        return (
+            f"- {label}: 今回確認できた根拠では不十分であり、この論点を裏付ける十分な記載を確認できませんでした"
+            f"{refs}。"
+        )
+
+    def _repair_answer_coverage(self, answer: str, context: AgentContext) -> str:
+        items = self._coverage_plan_items(context)
+        if not items:
+            return answer
+
+        repair_lines: list[str] = []
+        for item in items:
+            aliases = tuple(str(alias) for alias in item["aliases"])
+            if self._answer_mentions_slot_with_citation(answer, aliases):
+                continue
+            line = self._build_slot_repair_line(item, context)
+            if line and line not in repair_lines:
+                repair_lines.append(line)
+
+        if not repair_lines:
+            return answer
+
+        cleaned = answer.rstrip()
+        if cleaned:
+            cleaned += "\n\n"
+        cleaned += "## 論点カバレッジ\n" + "\n".join(repair_lines)
+        return cleaned
+
     def _sanitize_answer(self, text: str, *, number_refs: bool = False) -> tuple[str, list[str]] | str:
         """Normalize answer formatting before returning it to clients.
 
@@ -831,6 +1374,8 @@ class Agent:
         text = self._strip_reasoning_preamble(text)
         cited_ids: list[str] = []
         if number_refs:
+            # Drop model-authored numeric citations so only chunk-backed markers remain.
+            text = re.sub(r"\[(\d+)\]", "", text)
             text, cited_ids = self._number_chunk_refs(text)
         text = self._strip_chunk_refs(text)
         text = self._strip_inline_citation_labels(text)
@@ -862,6 +1407,7 @@ class Agent:
         return result
 
     def _finalize_answer(self, answer: str, context: AgentContext) -> tuple[str, list[dict[str, Any]], dict[str, str]]:
+        answer = self._repair_answer_coverage(answer, context)
         sanitized_answer, cited_ids = self._sanitize_answer(answer, number_refs=True)
         references, source_url_map = self._get_referenced_chunks(context, cited_ids)
         return sanitized_answer, references, source_url_map
@@ -917,6 +1463,7 @@ class Agent:
                 "source": chunk.get("source", ""),
                 "text": chunk["text"],
             }
+            ref.update(self._reference_card_fields(chunk))
             filename = chunk.get("file", "")
             if filename and filename in self.pdf_sources:
                 base_url = self.pdf_sources[filename]
@@ -963,11 +1510,212 @@ class Agent:
                 citations.add(normalized)
         return len(citations)
 
+    @staticmethod
+    def _compact_label(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip(" >\u3000")
+
+    @classmethod
+    def _clean_reference_label(cls, text: str) -> str:
+        cleaned = cls._compact_label(text)
+        if not cleaned:
+            return ""
+        if re.fullmatch(r"[-\u2010-\u2015\s\d.]+", cleaned):
+            return ""
+        return cleaned
+
+    @classmethod
+    def _short_reference_label(cls, text: str, limit: int = 44) -> str:
+        cleaned = cls._clean_reference_label(text)
+        if not cleaned:
+            return ""
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 1].rstrip() + "…"
+
+    @classmethod
+    def _infer_reference_doc_type(cls, chunk: dict[str, Any]) -> str:
+        explicit = cls._compact_label(chunk.get("doc_type", ""))
+        if explicit:
+            return explicit
+        haystack = cls._compact_label(chunk.get("doc_title", "")) or cls._compact_label(chunk.get("source", ""))
+        for token in (
+            "企業会計基準適用指針",
+            "企業会計基準",
+            "実務対応報告",
+            "会計制度委員会報告",
+            "企業会計原則",
+            "原価計算基準",
+            "注解",
+            "法令",
+            "IFRS関連情報",
+            "中小企業会計",
+        ):
+            if token and token in haystack:
+                return token
+        return "参考資料"
+
+    @classmethod
+    def _reference_card_fields(cls, chunk: dict[str, Any]) -> dict[str, Any]:
+        source = cls._compact_label(chunk.get("source", ""))
+        doc_title = cls._compact_label(chunk.get("doc_title", ""))
+        if not doc_title and source:
+            doc_title = cls._compact_label(source.split(">")[0])
+        section_title = cls._clean_reference_label(chunk.get("section_title", ""))
+        if not section_title and ">" in source:
+            section_title = cls._clean_reference_label(source.split(">", 1)[1])
+        page_label = ""
+        try:
+            pdf_page = int(chunk.get("pdf_page") or 0)
+        except (TypeError, ValueError):
+            pdf_page = 0
+        if pdf_page > 0:
+            page_label = f"p.{pdf_page}"
+        section_label = cls._short_reference_label(section_title)
+        if not section_label and page_label:
+            section_label = page_label
+        return {
+            "doc_type": cls._infer_reference_doc_type(chunk),
+            "doc_title": doc_title or source,
+            "section_title": section_title,
+            "section_label": section_label,
+            "page_label": page_label,
+            "standard_no": cls._compact_label(chunk.get("standard_no", "")) or None,
+        }
+
+    @staticmethod
+    def _extract_insufficient_points(answer: str) -> list[str]:
+        points: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"^\s*[-・•*]\s*([^:：\n]+?)\s*[:：]\s*今回確認できた根拠では不十分", answer, flags=re.MULTILINE):
+            label = re.sub(r"\s+", " ", match.group(1)).strip()
+            if label and label not in seen:
+                seen.add(label)
+                points.append(label)
+        return points
+
+    def _build_uncertainty_summary(self, answer: str, context: AgentContext) -> dict[str, Any]:
+        coverage = context.get_evidence_coverage()
+        insufficient_points: list[str] = []
+        seen: set[str] = set()
+        for label in list(coverage.get("uncovered_slots", [])) + self._extract_insufficient_points(answer):
+            normalized = re.sub(r"\s+", " ", str(label or "")).strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                insufficient_points.append(normalized)
+
+        present = bool(insufficient_points) or "今回確認できた根拠では不十分" in answer
+        note = ""
+        if present and insufficient_points:
+            note = "未確定の論点があります。参照カードは確認できた範囲の原典です。"
+        elif present:
+            note = "一部の記述は、今回確認できた根拠だけでは十分に裏付けられていません。"
+
+        return {
+            "present": present,
+            "insufficient_points": insufficient_points,
+            "covered_points": list(coverage.get("covered_slots", [])),
+            "coverage_ratio": float(coverage.get("coverage_ratio", 0.0)),
+            "note": note,
+        }
+
     def _build_answer_summary(self, answer: str, context: AgentContext) -> dict[str, Any]:
         summary = context.get_summary()
         summary["read_chunk_count"] = len(context.read_chunk_ids)
         summary["chunks_read_count"] = self._count_cited_references(answer)
         return summary
+
+    @staticmethod
+    def _iter_cited_answer_lines(answer: str) -> list[str]:
+        lines: list[str] = []
+        for raw_line in answer.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if re.search(r"\[\d+\]", stripped):
+                lines.append(stripped)
+        return lines
+
+    @staticmethod
+    def _strip_numeric_citations(text: str) -> str:
+        return re.sub(r"\[\d+\]", "", text)
+
+    def _natural_answer_retry_reasons(self, result: dict[str, Any], context: AgentContext) -> list[str]:
+        if context.question_complexity == "simple":
+            return []
+        if len(context.read_chunk_ids) < 2 or len(context.evidence_notes) < 2:
+            return []
+
+        reasons: list[str] = []
+        cited_reference_count = int(result.get("cited_reference_count", 0))
+        if cited_reference_count < 2:
+            reasons.append("low_citations")
+
+        answer = str(result.get("answer", ""))
+        cited_lines = self._iter_cited_answer_lines(answer)
+        coverage = context.get_evidence_coverage()
+        required_line_count = 2
+        if self._is_detail_seeking_context(context):
+            required_line_count = max(2, len(coverage.get("covered_slots", [])) or len(coverage.get("slots", [])) or 2)
+        if len(cited_lines) < required_line_count:
+            reasons.append("too_few_cited_lines")
+
+        if self._is_detail_seeking_context(context):
+            substantive_chars = sum(len(self._strip_numeric_citations(line).strip()) for line in cited_lines)
+            minimum_chars = 60 if context.question_complexity == "complex" else 40
+            if substantive_chars < minimum_chars:
+                reasons.append("too_little_detail")
+
+            covered_slots = list(coverage.get("covered_slots", []))
+            covered_mentions = sum(
+                1
+                for slot in covered_slots
+                if self._answer_mentions_slot_with_citation(
+                    answer,
+                    context.evidence_slot_terms.get(slot, (slot,)),
+                )
+            )
+            if covered_slots and covered_mentions < len(covered_slots):
+                reasons.append("covered_slots_missing")
+
+        return reasons
+
+    def _should_retry_natural_answer(self, result: dict[str, Any], context: AgentContext) -> bool:
+        return bool(self._natural_answer_retry_reasons(result, context))
+
+    def _build_completed_result(
+        self,
+        answer: str,
+        context: AgentContext,
+        loops: int,
+        stop_reason: str,
+        total_cost: float,
+    ) -> dict[str, Any]:
+        sanitized_answer, references, source_url_map = self._finalize_answer(answer, context)
+        summary = self._build_answer_summary(sanitized_answer, context)
+        uncertainty = self._build_uncertainty_summary(sanitized_answer, context)
+        observability = self._build_observability_summary(
+            context=context,
+            loops=loops,
+            stop_reason=stop_reason,
+            answer=sanitized_answer,
+            references=references,
+        )
+        return {
+            "answer": sanitized_answer,
+            "loops": loops,
+            "stop_reason": stop_reason,
+            "total_cost": total_cost,
+            **summary,
+            "cited_reference_count": self._count_cited_references(sanitized_answer),
+            "read_chunk_count": len(context.read_chunk_ids),
+            "trajectory": context.trajectory,
+            "references": references,
+            "source_url_map": source_url_map,
+            "uncertainty": uncertainty,
+            "request_id": observability.get("request_id"),
+            "query_class": observability["query_class"],
+            "observability": observability,
+        }
 
     def _build_result(
         self,
@@ -977,16 +1725,4 @@ class Agent:
         stop_reason: str,
         total_cost: float,
     ) -> dict[str, Any]:
-        sanitized_answer, references, source_url_map = self._finalize_answer(answer, context)
-        return {
-            "answer": sanitized_answer,
-            "loops": loops,
-            "stop_reason": stop_reason,
-            "total_cost": total_cost,
-            **context.get_summary(),
-            "cited_reference_count": self._count_cited_references(sanitized_answer),
-            "read_chunk_count": len(context.read_chunk_ids),
-            "trajectory": context.trajectory,
-            "references": references,
-            "source_url_map": source_url_map,
-        }
+        return self._build_completed_result(answer, context, loops, stop_reason, total_cost)

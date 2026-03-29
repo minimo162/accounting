@@ -35,12 +35,27 @@ class AgentContext:
         "改正点",
         "改正",
         "変更",
+        "要件",
+        "違い",
+        "比較",
+        "場合",
+        "条件",
+        "例外",
+        "観点",
     }
     _SLOT_ALIASES: dict[str, tuple[str, ...]] = {
         "借手": ("借手",),
         "貸手": ("貸手",),
         "経過措置": ("経過措置", "適用初年度", "初度適用", "適用時期"),
-        "関連基準": ("関連基準", "関連する会計基準", "他の会計基準", "税効果会計", "収益認識基準"),
+        "関連基準": (
+            "関連基準",
+            "関連する会計基準",
+            "他の会計基準",
+            "固定資産の減損",
+            "減損会計基準",
+            "資産除去債務",
+            "財務諸表等規則",
+        ),
         "使用権資産": ("使用権資産",),
         "リース負債": ("リース負債",),
         "短期リース": ("短期リース",),
@@ -51,7 +66,7 @@ class AgentContext:
         "純額": ("純額",),
         "支配": ("支配",),
         "履行義務": ("履行義務",),
-        "保守サービス": ("保守サービス",),
+        "保守サービス": ("保守サービス", "保守契約"),
         "値引き": ("値引き", "割引"),
         "変動対価": ("変動対価",),
         "制約": ("制約", "重要な戻入れ"),
@@ -114,6 +129,7 @@ class AgentContext:
         self.evidence_slot_hits: dict[str, set[str]] = {}
         self.wrap_up_nudged: bool = False
         self.coverage_gap_nudge_signature: str = ""
+        self.final_coverage_review_done: bool = False
 
     @classmethod
     def _normalize_slot_text(cls, text: str) -> str:
@@ -205,6 +221,7 @@ class AgentContext:
         self.evidence_slots, self.evidence_slot_terms = self._infer_evidence_slots(question, self.query_profile)
         self.evidence_slot_hits = {slot: set() for slot in self.evidence_slots}
         self.coverage_gap_nudge_signature = ""
+        self.final_coverage_review_done = False
 
     def set_current_search_query(self, query: str):
         self.current_search_query = query
@@ -312,3 +329,4 @@ class AgentContext:
         self.evidence_slot_hits.clear()
         self.wrap_up_nudged = False
         self.coverage_gap_nudge_signature = ""
+        self.final_coverage_review_done = False

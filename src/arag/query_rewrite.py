@@ -19,6 +19,8 @@ class QueryProfile:
     keywords: list[str] = field(default_factory=list)
     canonical_focus_query: str | None = None
     corrective_query: str | None = None
+    detail_seeking: bool = False
+    detail_terms: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -28,6 +30,8 @@ class QueryProfile:
             "keywords": list(self.keywords),
             "canonical_focus_query": self.canonical_focus_query,
             "corrective_query": self.corrective_query,
+            "detail_seeking": self.detail_seeking,
+            "detail_terms": list(self.detail_terms),
         }
 
 
@@ -50,6 +54,14 @@ class QueryExpander:
     _COMPLEX_TERMS = (
         "改正", "変更", "見直し", "背景", "目的", "経過措置", "適用時期",
         "比較", "違い", "それぞれ", "併せて", "また", "及び", "ならびに",
+    )
+    _DETAIL_SEEKING_TERMS = (
+        "詳しく", "要件", "違い", "比較", "どのような場合", "判断",
+        "経過措置", "手順", "例外", "条件", "観点", "識別", "見積り", "見積もり",
+    )
+    _DETAIL_HINT_TERMS = (
+        "要件", "条件", "例外", "判断", "比較", "経過措置", "適用時期",
+        "識別", "見積り", "見積もり", "場合", "区分", "差異",
     )
     _SIMPLE_TERMS = ("とは", "何か", "意味", "定義", "概要", "趣旨")
     _KEYWORD_PATTERNS = (
@@ -138,13 +150,24 @@ class QueryExpander:
     def profile(cls, query: str) -> QueryProfile:
         keywords = cls._extract_keywords(query)
         exact = cls.is_exact_query(query)
-        canonical_focus = cls._domain_focus_variant(query) or cls._canonical_title_focus_variant(query)
-        corrective_query = canonical_focus or cls._anchor_focus_variant(query)
         complexity = cls._infer_complexity(query, keywords, exact)
+        detail_seeking = cls._is_detail_seeking(query, exact, complexity)
+        detail_terms = cls._detail_focus_terms(query)
+        canonical_focus = cls._domain_focus_variant(query) or cls._canonical_title_focus_variant(query)
+        corrective_query = cls._merge_focus_terms(
+            canonical_focus or cls._anchor_focus_variant(query),
+            detail_terms if detail_seeking else [],
+        )
 
         if exact:
             search_mode = "keyword_first"
-        elif canonical_focus and complexity != "complex":
+        elif canonical_focus and (
+            complexity != "complex"
+            or cls._prefer_keyword_first_for_complex(query, keywords)
+            or detail_seeking
+        ):
+            search_mode = "keyword_first"
+        elif detail_seeking and corrective_query and complexity != "simple":
             search_mode = "keyword_first"
         elif any(term in query for term in cls._SIMPLE_TERMS) and not canonical_focus:
             search_mode = "semantic_first"
@@ -158,6 +181,8 @@ class QueryExpander:
             keywords=keywords[:6],
             canonical_focus_query=canonical_focus,
             corrective_query=corrective_query,
+            detail_seeking=detail_seeking,
+            detail_terms=detail_terms,
         )
 
     @staticmethod
@@ -190,7 +215,27 @@ class QueryExpander:
     def exact_keyword_terms(cls, query: str) -> list[str]:
         terms = cls.extract_exact_terms(query)
         if terms:
-            return terms
+            anchor_terms: list[str] = []
+            generic_terms = {
+                "処理", "扱い", "内容", "概要", "意味", "定義",
+                "教えて", "ください", "どのように", "ですか", "ますか",
+            }
+            for keyword in cls._extract_keywords(query):
+                normalized = re.sub(r"\s+", "", keyword)
+                if any(
+                    normalized == term
+                    or normalized in term
+                    or term in normalized
+                    for term in terms
+                ):
+                    continue
+                if normalized in generic_terms or len(normalized) < 2:
+                    continue
+                if keyword not in anchor_terms:
+                    anchor_terms.append(keyword)
+                if len(anchor_terms) >= 2:
+                    break
+            return terms + anchor_terms
         canonical_title = cls._canonical_title_focus_variant(query)
         if canonical_title:
             title_terms = cls.extract_exact_terms(canonical_title)
@@ -228,9 +273,14 @@ class QueryExpander:
     def _heuristic_variants(self, query: str) -> list[str]:
         keywords = self._extract_keywords(query)
         variants: list[str] = []
-        canonical_focus = self._domain_focus_variant(query) or self._canonical_title_focus_variant(query)
-        if canonical_focus:
+        profile = self.profile(query)
+        canonical_focus = profile.canonical_focus_query
+        if profile.detail_seeking and profile.corrective_query and profile.corrective_query != query:
+            variants.append(profile.corrective_query)
+        if canonical_focus and canonical_focus not in variants:
             variants.append(canonical_focus)
+        if profile.corrective_query and profile.corrective_query not in variants and profile.corrective_query != query:
+            variants.append(profile.corrective_query)
         if len(keywords) >= 2:
             variants.append(" ".join(keywords[:4]))
         if any("第" in kw and "号" in kw for kw in keywords):
@@ -240,11 +290,87 @@ class QueryExpander:
         return variants
 
     @classmethod
+    def _is_detail_seeking(cls, query: str, exact: bool, complexity: str) -> bool:
+        if exact and complexity == "simple":
+            return False
+        if complexity == "complex":
+            return True
+        return any(term in query for term in cls._DETAIL_SEEKING_TERMS)
+
+    @classmethod
+    def _detail_focus_terms(cls, query: str) -> list[str]:
+        terms: list[str] = []
+
+        def add(term: str) -> None:
+            if term and term not in terms:
+                terms.append(term)
+
+        for term in cls._DETAIL_HINT_TERMS:
+            if term in {"見積り", "見積もり"}:
+                continue
+            if term in query:
+                add(term)
+
+        if any(term in query for term in ("見積り", "見積もり")):
+            add("見積り")
+
+        if "どのような場合" in query:
+            add("場合")
+        if "どのように" in query and "判断" in query:
+            add("判断")
+        if any(term in query for term in ("違い", "比較", "区分")):
+            add("比較")
+
+        return terms[:4]
+
+    @staticmethod
+    def _merge_focus_terms(base: str | None, extra_terms: list[str]) -> str | None:
+        tokens: list[str] = []
+        for part in (base or "").split():
+            normalized = part.strip()
+            if normalized and normalized not in tokens:
+                tokens.append(normalized)
+        for term in extra_terms:
+            normalized = term.strip()
+            if normalized and normalized not in tokens:
+                tokens.append(normalized)
+        return " ".join(tokens) or None
+
+    @classmethod
     def _infer_complexity(cls, query: str, keywords: list[str], exact: bool) -> str:
         complex_hits = sum(1 for term in cls._COMPLEX_TERMS if term in query)
         separator_hits = sum(query.count(token) for token in ("と", "、", "/", "・"))
-        if exact and len(keywords) <= 4:
+        if exact:
+            exact_terms = set(cls.extract_exact_terms(query))
+            non_exact_keywords = [
+                keyword for keyword in keywords
+                if not any(
+                    (normalized_keyword := re.sub(r"\s+", "", keyword)) == exact_term
+                    or normalized_keyword in exact_term
+                    or exact_term in normalized_keyword
+                    for exact_term in exact_terms
+                )
+            ]
+            if len(non_exact_keywords) <= 3:
+                return "simple"
+            if len(non_exact_keywords) <= 4:
+                return "moderate"
+        if "短期リース" in query and any(term in query for term in ("少額リース", "少額資産")) and len(keywords) <= 5:
             return "simple"
+        if all(term in query for term in ("本人", "代理人")) and len(keywords) <= 6:
+            return "moderate"
+        if "履行義務" in query and any(term in query for term in ("保守サービス", "値引き", "割引")) and len(keywords) <= 8:
+            return "moderate"
+        if "減損" in query and "兆候" in query and len(keywords) <= 7:
+            return "moderate"
+        if "変動対価" in query and len(keywords) <= 6:
+            return "moderate"
+        if "契約変更" in query and any(term in query for term in ("既存", "新しい契約", "別個")) and len(keywords) <= 8:
+            return "moderate"
+        if "研究開発費" in query and "ソフトウェア" in query and len(keywords) <= 7:
+            return "moderate"
+        if "税効果会計" in query and "税率" in query and len(keywords) <= 7:
+            return "moderate"
         if complex_hits >= 2 or (complex_hits >= 1 and (separator_hits >= 1 or len(keywords) >= 5)):
             return "complex"
         if any(term in query for term in cls._SIMPLE_TERMS) and len(keywords) <= 4:
@@ -255,6 +381,64 @@ class QueryExpander:
 
     @classmethod
     def _domain_focus_variant(cls, query: str) -> str | None:
+        if "短期リース" in query and any(term in query for term in ("少額リース", "少額資産")):
+            focus_parts = []
+            if "借手" in query:
+                focus_parts.append("借手")
+            focus_parts.extend(["短期リース", "少額リース"])
+            return " ".join(dict.fromkeys(focus_parts))
+        if "減損" in query and "兆候" in query:
+            focus_parts = []
+            if "固定資産" in query:
+                focus_parts.append("固定資産")
+            focus_parts.extend(["減損", "兆候", "回収可能価額"])
+            if "固定資産" in query or any(term in query for term in ("使用価値", "正味売却価額")):
+                focus_parts.extend(["使用価値", "正味売却価額"])
+            return " ".join(dict.fromkeys(focus_parts))
+        if "変動対価" in query:
+            focus_parts = []
+            if "収益認識基準" in query:
+                focus_parts.append("収益認識基準")
+            focus_parts.extend(["変動対価", "見積り", "制約"])
+            if "収益" in query:
+                focus_parts.append("収益")
+            return " ".join(dict.fromkeys(focus_parts))
+        if "契約変更" in query:
+            focus_parts = []
+            if "収益認識基準" in query:
+                focus_parts.append("収益認識基準")
+            focus_parts.extend(["契約変更", "別個"])
+            if any(term in query for term in ("既存", "継続")):
+                focus_parts.append("既存")
+            if any(term in query for term in ("新しい契約", "新規")):
+                focus_parts.append("新しい契約")
+            focus_parts.extend(["履行義務", "取引価格"])
+            return " ".join(dict.fromkeys(focus_parts))
+        if "研究開発費" in query:
+            focus_parts = ["研究開発費", "発生時", "費用"]
+            if "ソフトウェア" in query:
+                focus_parts.extend(["ソフトウェア", "資産"])
+            return " ".join(dict.fromkeys(focus_parts))
+        if all(term in query for term in ("本人", "代理人")):
+            focus_parts = []
+            if "収益認識基準" in query:
+                focus_parts.append("収益認識基準")
+            focus_parts.extend(["本人", "代理人", "支配"])
+            if any(term in query for term in ("区分", "判断")):
+                focus_parts.extend(["総額", "純額"])
+            return " ".join(dict.fromkeys(focus_parts))
+        if "履行義務" in query:
+            focus_parts = []
+            if "収益認識基準" in query:
+                focus_parts.append("収益認識基準")
+            focus_parts.extend(["履行義務", "別個"])
+            if "保守サービス" in query:
+                focus_parts.append("保守サービス")
+            if any(term in query for term in ("値引き", "割引")):
+                focus_parts.append("値引き")
+            if "契約" in query:
+                focus_parts.append("契約")
+            return " ".join(dict.fromkeys(focus_parts))
         if "繰延ヘッジ" in query or "ヘッジ会計" in query:
             focus_parts = ["ヘッジ会計"]
             if "繰延ヘッジ" in query:
@@ -262,7 +446,25 @@ class QueryExpander:
             if any(term in query for term in ("要件", "適用")):
                 focus_parts.extend(["ヘッジ会計の適用要件", "正式な文書", "有効性", "事前テスト", "事後テスト"])
             return " ".join(dict.fromkeys(focus_parts))
+        if "税効果会計" in query and "税率" in query:
+            focus_parts = ["税効果会計", "税率"]
+            if "繰延税金資産" in query:
+                focus_parts.append("繰延税金資産")
+            if "繰延税金負債" in query or ("繰延税金資産" in query and "負債" in query):
+                focus_parts.append("繰延税金負債")
+            if "税率変更" in query or "変更時" in query:
+                focus_parts.append("税率変更")
+            return " ".join(dict.fromkeys(focus_parts))
         return None
+
+    @classmethod
+    def _prefer_keyword_first_for_complex(cls, query: str, keywords: list[str]) -> bool:
+        return (
+            "リース" in query
+            and any(term in query for term in ("改正", "改正点", "経過措置"))
+            and all(term in query for term in ("借手", "貸手"))
+            and len(keywords) <= 8
+        )
 
     @staticmethod
     def _canonicalize_standard_aliases(query: str) -> str:

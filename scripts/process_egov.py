@@ -1,10 +1,17 @@
 """Process e-Gov XML law data into parent/child chunks and append to chunks.json."""
 
+import argparse
 import json
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from .source_manifest import load_source_manifest, metadata_for_file, upsert_source_record
+except ImportError:
+    from source_manifest import load_source_manifest, metadata_for_file, upsert_source_record
 
 
 _OVERLAP_CHARS = 100
@@ -52,11 +59,11 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def download_law(law_id: str, cache_dir: Path) -> Path:
+def download_law(law_id: str, cache_dir: Path, *, refresh: bool = False) -> Path:
     import urllib.request
 
     cache_path = cache_dir / f"{law_id}.xml"
-    if cache_path.exists():
+    if cache_path.exists() and not refresh:
         print(f"  Using cached: {cache_path}")
         return cache_path
     url = f"https://laws.e-gov.go.jp/api/1/lawdata/{law_id}"
@@ -92,7 +99,14 @@ def _split_child_chunks(text: str, target_chars: int = 700, overlap_chars: int =
     return [text[i:i + target_chars].strip() for i in range(0, len(text), step) if text[i:i + target_chars].strip()]
 
 
-def process_law(xml_path: Path, source_name: str, file_name: str, parts: list[str] | None = None) -> list[dict]:
+def process_law(
+    xml_path: Path,
+    source_name: str,
+    file_name: str,
+    *,
+    source_meta: dict[str, str],
+    parts: list[str] | None = None,
+) -> list[dict]:
     tree = ET.parse(str(xml_path))
     root = tree.getroot()
     law = root.find(".//Law")
@@ -136,6 +150,7 @@ def process_law(xml_path: Path, source_name: str, file_name: str, parts: list[st
             "standard_no": "",
             "section_title": section_title,
             "section_path": source,
+            **source_meta,
         }
         chunks.append(parent)
         for child_text in _split_child_chunks(parent_text):
@@ -153,6 +168,7 @@ def process_law(xml_path: Path, source_name: str, file_name: str, parts: list[st
                     "standard_no": "",
                     "section_title": section_title,
                     "section_path": source,
+                    **source_meta,
                 }
             )
             child_counter += 1
@@ -179,19 +195,42 @@ def process_law(xml_path: Path, source_name: str, file_name: str, parts: list[st
     return chunks
 
 
-def main(chunks_path: str = "data/chunks.json"):
-    cache_dir = Path("data/egov_cache")
-    cache_dir.mkdir(parents=True, exist_ok=True)
+def main(chunks_path: str = "data/chunks.json", *, refresh: bool = False):
     chunks_file = Path(chunks_path)
+    data_dir = chunks_file.resolve().parent
+    cache_dir = data_dir / "egov_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     existing_chunks = json.loads(chunks_file.read_text(encoding="utf-8")) if chunks_file.exists() else []
     egov_files = {info["file"] for info in LAWS.values()}
     existing_chunks = [chunk for chunk in existing_chunks if chunk.get("file") not in egov_files]
+    manifest_file = data_dir / "source_manifest.json"
+    manifest_sources = load_source_manifest(manifest_file)["sources"]
 
     new_chunks: list[dict] = []
     for law_id, info in LAWS.items():
         print(f"Processing: {info['source']}")
-        xml_path = download_law(law_id, cache_dir)
-        chunks = process_law(xml_path, info["source"], info["file"], parts=info.get("parts"))
+        xml_path = download_law(law_id, cache_dir, refresh=refresh)
+        record = upsert_source_record(
+            manifest_file,
+            file_path=xml_path.resolve(),
+            data_dir=data_dir,
+            url=f"https://laws.e-gov.go.jp/law/{law_id}",
+            source_group="egov_cache",
+            kind="xml",
+        )
+        manifest_sources[record["path"]] = record
+        source_meta = metadata_for_file(
+            xml_path.resolve(),
+            data_dir=data_dir,
+            manifest_sources=manifest_sources,
+        )
+        chunks = process_law(
+            xml_path,
+            info["source"],
+            info["file"],
+            source_meta=source_meta,
+            parts=info.get("parts"),
+        )
         new_chunks.extend(chunks)
         print(f"  Created {len(chunks)} chunks")
 
@@ -201,5 +240,8 @@ def main(chunks_path: str = "data/chunks.json"):
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/chunks.json"
-    main(path)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("chunks_path", nargs="?", default="data/chunks.json")
+    parser.add_argument("--refresh", action="store_true", help="Refresh cached e-Gov XML before chunking.")
+    args = parser.parse_args()
+    main(args.chunks_path, refresh=args.refresh)

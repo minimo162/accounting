@@ -18,6 +18,7 @@ from src.arag.answer_eval import (  # noqa: E402
     load_answer_eval_cases,
     render_answer_eval_markdown,
     summarize_answer_eval,
+    summarize_answer_eval_gate,
 )
 
 
@@ -33,8 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-id", action="append", default=[])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output")
+    parser.add_argument("--json-output")
+    parser.add_argument("--markdown-output")
     parser.add_argument("--format", choices=["json", "markdown"], default="json")
     parser.add_argument("--fail-on-fail", action="store_true")
+    parser.add_argument("--gate-mode", choices=["none", "hard", "strict"], default="none")
+    parser.add_argument("--override-reason", default="")
     return parser.parse_args()
 
 
@@ -55,6 +60,8 @@ async def run_local_question(question: str) -> tuple[str, dict[str, Any]]:
         "cited_reference_count": result.get("cited_reference_count", 0),
         "references": result.get("references", []),
         "source_url_map": result.get("source_url_map", {}),
+        "request_id": result.get("request_id"),
+        "query_class": result.get("query_class"),
     }
     return result.get("answer", ""), metadata
 
@@ -66,9 +73,13 @@ def normalize_api_url(api_url: str) -> str:
     return f"{trimmed}/api/ask"
 
 
-def run_api_question(question: str, api_url: str, timeout: float) -> tuple[str, dict[str, Any]]:
+def run_api_question(case_id: str, question: str, api_url: str, timeout: float) -> tuple[str, dict[str, Any]]:
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        response = client.post(api_url, json={"question": question, "history": []})
+        response = client.post(
+            api_url,
+            json={"question": question, "history": []},
+            headers={"X-Monitor-Case-Id": f"answer-eval:{case_id}"},
+        )
         response.raise_for_status()
         payload = response.json()
     metadata = dict(payload.get("metadata", {}))
@@ -102,20 +113,31 @@ async def main():
         if args.backend == "local":
             answer, metadata = await run_local_question(case.question)
         else:
-            answer, metadata = run_api_question(case.question, api_url, args.timeout)
+            answer, metadata = run_api_question(case.case_id, case.question, api_url, args.timeout)
         elapsed = time.perf_counter() - start
         results.append(evaluate_answer_case(case, answer, metadata, elapsed))
 
     summary = summarize_answer_eval(results)
+    gate = summarize_answer_eval_gate(results, args.gate_mode)
+    override_reason = args.override_reason.strip()
+    if override_reason:
+        gate["override_reason"] = override_reason
+        gate["override_applied"] = not gate["passed"]
+    else:
+        gate["override_applied"] = False
     payload = {
         "summary": summary,
+        "gate": gate,
         "results": [result.to_dict() for result in results],
     }
 
     if args.format == "markdown":
-        output_text = render_answer_eval_markdown(summary, results)
+        output_text = render_answer_eval_markdown(summary, results, gate)
     else:
         output_text = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    markdown_text = render_answer_eval_markdown(summary, results, gate)
+    json_text = json.dumps(payload, ensure_ascii=False, indent=2)
 
     if args.output:
         out_path = Path(args.output)
@@ -123,10 +145,24 @@ async def main():
         out_path.write_text(output_text, encoding="utf-8")
         print(f"Wrote report: {out_path}")
 
+    if args.json_output:
+        json_path = Path(args.json_output)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json_text, encoding="utf-8")
+        print(f"Wrote JSON report: {json_path}", file=sys.stderr)
+
+    if args.markdown_output:
+        markdown_path = Path(args.markdown_output)
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(markdown_text, encoding="utf-8")
+        print(f"Wrote Markdown report: {markdown_path}", file=sys.stderr)
+
     print(output_text)
 
     if args.fail_on_fail and summary["failed"] > 0:
         raise SystemExit(1)
+    if args.gate_mode != "none" and not gate["passed"] and not override_reason:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

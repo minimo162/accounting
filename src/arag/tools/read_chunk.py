@@ -17,6 +17,11 @@ class ReadChunkTool(BaseTool):
         "会計", "会計基準", "基準", "内容", "教えて", "教えてください", "について",
         "改正", "変更", "見直し", "概要", "ポイント", "処理", "方法",
     }
+    _DETAIL_MARKERS = (
+        "場合", "とき", "要件", "条件", "例外", "ただし", "なお", "一方",
+        "また", "次の", "以下", "比較", "区分", "判断", "経過措置",
+        "適用時期", "別個", "見積り", "制約",
+    )
 
     def __init__(self, corpus: ChunkCorpus):
         self._corpus = corpus
@@ -81,7 +86,13 @@ class ReadChunkTool(BaseTool):
             text = parent["text"]
             source = parent.get("source", "")
             query = context.current_search_query or context.question
-            excerpt, compressed = self._build_excerpt(text, query, context.question_complexity)
+            detail_seeking = bool(context.query_profile.get("detail_seeking"))
+            excerpt, compressed = self._build_excerpt(
+                text,
+                query,
+                context.question_complexity,
+                detail_seeking=detail_seeking,
+            )
             chunk_tokens = len(_tokenizer.encode(excerpt))
             total_tokens += chunk_tokens
             compressed_any = compressed_any or compressed
@@ -156,28 +167,35 @@ class ReadChunkTool(BaseTool):
         return units
 
     @classmethod
-    def _score_unit(cls, unit: str, query_terms: list[str]) -> int:
-        if not query_terms:
-            return 0
+    def _score_unit(cls, unit: str, query_terms: list[str], *, detail_seeking: bool = False) -> int:
         score = 0
         for term in query_terms:
             if term in unit:
                 score += 3 if len(term) >= 4 else 2
         if "第" in unit and any("第" in term for term in query_terms):
             score += 1
+        if detail_seeking and any(marker in unit for marker in cls._DETAIL_MARKERS):
+            score += 2
         return score
 
     @classmethod
-    def _excerpt_budget(cls, complexity: str) -> int:
+    def _excerpt_budget(cls, complexity: str, *, detail_seeking: bool = False) -> int:
         if complexity == "simple":
             return 1200
         if complexity == "complex":
-            return 2200
-        return 1600
+            return 2600 if detail_seeking else 2200
+        return 1900 if detail_seeking else 1600
 
     @classmethod
-    def _build_excerpt(cls, text: str, query: str, complexity: str) -> tuple[str, bool]:
-        budget = cls._excerpt_budget(complexity)
+    def _build_excerpt(
+        cls,
+        text: str,
+        query: str,
+        complexity: str,
+        *,
+        detail_seeking: bool = False,
+    ) -> tuple[str, bool]:
+        budget = cls._excerpt_budget(complexity, detail_seeking=detail_seeking)
         if len(text) <= budget:
             return text, False
 
@@ -189,11 +207,15 @@ class ReadChunkTool(BaseTool):
         selected_indexes: set[int] = set()
         if query_terms:
             scored_units = sorted(
-                ((cls._score_unit(unit, query_terms), idx) for idx, unit in enumerate(units)),
+                (
+                    (cls._score_unit(unit, query_terms, detail_seeking=detail_seeking), idx)
+                    for idx, unit in enumerate(units)
+                ),
                 key=lambda item: (item[0], -item[1]),
                 reverse=True,
             )
-            for score, idx in scored_units[:6]:
+            selected_budget = 8 if detail_seeking else 6
+            for score, idx in scored_units[:selected_budget]:
                 if score <= 0:
                     continue
                 selected_indexes.add(idx)
@@ -201,9 +223,23 @@ class ReadChunkTool(BaseTool):
                     selected_indexes.add(idx - 1)
                 if idx + 1 < len(units):
                     selected_indexes.add(idx + 1)
+                if detail_seeking and idx + 2 < len(units):
+                    next_unit = units[idx + 1]
+                    if any(marker in next_unit for marker in cls._DETAIL_MARKERS):
+                        selected_indexes.add(idx + 2)
 
         if not selected_indexes:
-            selected_indexes.update(range(min(6, len(units))))
+            fallback_budget = 8 if detail_seeking else 6
+            selected_indexes.update(range(min(fallback_budget, len(units))))
+
+        if detail_seeking:
+            for idx, unit in enumerate(units):
+                if any(marker in unit for marker in cls._DETAIL_MARKERS):
+                    selected_indexes.add(idx)
+                    if idx > 0:
+                        selected_indexes.add(idx - 1)
+                    if idx + 1 < len(units):
+                        selected_indexes.add(idx + 1)
 
         ordered_units = [units[idx] for idx in sorted(selected_indexes)]
         excerpt_parts: list[str] = []

@@ -128,7 +128,7 @@ class HybridSearchTests(unittest.TestCase):
 
         terms = QueryExpander.exact_keyword_terms("企業会計基準第13号 第10項では借手のリースをどのように扱いますか")
 
-        self.assertEqual(terms, ["企業会計基準第13号", "第10項"])
+        self.assertEqual(terms, ["企業会計基準第13号", "第10項", "借手", "リース"])
 
     def test_query_expansion_adds_hedge_accounting_focus_terms(self):
         from src.arag.query_rewrite import QueryExpander
@@ -142,11 +142,340 @@ class HybridSearchTests(unittest.TestCase):
             expansions,
             [
                 "繰延ヘッジを適用するための主な要件を教えてください",
-                "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+                "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト 要件",
             ],
         )
         self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
         self.assertEqual(profile.corrective_query, expansions[1])
+
+    def test_query_profile_marks_short_term_and_low_value_lease_as_simple_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "借手は短期リースや少額リースをどのように扱いますか"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "simple")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertEqual(profile.corrective_query, "借手 短期リース 少額リース")
+        self.assertEqual(
+            expansions,
+            [
+                "借手は短期リースや少額リースをどのように扱いますか",
+                "借手 短期リース 少額リース",
+            ],
+        )
+
+    def test_query_profile_marks_tax_rate_change_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "税効果会計で繰延税金資産・負債の計算に使う税率は何ですか。税率変更時の扱いも教えてください"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertEqual(profile.corrective_query, "税効果会計 税率 繰延税金資産 繰延税金負債 税率変更")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "税効果会計 税率 繰延税金資産 繰延税金負債 税率変更",
+            ],
+        )
+
+    def test_query_profile_marks_principal_agent_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "収益認識基準における本人と代理人の区分はどう判断しますか"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
+        self.assertEqual(profile.corrective_query, "収益認識基準 本人 代理人 支配 総額 純額 判断 区分 比較")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "収益認識基準 本人 代理人 支配 総額 純額 判断 区分 比較",
+            ],
+        )
+
+    def test_query_profile_keeps_exact_clause_query_simple(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        query = "企業会計基準第13号第10項では借手のリースをどのように扱いますか"
+
+        profile = QueryExpander.profile(query)
+
+        self.assertEqual(profile.complexity, "simple")
+        self.assertEqual(profile.search_mode, "keyword_first")
+
+    def test_query_profile_marks_performance_obligation_identification_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "収益認識基準で履行義務はどのように識別しますか。保守サービスや値引きのある契約を念頭に説明してください"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
+        self.assertEqual(profile.corrective_query, "収益認識基準 履行義務 別個 保守サービス 値引き 契約 識別")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "収益認識基準 履行義務 別個 保守サービス 値引き 契約 識別",
+            ],
+        )
+
+    def test_query_profile_marks_variable_consideration_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "収益認識基準における変動対価はどのように見積もり、いつ収益に反映しますか"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
+        self.assertEqual(profile.corrective_query, "収益認識基準 変動対価 見積り 制約 収益")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "収益認識基準 変動対価 見積り 制約 収益",
+            ],
+        )
+
+    def test_query_profile_marks_contract_modification_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "収益認識基準で契約変更はどのように処理しますか。既存契約の継続か、新しい契約として扱うかの観点で教えてください"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertEqual(profile.corrective_query, "収益認識基準 契約変更 別個 既存 新しい契約 履行義務 取引価格")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "収益認識基準 契約変更 別個 既存 新しい契約 履行義務 取引価格",
+            ],
+        )
+
+    def test_query_profile_marks_r_and_d_cost_treatment_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "研究開発費はどのように会計処理しますか。ソフトウェア開発費との違いにも触れてください"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
+        self.assertEqual(profile.corrective_query, "研究開発費 発生時 費用 ソフトウェア 資産 比較")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "研究開発費 発生時 費用 ソフトウェア 資産 比較",
+            ],
+        )
+
+    def test_query_profile_marks_impairment_indication_as_moderate_keyword_first(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "固定資産の減損会計では、どのような場合に減損の兆候があると判断しますか"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "moderate")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
+        self.assertEqual(profile.corrective_query, "固定資産 減損 兆候 回収可能価額 使用価値 正味売却価額 判断 場合")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "固定資産 減損 兆候 回収可能価額 使用価値 正味売却価額 判断 場合",
+            ],
+        )
+
+    def test_query_profile_prefers_keyword_first_for_complex_lease_revision_detail(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=None)
+        query = "リース会計基準の改正点と経過措置を、借手の会計処理・貸手の扱い・関連基準への影響に分けて詳しく教えてください"
+
+        profile = QueryExpander.profile(query)
+        expansions = expander.expand(query)
+
+        self.assertEqual(profile.complexity, "complex")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.detail_seeking)
+        self.assertEqual(profile.corrective_query, "リースに関する会計基準 改正 借手 貸手 経過措置")
+        self.assertEqual(
+            expansions,
+            [
+                query,
+                "リースに関する会計基準 改正 借手 貸手 経過措置",
+            ],
+        )
+
+    def test_detail_seeking_keyword_first_prefers_corrective_query_over_canonical_focus(self):
+        query = "収益認識基準で履行義務はどのように識別しますか。保守サービスや値引きのある契約を念頭に説明してください"
+        profile = QueryProfile(
+            query=query,
+            complexity="moderate",
+            search_mode="keyword_first",
+            keywords=["履行義務", "保守サービス", "値引き"],
+            canonical_focus_query="収益認識基準 履行義務 別個",
+            corrective_query="収益認識基準 履行義務 別個 保守サービス 値引き 契約 識別",
+            detail_seeking=True,
+            detail_terms=["識別"],
+        )
+        semantic = FakeSemanticTool({})
+        keyword = FakeKeywordTool(
+            {
+                ("収益認識基準", "履行義務", "別個", "保守サービス", "値引き", "契約", "識別"): [
+                    make_result("doc-a:p1", 0.9)
+                ],
+            }
+        )
+        tool = HybridSearchTool(
+            semantic_tool=semantic,
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander([query], profile=profile),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        results, _, _ = tool.search(query, top_k=5)
+
+        self.assertEqual(
+            keyword.calls[0][0],
+            ("収益認識基準", "履行義務", "別個", "保守サービス", "値引き", "契約", "識別"),
+        )
+        self.assertEqual([item.parent_id for item in results], ["doc-a:p1"])
+
+    def test_keyword_first_focus_query_uses_split_keywords(self):
+        query = "収益認識基準における本人と代理人の区分はどう判断しますか"
+        profile = QueryProfile(
+            query=query,
+            complexity="moderate",
+            search_mode="keyword_first",
+            keywords=["本人", "代理人", "収益認識基準", "区分"],
+            canonical_focus_query="収益認識基準 本人 代理人 支配 総額 純額",
+            corrective_query="収益認識基準 本人 代理人 支配 総額 純額",
+        )
+        semantic = FakeSemanticTool({})
+        keyword = FakeKeywordTool(
+            {
+                ("収益認識基準", "本人", "代理人", "支配", "総額", "純額"): [make_result("doc-a:p1", 0.9)],
+            }
+        )
+        tool = HybridSearchTool(
+            semantic_tool=semantic,
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander([query], profile=profile),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        results, _, _ = tool.search(query, top_k=5)
+
+        self.assertEqual(keyword.calls[0][0], ("収益認識基準", "本人", "代理人", "支配", "総額", "純額"))
+        self.assertEqual([item.parent_id for item in results], ["doc-a:p1"])
+
+    def test_exact_query_uses_original_query_terms_instead_of_canonical_focus(self):
+        query = "企業会計基準第13号第10項では借手のリースをどのように扱いますか"
+        profile = QueryProfile(
+            query=query,
+            complexity="simple",
+            search_mode="keyword_first",
+            keywords=["企業会計基準第13号", "第10項", "借手", "リース"],
+            canonical_focus_query="企業に関する会計基準 借手",
+            corrective_query="企業に関する会計基準 借手",
+        )
+        semantic = FakeSemanticTool({})
+        keyword = FakeKeywordTool(
+            {
+                ("企業会計基準第13号", "第10項", "借手", "リース"): [make_result("doc-a:p1", 0.9)],
+            }
+        )
+        tool = HybridSearchTool(
+            semantic_tool=semantic,
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander([query], exact=True, profile=profile),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        results, _, _ = tool.search(query, top_k=5)
+
+        self.assertEqual(keyword.calls[0][0], ("企業会計基準第13号", "第10項", "借手", "リース"))
+        self.assertEqual([item.parent_id for item in results], ["doc-a:p1"])
+
+    def test_keyword_first_focus_query_adds_semantic_backfill_when_top_hit_is_too_narrow(self):
+        query = "収益認識基準における本人と代理人の区分はどう判断しますか"
+        profile = QueryProfile(
+            query=query,
+            complexity="moderate",
+            search_mode="keyword_first",
+            keywords=["本人", "代理人", "収益認識基準", "区分"],
+            canonical_focus_query="収益認識基準 本人 代理人 支配 総額 純額",
+            corrective_query="収益認識基準 本人 代理人 支配 総額 純額",
+        )
+        semantic = FakeSemanticTool({query: [make_result("doc-sem:p1", 0.9)]})
+        keyword = FakeKeywordTool(
+            {
+                ("収益認識基準", "本人", "代理人", "支配", "総額", "純額"): [
+                    SearchResult(
+                        chunk_id="doc-key:c1",
+                        parent_id="doc-key:p1",
+                        score=0.8,
+                        source="収益認識基準第29号 > 代理人として行動する場合の注記",
+                        snippet="代理人として行動する場合の開示例",
+                        text="代理人として行動する場合の注記例のみを示す。",
+                        metadata={"id": "doc-key:p1", "file": "doc-key.pdf"},
+                    )
+                ],
+            }
+        )
+        tool = HybridSearchTool(
+            semantic_tool=semantic,
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander([query], profile=profile),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        tool.search(query, top_k=5)
+
+        self.assertEqual([called_query for called_query, _ in semantic.calls], [query])
 
     def test_search_uses_semantic_only_for_primary_non_exact_query(self):
         semantic = FakeSemanticTool({"リース 会計": [make_result("doc-a:p1", 0.9)]})
@@ -470,6 +799,42 @@ class HybridSearchTests(unittest.TestCase):
         self.assertEqual(log["corrective_query"], "リースに関する会計基準 改正 使用権資産 リース負債")
         self.assertIn(("リースに関する会計基準 改正 使用権資産 リース負債",), [keywords for keywords, _ in keyword.calls])
         self.assertIn("企業会計基準第34号", text)
+
+    def test_execute_sets_current_search_query_to_effective_focus_query(self):
+        profile = QueryProfile(
+            query="繰延ヘッジを適用するための主な要件を教えてください",
+            complexity="simple",
+            search_mode="keyword_first",
+            keywords=["繰延ヘッジ", "要件"],
+            canonical_focus_query="ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+            corrective_query="ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+        )
+        keyword = FakeKeywordTool(
+            {
+                (
+                    "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+                ): [make_result("doc-a:p1", 0.9)]
+            }
+        )
+        tool = HybridSearchTool(
+            semantic_tool=FakeSemanticTool({}),
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander(
+                ["繰延ヘッジを適用するための主な要件を教えてください"],
+                profile=profile,
+            ),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+        context = AgentContext()
+
+        _, log = tool.execute(context, query=profile.query, top_k=3)
+
+        self.assertEqual(
+            context.current_search_query,
+            "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+        )
+        self.assertEqual(log["effective_query"], context.current_search_query)
 
 
 if __name__ == "__main__":

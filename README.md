@@ -9,6 +9,8 @@
 - Chunking: parent/child chunking。検索は child、表示と引用は parent
 - Infra: Cloud Run + GCS
 
+運用手順は [docs/operations_runbook.md](/workspace/accounting/accounting/docs/operations_runbook.md) を参照してください。通常デプロイ、corpus 更新、quality gate fail、secret rotation、Cloud Run rollback、誤引用対応、週次レビュー基準を 1 か所にまとめています。
+
 ## アプリ概要
 
 質問を受けると、エージェントが複数の検索ツールを使い分けて根拠を集め、最終回答を生成します。
@@ -54,20 +56,26 @@ src/
 frontend/
   src/routes/+page.svelte  チャット UI
 scripts/
+  corpus_pipeline.py       corpus 更新 / validate / rollback の統合ジョブ
   process_pdfs.py          PDF を parent/child chunk 化
   process_egov.py          e-Gov XML を parent/child chunk 化
   process_html_sources.py  HTML/PDF ソースを parent/child chunk 化
   process_full_texts.py    補助用の全文テキスト生成
   add_context.py           chunk に追加文脈を付与
   build_index.py           searchable chunk の埋め込み index 構築
+  source_manifest.py       source hash / fetched_at / version の manifest 管理
   eval_retrieval.py        retrieval 評価
   eval_answers.py          回答品質・速度評価
+  monitor_answer_eval.py   代表質問の定期監視
   deploy.sh                Cloud Run デプロイ
 eval/
   answer_eval_set.jsonl    回答評価ケース
 data/
   chunks.json
   pdf_sources.json
+  source_manifest.json
+  pipeline_runs/
+  releases/
   index/
 ```
 
@@ -146,24 +154,42 @@ uv run uvicorn src.api.main:app --host 0.0.0.0 --port 8080
 
 ## データ更新フロー
 
-最小構成の流れ:
+推奨フロー:
+
+```bash
+uv run python scripts/corpus_pipeline.py update
+```
+
+このジョブは次をまとめて実行します。
+
+- `data/pdf_sources.json` を使った PDF sync
+- `process_pdfs.py` / `process_html_sources.py --refresh` / `process_egov.py --refresh`
+- `build_index.py`
+- `source_manifest.json` の更新
+- `pipeline_runs/<run_id>/summary.json` の出力
+- `releases/<run_id>/` への snapshot 作成
+
+個別実行したい場合の最小構成:
 
 ```bash
 # 1. PDF / HTML / e-Gov から chunk を生成
-python scripts/process_pdfs.py
-python scripts/process_html_sources.py
-python scripts/process_egov.py
+uv run python scripts/download_pdfs.py
+uv run python scripts/process_pdfs.py
+uv run python scripts/process_html_sources.py --refresh
+uv run python scripts/process_egov.py --refresh
 
 # 2. 必要なら全文テキストや追加コンテキストを生成
-python scripts/process_full_texts.py
-python scripts/add_context.py
+uv run python scripts/process_full_texts.py
+uv run python scripts/add_context.py
 
 # 3. searchable chunk の index を構築
-python scripts/build_index.py
+uv run python scripts/build_index.py
 ```
 
 補足:
 
+- `source_manifest.json` には各 source file の `version` `fetched_at` `source_hash` `checked_at` を保存します
+- 再構築後の `chunks.json` には `source_version` `source_fetched_at` `source_hash` `source_url` を埋め込みます
 - `build_index.py` はチェックポイント付きで差分更新に対応しています
 - retrieval 候補を評価したい場合は `python scripts/eval_retrieval.py --write-candidates` を使います
 - 回答品質と速度の回帰を見たい場合は `python scripts/eval_answers.py` と `eval/answer_eval_set.jsonl` を使います
@@ -176,6 +202,19 @@ python scripts/build_index.py
 - e-Gov 法令キャッシュを更新した: `process_egov.py` のあとに `build_index.py`
 - 検索精度改善のため `context` を付与し直した: `add_context.py` のあとに `build_index.py`
 - `read_document` 用の補助テキストだけ更新したい: `process_full_texts.py` のみでも可
+
+integrity check:
+
+```bash
+uv run python scripts/corpus_pipeline.py validate
+```
+
+この validate は少なくとも次を確認します。
+
+- `chunks.json` に source metadata が入っていること
+- child chunk の `parent_id` が壊れていないこと
+- `source_manifest.json` と `chunks.json` の source path が一致すること
+- `sentence_meta.pkl` の chunk IDs が現在の `chunks.json` と整合すること
 
 重複回避のルール:
 
@@ -190,13 +229,55 @@ Cloud Run へのデプロイ:
 bash scripts/deploy.sh
 ```
 
+`scripts/deploy.sh` は既定で次の順に実行します。
+
+1. pre-deploy local subset eval (`gate_mode=hard`, 既定 3 ケース)
+2. Cloud Run deploy
+3. post-deploy production API eval (`gate_mode=hard`)
+
+レポートは既定で `eval/reports/deploy/` に出ます。hard gate を一時的に bypass する必要がある場合だけ、理由を残して実行します。
+
+```bash
+EVAL_OVERRIDE_REASON="temporary rollout for logging-only check" bash scripts/deploy.sh
+```
+
+主な env:
+
+- `RUN_PREDEPLOY_LOCAL_EVAL=0`: local subset gate をスキップ
+- `RUN_POSTDEPLOY_API_EVAL=0`: post-deploy API gate をスキップ
+- `EVAL_GATE_MODE=hard|strict|none`: gate の厳しさ
+- `EVAL_LOCAL_LIMIT=3`: pre-deploy のケース数
+- `EVAL_PROD_LIMIT=5`: post-deploy のケース数を絞るときに使う
+- `EVAL_OVERRIDE_REASON=...`: manual override 理由をレポートに残す
+- `EVAL_REPORT_DIR=...`: レポート出力先
+
+デプロイ前チェック:
+
+```bash
+uv run python scripts/corpus_pipeline.py validate
+uv run pytest tests/test_corpus_pipeline.py tests/test_agent_loop_control.py tests/test_agent_references.py
+```
+
 インデックスを GCS にアップロードする例:
 
 ```bash
 gsutil cp data/chunks.json gs://jp-accounting-chat-data/index/
 gsutil cp data/pdf_sources.json gs://jp-accounting-chat-data/index/
+gsutil cp data/source_manifest.json gs://jp-accounting-chat-data/index/
 gsutil cp data/index/sentence_index.npz gs://jp-accounting-chat-data/index/
 gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
+```
+
+版管理付きで置く例:
+
+```bash
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+gsutil cp data/chunks.json gs://jp-accounting-chat-data/index/releases/${RUN_ID}/
+gsutil cp data/pdf_sources.json gs://jp-accounting-chat-data/index/releases/${RUN_ID}/
+gsutil cp data/source_manifest.json gs://jp-accounting-chat-data/index/releases/${RUN_ID}/
+gsutil cp data/index/sentence_index.npz gs://jp-accounting-chat-data/index/releases/${RUN_ID}/
+gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/releases/${RUN_ID}/
+gsutil cp data/index/sentence_index.pkl gs://jp-accounting-chat-data/index/releases/${RUN_ID}/
 ```
 
 デプロイ時の前提:
@@ -205,6 +286,14 @@ gsutil cp data/index/sentence_meta.pkl gs://jp-accounting-chat-data/index/
 - 実行環境で `gcloud auth login` と `gcloud config set project jp-accounting-chat` が済んでいる必要があります
 - Cloud Run 上では `DEEPSEEK_API_KEY` を別途設定しておく必要があります。`deploy.sh` では非シークレット設定のみ更新します
 - 別環境へ出す場合は、先に `scripts/deploy.sh` の定数と GCS 設定を見直してください
+
+rollback:
+
+```bash
+uv run python scripts/corpus_pipeline.py rollback <run_id>
+```
+
+`data/releases/<run_id>/` に保存された `chunks.json` `pdf_sources.json` `source_manifest.json` `index/*` を現在の `data/` に戻します。Cloud Run / GCS を巻き戻す場合は、同じ `<run_id>` の release artifact を再アップロードしてください。
 
 ## 評価
 
@@ -229,9 +318,37 @@ uv run python scripts/eval_answers.py \
   --backend api \
   --api-url https://accounting-qa-xdt66erlqa-an.a.run.app \
   --cases eval/answer_eval_set.jsonl \
-  --format markdown \
-  --output eval/reports/prod_answer_eval.md \
-  --fail-on-fail
+  --gate-mode hard \
+  --json-output eval/reports/prod_answer_eval_gate.json \
+  --markdown-output eval/reports/prod_answer_eval_gate.md
+```
+
+gate mode:
+
+- `none`: レポートのみ。exit code では block しない
+- `hard`: 引用整合と重大品質 fail のみ block
+- `strict`: fail reason が 1 件でもあれば block
+
+`hard` で block するのは次です。
+
+- `missing_all`
+- `must_exclude`
+- `citations<...`
+- `missing_inline_citations`
+- `uncited_lines>...`
+- `reference_alignment_mismatch`
+- `missing_reference_urls`
+
+manual override が必要な場合は、理由を残して実行します。
+
+```bash
+uv run python scripts/eval_answers.py \
+  --backend api \
+  --api-url https://accounting-qa-xdt66erlqa-an.a.run.app \
+  --cases eval/answer_eval_set.jsonl \
+  --gate-mode hard \
+  --override-reason "known latency regression during index rebuild" \
+  --markdown-output eval/reports/prod_answer_eval_gate.md
 ```
 
 `eval/answer_eval_set.jsonl` の主な項目:
@@ -256,12 +373,59 @@ uv run python scripts/eval_answers.py \
 - baseline を更新するときは、少なくとも 2 回連続で full eval を回し、pass rate 100%、`max_uncited_lines=0` 維持、参照整合エラー 0 件を確認してから閾値を下げてください
 - `answer_eval` は本文品質だけでなく、無引用文、参照番号不整合、参照 URL 欠落も落とします。`/api/ask` は評価用に `references` と `source_url_map` も返します
 
+本番監視向けの代表質問チェック:
+
+```bash
+uv run python scripts/monitor_answer_eval.py \
+  --backend api \
+  --api-url https://accounting-qa-xdt66erlqa-an.a.run.app \
+  --limit 3 \
+  --output eval/reports/prod_monitor.json \
+  --fail-on-threshold
+```
+
+このスクリプトは PRD の目標値を既定値として使います。
+
+- `avg_latency_sec <= 35`
+- `p95_latency_sec <= 60`
+- `avg_loops <= 5`
+
+必要なら `--avg-latency-threshold` `--p95-latency-threshold` `--avg-loops-threshold` で上書きできます。API 実行時は `X-Monitor-Case-Id` を付けるので、Cloud Logging 上で代表質問だけを絞って確認できます。
+
+## Observability
+
+`/api/ask` と `/api/ask/stream` は request ごとに `X-Request-ID` を返し、回答 metadata にも `request_id` を含めます。frontend は既定で利用者向けの簡潔な summary chips を表示し、`開発表示` に切り替えると request id / stop reason / retrieved tokens / 実行 step を確認できます。回答 metadata には `evidence_coverage` と `uncertainty` も含めるので、未確定の論点を UI でも明示できます。
+
+Cloud Logging 向けの structured log は JSON 1 行で出力します。主な項目:
+
+- `request_id`
+- `monitor_case_id`
+- `query_class`
+- `search_mode`
+- `loops`
+- `tool_call_count`
+- `read_chunk_count`
+- `retrieved_tokens`
+- `stop_reason`
+- `reference_count`
+- `cited_reference_count`
+- `zero_reference`
+- `exploration_signature`
+- `elapsed_ms`
+
+`src/arag/agent.py` は retrieval 経路まで含む詳細ログ、`src/api/main.py` は HTTP request 単位の完了/失敗ログを出します。加えて `/api/ui-event` は `question_submitted` `followup_submitted` `answer_rendered` `reference_opened` を structured log に出すので、参照カード click-through と再質問率を Cloud Logging で集計できます。Cloud Run デプロイでは `APP_ENV=prod` `OBS_SERVICE=accounting-qa` と Cloud Run labels を設定するよう `scripts/deploy.sh` を更新しています。
+
 GitHub Actions:
 
 - `.github/workflows/answer-eval.yml` は `workflow_dispatch` と週次 schedule で実行します
-- repository variable `ACCOUNTING_QA_API_URL` を設定すると、デプロイ済み API に対して `scripts/eval_answers.py` を走らせ、Markdown レポートを artifact に保存します
-- workflow 側はまず計測レポートの蓄積を優先し、常時失敗にはしません。quality gate にしたい場合は手元や別 workflow で `--fail-on-fail` を付けます
-- レポートでは `Avg uncited lines`、`Reference alignment failures`、`Missing reference URL failures` を確認してください。これらが 0 でない場合は、pass rate だけ見てデプロイ判断しない方が安全です
+- `workflow_dispatch` では `gate_mode` `local_limit` `override_reason` を指定できます
+- repository variable `ACCOUNTING_QA_API_URL` を設定すると、deployed API に対する production gate も実行します
+- local subset gate は `eval/reports/local_answer_eval_gate.{md,json}`、production gate は `eval/reports/prod_answer_eval_gate.{md,json}` を artifact に保存します
+- manual override を使う場合は `override_reason` を空にしないでください。理由は report と `GITHUB_STEP_SUMMARY` に残ります
+- repository variable / secret の設定:
+  - `ACCOUNTING_QA_API_URL`: デプロイ済み API の `/api/ask` ベース URL
+  - `DEEPSEEK_API_KEY`: local eval や deploy 時に使う LLM key
+- レポートでは `Gate passed` `Blocking case IDs` `Reference alignment failures` `Missing reference URL failures` を優先確認してください
 
 ## トラブルシュート
 

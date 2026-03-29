@@ -8,15 +8,44 @@ from urllib.parse import urljoin
 
 import httpx
 
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from .source_manifest import manifest_path, upsert_source_record
+except ImportError:
+    from source_manifest import manifest_path, upsert_source_record
 
-async def download_pdf(client: httpx.AsyncClient, url: str, output_path: Path) -> bool:
+
+async def download_pdf(
+    client: httpx.AsyncClient,
+    url: str,
+    output_path: Path,
+    *,
+    data_dir: Path,
+    manifest_file: Path,
+) -> bool:
     if output_path.exists() and output_path.stat().st_size > 0:
+        upsert_source_record(
+            manifest_file,
+            file_path=output_path.resolve(),
+            data_dir=data_dir,
+            url=url,
+            source_group=output_path.resolve().relative_to(data_dir.resolve()).as_posix().split("/", 1)[0],
+            kind="pdf",
+        )
         print(f"  Skip (exists): {output_path.name}")
         return True
     try:
         resp = await client.get(url, follow_redirects=True)
         resp.raise_for_status()
         output_path.write_bytes(resp.content)
+        upsert_source_record(
+            manifest_file,
+            file_path=output_path.resolve(),
+            data_dir=data_dir,
+            url=url,
+            source_group=output_path.resolve().relative_to(data_dir.resolve()).as_posix().split("/", 1)[0],
+            kind="pdf",
+        )
         print(f"  Downloaded: {output_path.name} ({len(resp.content) // 1024} KB)")
         return True
     except Exception as e:
@@ -24,7 +53,14 @@ async def download_pdf(client: httpx.AsyncClient, url: str, output_path: Path) -
         return False
 
 
-async def scrape_and_download(client: httpx.AsyncClient, page_url: str, output_dir: Path) -> int:
+async def scrape_and_download(
+    client: httpx.AsyncClient,
+    page_url: str,
+    output_dir: Path,
+    *,
+    data_dir: Path,
+    manifest_file: Path,
+) -> int:
     """Scrape a page for PDF links and download them."""
     try:
         resp = await client.get(page_url, follow_redirects=True)
@@ -44,7 +80,7 @@ async def scrape_and_download(client: httpx.AsyncClient, page_url: str, output_d
     count = 0
     for url in urls:
         filename = Path(url).name
-        if await download_pdf(client, url, output_dir / filename):
+        if await download_pdf(client, url, output_dir / filename, data_dir=data_dir, manifest_file=manifest_file):
             count += 1
     return count
 
@@ -141,6 +177,8 @@ REGULATIONS_PAGES = [
 
 async def main():
     base_dir = Path("data/pdfs")
+    data_dir = base_dir.parent
+    manifest_file = manifest_path(data_dir)
 
     async with httpx.AsyncClient(
         timeout=120,
@@ -154,22 +192,22 @@ async def main():
         bac_dir = base_dir / "bac"
         bac_dir.mkdir(parents=True, exist_ok=True)
         for url, filename in BAC_PDFS:
-            if await download_pdf(client, url, bac_dir / filename):
+            if await download_pdf(client, url, bac_dir / filename, data_dir=data_dir, manifest_file=manifest_file):
                 total += 1
         for page in BAC_PAGES:
             print(f"  Scraping: {page}")
-            total += await scrape_and_download(client, page, bac_dir)
+            total += await scrape_and_download(client, page, bac_dir, data_dir=data_dir, manifest_file=manifest_file)
 
         # 2. JICPA
         print("\n=== 2. JICPA 実務指針 ===")
         jicpa_dir = base_dir / "jicpa"
         jicpa_dir.mkdir(parents=True, exist_ok=True)
         for url, filename in JICPA_PDFS:
-            if await download_pdf(client, url, jicpa_dir / filename):
+            if await download_pdf(client, url, jicpa_dir / filename, data_dir=data_dir, manifest_file=manifest_file):
                 total += 1
         for page in JICPA_PAGES:
             print(f"  Scraping: {page}")
-            total += await scrape_and_download(client, page, jicpa_dir)
+            total += await scrape_and_download(client, page, jicpa_dir, data_dir=data_dir, manifest_file=manifest_file)
 
         # 3. SSBJ
         print("\n=== 3. SSBJ ===")
@@ -177,18 +215,18 @@ async def main():
         ssbj_dir.mkdir(parents=True, exist_ok=True)
         for page in SSBJ_PAGES:
             print(f"  Scraping: {page}")
-            total += await scrape_and_download(client, page, ssbj_dir)
+            total += await scrape_and_download(client, page, ssbj_dir, data_dir=data_dir, manifest_file=manifest_file)
 
         # 4. 財務諸表等規則
         print("\n=== 4. 財務諸表等規則 ===")
         reg_dir = base_dir / "regulations"
         reg_dir.mkdir(parents=True, exist_ok=True)
         for url, filename in REGULATIONS_PDFS:
-            if await download_pdf(client, url, reg_dir / filename):
+            if await download_pdf(client, url, reg_dir / filename, data_dir=data_dir, manifest_file=manifest_file):
                 total += 1
         for page in REGULATIONS_PAGES:
             print(f"  Scraping: {page}")
-            total += await scrape_and_download(client, page, reg_dir)
+            total += await scrape_and_download(client, page, reg_dir, data_dir=data_dir, manifest_file=manifest_file)
 
         print(f"\n=== Total: {total} files downloaded ===")
 

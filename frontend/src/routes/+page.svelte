@@ -1,31 +1,82 @@
 <script lang="ts">
+  import { browser } from '$app/environment';
+  import { onMount } from 'svelte';
+
   interface Reference {
     id: string;
     source: string;
     text: string;
     url?: string;
     display_number?: number;
+    doc_type?: string;
+    doc_title?: string;
+    section_title?: string;
+    section_label?: string;
+    page_label?: string;
+    standard_no?: string | null;
+  }
+
+  interface EvidenceCoverage {
+    slots?: string[];
+    covered_slots?: string[];
+    uncovered_slots?: string[];
+    coverage_ratio?: number;
+  }
+
+  interface AnswerUncertainty {
+    present?: boolean;
+    insufficient_points?: string[];
+    covered_points?: string[];
+    coverage_ratio?: number;
+    note?: string;
+  }
+
+  interface ToolStep {
+    tool: string;
+    label: string;
+    detail?: string;
   }
 
   interface Message {
     role: 'user' | 'assistant' | 'status';
     content: string;
     metadata?: {
+      request_id?: string;
+      query_class?: string;
       loops?: number;
       chunks_read_count?: number;
       read_chunk_count?: number;
       total_cost?: number;
+      total_retrieved_tokens?: number;
+      stop_reason?: string;
       references?: Reference[];
       source_url_map?: Record<string, string>;
+      evidence_coverage?: EvidenceCoverage;
+      uncertainty?: AnswerUncertainty;
+      steps?: ToolStep[];
     };
   }
 
   let messages: Message[] = $state([]);
   let input = $state('');
   let loading = $state(false);
+  let developerMode = $state(false);
   let chatContainer: HTMLElement;
 
   const API_BASE = import.meta.env.DEV ? 'http://localhost:8000' : '';
+
+  onMount(() => {
+    if (browser) {
+      developerMode = window.localStorage.getItem('arag:developer-mode') === '1';
+    }
+  });
+
+  function setDeveloperMode(enabled: boolean) {
+    developerMode = enabled;
+    if (browser) {
+      window.localStorage.setItem('arag:developer-mode', enabled ? '1' : '0');
+    }
+  }
 
   function scrollToBottom() {
     if (chatContainer) {
@@ -45,6 +96,160 @@
 
   function getDisplayedReadCount(message: Message): number | string {
     return message.metadata?.read_chunk_count ?? '?';
+  }
+
+  function getDisplayedRequestId(message: Message): string | null {
+    return message.metadata?.request_id ?? null;
+  }
+
+  function compactLabel(text: string | null | undefined): string {
+    return (text ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  function trimLabel(text: string, limit = 44): string {
+    const cleaned = compactLabel(text);
+    if (!cleaned) return '';
+    if (cleaned.length <= limit) return cleaned;
+    return `${cleaned.slice(0, limit - 1).trimEnd()}…`;
+  }
+
+  function inferDocType(ref: Reference): string {
+    const haystack = compactLabel(ref.doc_title ?? ref.source);
+    for (const token of [
+      '企業会計基準適用指針',
+      '企業会計基準',
+      '実務対応報告',
+      '会計制度委員会報告',
+      '企業会計原則',
+      '原価計算基準',
+      '注解',
+      '法令',
+      'IFRS関連情報',
+      '中小企業会計',
+    ]) {
+      if (haystack.includes(token)) return token;
+    }
+    return '参考資料';
+  }
+
+  function getReferenceDocType(ref: Reference): string {
+    return compactLabel(ref.doc_type) || inferDocType(ref);
+  }
+
+  function getReferenceDocTitle(ref: Reference): string {
+    return compactLabel(ref.doc_title) || compactLabel(ref.source.split('>')[0] ?? ref.source);
+  }
+
+  function getReferenceSectionLabel(ref: Reference): string {
+    return (
+      compactLabel(ref.section_label) ||
+      trimLabel(compactLabel(ref.section_title) || compactLabel(ref.source.split('>').slice(1).join(' > '))) ||
+      compactLabel(ref.page_label) ||
+      '該当箇所'
+    );
+  }
+
+  function getReferencePageLabel(ref: Reference): string {
+    return compactLabel(ref.page_label);
+  }
+
+  function getReferencePreview(ref: Reference): string {
+    const preview = compactLabel(ref.text);
+    return preview.length > 200 ? `${preview.slice(0, 200)}…` : preview;
+  }
+
+  function extractInsufficientPoints(text: string): string[] {
+    const points: string[] = [];
+    const seen = new Set<string>();
+    const matches = text.matchAll(/^\s*[-・•*]\s*([^:：\n]+?)\s*[:：]\s*今回確認できた根拠では不十分/gm);
+    for (const match of matches) {
+      const label = compactLabel(match[1]);
+      if (label && !seen.has(label)) {
+        seen.add(label);
+        points.push(label);
+      }
+    }
+    return points;
+  }
+
+  function getUncertainty(message: Message): AnswerUncertainty | null {
+    const explicit = message.metadata?.uncertainty;
+    if (explicit?.present || explicit?.insufficient_points?.length || explicit?.note) {
+      return {
+        present: Boolean(explicit.present ?? explicit.insufficient_points?.length),
+        insufficient_points: explicit.insufficient_points ?? [],
+        covered_points: explicit.covered_points ?? [],
+        coverage_ratio: explicit.coverage_ratio ?? message.metadata?.evidence_coverage?.coverage_ratio ?? 0,
+        note: explicit.note ?? '',
+      };
+    }
+
+    const uncovered = message.metadata?.evidence_coverage?.uncovered_slots ?? [];
+    const extracted = extractInsufficientPoints(message.content);
+    const insufficient = [...new Set([...uncovered, ...extracted].map((item) => compactLabel(item)).filter(Boolean))];
+    if (insufficient.length === 0 && !message.content.includes('今回確認できた根拠では不十分')) {
+      return null;
+    }
+    return {
+      present: true,
+      insufficient_points: insufficient,
+      covered_points: message.metadata?.evidence_coverage?.covered_slots ?? [],
+      coverage_ratio: message.metadata?.evidence_coverage?.coverage_ratio ?? 0,
+      note: insufficient.length > 0 ? '未確定の論点があります。参照カードは確認できた範囲の原典です。' : '',
+    };
+  }
+
+  function buildToolStep(toolName: string, args: Record<string, unknown>): ToolStep {
+    if (toolName === 'hybrid_search' || toolName === 'keyword_search' || toolName === 'semantic_search') {
+      const labelMap: Record<string, string> = {
+        hybrid_search: '検索',
+        keyword_search: 'キーワード検索',
+        semantic_search: '意味検索',
+      };
+      const query = typeof args.query === 'string' ? compactLabel(args.query) : '';
+      return {
+        tool: toolName,
+        label: query ? `${labelMap[toolName]}: 「${query}」` : labelMap[toolName],
+      };
+    }
+
+    if (toolName === 'read_chunk') {
+      const ids = Array.isArray(args.chunk_ids) ? args.chunk_ids : [];
+      return {
+        tool: toolName,
+        label: '条文を確認',
+        detail: `${ids.length || 1}件`,
+      };
+    }
+
+    if (toolName === 'read_document') {
+      const docName = compactLabel(String(args.document_name ?? args.filename ?? ''));
+      return {
+        tool: toolName,
+        label: '文書全体を確認',
+        detail: docName || '文書指定なし',
+      };
+    }
+
+    return {
+      tool: toolName,
+      label: `${toolName} を実行`,
+    };
+  }
+
+  function trackUiEvent(event: string, payload: Record<string, unknown> = {}) {
+    if (!browser) return;
+    const detail = { event, ...payload };
+    const trackedWindow = window as Window & { __aragUiEvents?: Array<Record<string, unknown>> };
+    trackedWindow.__aragUiEvents = trackedWindow.__aragUiEvents ?? [];
+    trackedWindow.__aragUiEvents.push(detail);
+    window.dispatchEvent(new CustomEvent('arag-ui-event', { detail }));
+    void fetch(`${API_BASE}/api/ui-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(detail),
+      keepalive: true,
+    }).catch(() => {});
   }
 
   function getChunkUrl(ref: Reference): string {
@@ -79,9 +284,35 @@
     }
   }
 
+  function handleReferenceOpen(ref: Reference, idx: number, message: Message) {
+    const uncertainty = getUncertainty(message);
+    trackUiEvent('reference_opened', {
+      request_id: message.metadata?.request_id ?? null,
+      reference_number: getDisplayNumber(ref, idx),
+      reference_id: ref.id,
+      reference_count: message.metadata?.references?.length ?? 0,
+      uncertainty_present: Boolean(uncertainty?.present),
+      developer_mode: developerMode,
+    });
+  }
+
   async function sendMessage() {
     const question = input.trim();
     if (!question || loading) return;
+
+    const priorAnswerCount = messages.filter((message) => message.role === 'assistant').length;
+    trackUiEvent('question_submitted', {
+      question_length: question.length,
+      prior_answer_count: priorAnswerCount,
+      developer_mode: developerMode,
+    });
+    if (priorAnswerCount > 0) {
+      trackUiEvent('followup_submitted', {
+        question_length: question.length,
+        prior_answer_count: priorAnswerCount,
+        developer_mode: developerMode,
+      });
+    }
 
     input = '';
     loading = true;
@@ -124,6 +355,7 @@
       let streamingStarted = false;
       let answerIdx = -1;
       let collectedRefs: Reference[] = [];
+      let collectedSteps: ToolStep[] = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -146,6 +378,7 @@
             } else if (event.type === 'tool_call') {
               const toolName = event.data.tool;
               const args = event.data.args || {};
+              collectedSteps = [...collectedSteps, buildToolStep(toolName, args)];
               let statusContent = '';
               if (toolName === 'hybrid_search' || toolName === 'keyword_search' || toolName === 'semantic_search') {
                 const labelMap: Record<string, string> = {
@@ -221,7 +454,8 @@
               // Merge collected references into metadata
               const metadata = {
                 ...event.data,
-                references: collectedRefs.length > 0 ? collectedRefs : event.data.references,
+                references: collectedRefs.length > 0 ? collectedRefs : Array.isArray(event.data.references) ? event.data.references : [],
+                steps: collectedSteps,
               };
               if (!streamingStarted) {
                 // Non-streaming fallback
@@ -244,6 +478,12 @@
                   messages = [...messages];
                 }
               }
+              trackUiEvent('answer_rendered', {
+                request_id: metadata.request_id ?? null,
+                reference_count: metadata.references?.length ?? 0,
+                uncertainty_present: Boolean(metadata.uncertainty?.present),
+                developer_mode: developerMode,
+              });
             }
             // Only auto-scroll for non-streaming events (status, tool_call)
             if (!streamingStarted) {
@@ -521,10 +761,32 @@
   <div class="scroll-outer" bind:this={chatContainer}>
     <header>
       <div class="header-wrap">
-        <button class="header-inner" onclick={resetChat}>
-          <h1>会計基準 Q&A</h1>
-          <p class="subtitle">日本の会計基準についてAIが回答します</p>
-        </button>
+        <div class="header-row">
+          <button class="header-inner" onclick={resetChat}>
+            <h1>会計基準 Q&A</h1>
+            <p class="subtitle">日本の会計基準についてAIが回答します</p>
+          </button>
+          <div class="view-toggle" data-testid="view-toggle">
+            <button
+              class:active={!developerMode}
+              class="view-toggle-btn"
+              data-testid="view-toggle-user"
+              onclick={() => setDeveloperMode(false)}
+              type="button"
+            >
+              利用者表示
+            </button>
+            <button
+              class:active={developerMode}
+              class="view-toggle-btn"
+              data-testid="view-toggle-developer"
+              onclick={() => setDeveloperMode(true)}
+              type="button"
+            >
+              開発表示
+            </button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -567,44 +829,121 @@
               {@html formatMarkdown(msg.content, msg.metadata?.references ?? [])}
             </div>
 
+            {#if msg.metadata}
+              <div class="answer-summary" data-testid="answer-summary">
+                <span class="answer-chip">検索 {msg.metadata.loops ?? '?'} 回</span>
+                <span class="answer-chip">引用 {getDisplayedCitationCount(msg)} 件</span>
+                <span class="answer-chip">確認候補 {getDisplayedReadCount(msg)} 件</span>
+                {#if getUncertainty(msg)?.present}
+                  <span class="answer-chip warning">
+                    未確定 {getUncertainty(msg)?.insufficient_points?.length || 'あり'}
+                  </span>
+                {/if}
+              </div>
+            {/if}
+
+            {#if getUncertainty(msg)?.present}
+              <div class="uncertainty-banner" data-testid="uncertainty-banner">
+                <div class="uncertainty-eyebrow">未確定の論点</div>
+                <div class="uncertainty-title">この回答は一部の論点で根拠が不足しています</div>
+                <p class="uncertainty-copy">
+                  {getUncertainty(msg)?.note || '参照カードは、確認できた範囲の原典だけを示しています。'}
+                </p>
+                {#if getUncertainty(msg)?.insufficient_points?.length}
+                  <div class="uncertainty-points">
+                    {#each getUncertainty(msg)?.insufficient_points ?? [] as point}
+                      <span class="uncertainty-chip">{point}</span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+
             {#if msg.metadata?.references?.length}
               <div class="sources-section" data-testid="references-section">
-                <div class="sources-label">参照 ({getDisplayedReferenceCount(msg)}件)</div>
+                <div class="sources-header">
+                  <div>
+                    <div class="sources-label">参照 ({getDisplayedReferenceCount(msg)}件)</div>
+                    <div class="sources-caption">本文の引用番号と同じ順に、原典へそのまま移動できます。</div>
+                  </div>
+                  {#if getUncertainty(msg)?.present}
+                    <div class="sources-caution">未確定の論点は上の注意表示で明示しています</div>
+                  {/if}
+                </div>
                 <div class="sources-list">
                   {#each msg.metadata.references as ref, idx}
                     <div class="source-card" data-testid="reference-card" data-reference-number={getDisplayNumber(ref, idx)}>
                       <div class="source-card-header">
-                        <span class="source-ref-number">[{getDisplayNumber(ref, idx)}]</span>
+                        <div class="source-card-meta-row">
+                          <span class="source-ref-number">[{getDisplayNumber(ref, idx)}]</span>
+                          <span class="source-doc-type" data-testid="reference-doc-type">{getReferenceDocType(ref)}</span>
+                          {#if getReferencePageLabel(ref)}
+                            <span class="source-page-chip">{getReferencePageLabel(ref)}</span>
+                          {/if}
+                        </div>
+                        <button class="copy-btn" title="テキストをコピー（PDF内Ctrl+F用）" onclick={() => copyChunkText(ref)}>
+                          {copiedRefId === ref.id ? '✓' : '⎘'}
+                        </button>
+                      </div>
+                      <div class="source-card-title-row">
                         {#if ref.url}
                           <a
-                            class="source-chip-link"
+                            class="source-card-title"
                             data-testid="reference-link"
                             data-reference-number={getDisplayNumber(ref, idx)}
                             href={getChunkUrl(ref)}
                             target="_blank"
                             rel="noopener noreferrer"
+                            onclick={() => handleReferenceOpen(ref, idx, msg)}
                           >
-                            {ref.source.split('>')[0].trim()}<span class="ref-link-icon">&#x2197;</span>
+                            <span data-testid="reference-doc-title">{getReferenceDocTitle(ref)}</span><span class="ref-link-icon">&#x2197;</span>
                           </a>
                         {:else}
-                          <span class="source-card-name">{ref.source.split('>')[0].trim()}</span>
+                          <span class="source-card-title" data-testid="reference-doc-title">{getReferenceDocTitle(ref)}</span>
                         {/if}
-                        <button class="copy-btn" title="テキストをコピー（PDF内Ctrl+F用）" onclick={() => copyChunkText(ref)}>
-                          {copiedRefId === ref.id ? '✓' : '⎘'}
-                        </button>
                       </div>
-                      <div class="source-card-text">{ref.text.slice(0, 200)}{ref.text.length > 200 ? '…' : ''}</div>
+                      <div class="source-card-section" data-testid="reference-section-label">{getReferenceSectionLabel(ref)}</div>
+                      <div class="source-card-text">{getReferencePreview(ref)}</div>
                     </div>
                   {/each}
                 </div>
               </div>
             {/if}
-            {#if msg.metadata}
-              <div class="meta">
-                検索ステップ: {msg.metadata.loops ?? '?'} |
-                引用: {getDisplayedCitationCount(msg)}件 |
-                候補: {getDisplayedReadCount(msg)}件
-              </div>
+
+            {#if developerMode && msg.metadata}
+              <details class="developer-panel" data-testid="developer-panel" open>
+                <summary>開発者詳細</summary>
+                <div class="developer-grid">
+                  <div class="developer-field">
+                    <span class="developer-field-label">Query Class</span>
+                    <span class="developer-field-value">{msg.metadata.query_class ?? '?'}</span>
+                  </div>
+                  <div class="developer-field">
+                    <span class="developer-field-label">Stop Reason</span>
+                    <span class="developer-field-value">{msg.metadata.stop_reason ?? '?'}</span>
+                  </div>
+                  <div class="developer-field">
+                    <span class="developer-field-label">Retrieved Tokens</span>
+                    <span class="developer-field-value">{msg.metadata.total_retrieved_tokens ?? '?'}</span>
+                  </div>
+                  <div class="developer-field">
+                    <span class="developer-field-label">Request ID</span>
+                    <span class="developer-field-value" data-testid="developer-request-id">{getDisplayedRequestId(msg) ?? '?'}</span>
+                  </div>
+                </div>
+                {#if msg.metadata.steps?.length}
+                  <ol class="developer-steps">
+                    {#each msg.metadata.steps as step}
+                      <li class="developer-step">
+                        <span class="developer-step-label">{step.label}</span>
+                        {#if step.detail}
+                          <span class="developer-step-detail">{step.detail}</span>
+                        {/if}
+                      </li>
+                    {/each}
+                  </ol>
+                {/if}
+              </details>
             {/if}
           </div>
         </div>
@@ -683,6 +1022,13 @@
     margin: 0 auto;
   }
 
+  .header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
   .header-inner {
     background: none;
     border: none;
@@ -708,6 +1054,35 @@
     font-size: 0.8rem;
     color: #8b8b95;
     margin-top: 0.15rem;
+  }
+
+  .view-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem;
+    border: 1px solid #2a2a35;
+    border-radius: 999px;
+    background: rgba(24, 24, 32, 0.9);
+  }
+
+  .view-toggle-btn {
+    border: none;
+    background: transparent;
+    color: #8b8b95;
+    padding: 0.45rem 0.8rem;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .view-toggle-btn.active {
+    background: linear-gradient(135deg, #1d4ed8, #2563eb);
+    color: #f8fbff;
+    box-shadow: 0 8px 18px rgba(37, 99, 235, 0.28);
   }
 
   main {
@@ -842,56 +1217,168 @@
     opacity: 0.7;
   }
 
+  .answer-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin-top: 0.85rem;
+  }
+
+  .answer-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.3rem 0.65rem;
+    border-radius: 999px;
+    border: 1px solid #2c3444;
+    background: #171d29;
+    color: #b4c2d8;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .answer-chip.warning {
+    border-color: #6b4f1d;
+    background: #2d2211;
+    color: #f0cd87;
+  }
+
+  .uncertainty-banner {
+    margin-top: 0.85rem;
+    padding: 0.95rem 1rem;
+    border-radius: 0.85rem;
+    border: 1px solid #6b4f1d;
+    background:
+      linear-gradient(135deg, rgba(133, 77, 14, 0.2), rgba(54, 40, 16, 0.92)),
+      #21170b;
+  }
+
+  .uncertainty-eyebrow {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #f0cd87;
+  }
+
+  .uncertainty-title {
+    margin-top: 0.25rem;
+    color: #fff0cf;
+    font-size: 0.95rem;
+    font-weight: 700;
+  }
+
+  .uncertainty-copy {
+    margin-top: 0.35rem;
+    color: #e8d6b3;
+    font-size: 0.8rem;
+    line-height: 1.6;
+  }
+
+  .uncertainty-points {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin-top: 0.65rem;
+  }
+
+  .uncertainty-chip {
+    padding: 0.28rem 0.6rem;
+    border-radius: 999px;
+    background: rgba(255, 243, 214, 0.09);
+    border: 1px solid rgba(240, 205, 135, 0.28);
+    color: #ffe4aa;
+    font-size: 0.72rem;
+    font-weight: 600;
+  }
+
   .sources-section {
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
+    margin-top: 0.9rem;
+    padding-top: 0.9rem;
     border-top: 1px solid #2a2a35;
   }
 
+  .sources-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.55rem;
+  }
+
   .sources-label {
+    font-size: 0.72rem;
+    color: #727888;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .sources-caption {
+    margin-top: 0.2rem;
+    color: #787f8f;
+    font-size: 0.74rem;
+    line-height: 1.5;
+  }
+
+  .sources-caution {
+    max-width: 230px;
+    padding: 0.35rem 0.55rem;
+    border-radius: 0.6rem;
+    background: rgba(133, 77, 14, 0.14);
+    border: 1px solid rgba(240, 205, 135, 0.14);
+    color: #d5b26f;
     font-size: 0.7rem;
-    color: #52525b;
-    margin-bottom: 0.4rem;
+    line-height: 1.4;
   }
 
   .sources-list {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.35rem;
+    flex-direction: column;
+    gap: 0.5rem;
   }
-
-  .source-chip-link {
-    color: #60a5fa;
-    text-decoration: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.2rem;
-    font-size: 0.73rem;
-    font-weight: 500;
-  }
-
-  .source-chip-link:hover { text-decoration: underline; }
 
   .source-card {
-    background: #131318;
-    border: 1px solid #2a2a35;
-    border-radius: 0.5rem;
-    padding: 0.5rem 0.65rem;
+    background:
+      radial-gradient(circle at top right, rgba(37, 99, 235, 0.12), transparent 36%),
+      #131823;
+    border: 1px solid #273044;
+    border-radius: 0.85rem;
+    padding: 0.8rem 0.9rem;
     width: 100%;
   }
 
   .source-card-header {
     display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    margin-bottom: 0.3rem;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
   }
 
   .source-ref-number {
     color: #f4f4f5;
-    font-size: 0.73rem;
+    font-size: 0.72rem;
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
+  }
+
+  .source-card-meta-row {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+
+  .source-doc-type,
+  .source-page-chip {
+    padding: 0.18rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid #30415f;
+    background: #1a2334;
+    color: #9eb4d8;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
   }
 
   .copy-btn {
@@ -907,25 +1394,104 @@
   }
   .copy-btn:hover { color: #a1a1aa; }
 
-  .source-card-name {
-    color: #a1a1aa;
-    font-size: 0.73rem;
-    font-weight: 500;
+  .source-card-title-row {
+    margin-top: 0.45rem;
+  }
+
+  .source-card-title {
+    color: #f5f8ff;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    font-size: 0.92rem;
+    font-weight: 700;
+    line-height: 1.5;
+  }
+
+  .source-card-title:hover {
+    color: #b8d0ff;
+    text-decoration: underline;
+  }
+
+  .source-card-section {
+    margin-top: 0.2rem;
+    color: #8ea4c9;
+    font-size: 0.76rem;
+    font-weight: 600;
   }
 
   .source-card-text {
-    color: #71717a;
-    font-size: 0.7rem;
-    line-height: 1.5;
+    margin-top: 0.5rem;
+    color: #98a2b6;
+    font-size: 0.74rem;
+    line-height: 1.6;
     white-space: pre-wrap;
   }
 
-  .meta {
-    margin-top: 0.5rem;
-    padding-top: 0.5rem;
+  .developer-panel {
+    margin-top: 0.9rem;
+    padding-top: 0.85rem;
     border-top: 1px solid #2a2a35;
-    font-size: 0.7rem;
-    color: #5a5a65;
+  }
+
+  .developer-panel summary {
+    cursor: pointer;
+    color: #8fa8d4;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .developer-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.6rem;
+    margin-top: 0.75rem;
+  }
+
+  .developer-field {
+    padding: 0.65rem 0.75rem;
+    border-radius: 0.7rem;
+    border: 1px solid #273044;
+    background: #111725;
+  }
+
+  .developer-field-label {
+    display: block;
+    color: #69758d;
+    font-size: 0.67rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .developer-field-value {
+    display: block;
+    margin-top: 0.18rem;
+    color: #d4def1;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .developer-steps {
+    margin: 0.8rem 0 0;
+    padding-left: 1.15rem;
+    color: #9aa7bf;
+  }
+
+  .developer-step {
+    margin-bottom: 0.45rem;
+  }
+
+  .developer-step-label {
+    color: #d4def1;
+  }
+
+  .developer-step-detail {
+    margin-left: 0.35rem;
+    color: #8fa8d4;
+    font-size: 0.76rem;
   }
 
   footer {
@@ -1122,12 +1688,34 @@
       max-width: 95%;
     }
 
+    .header-row {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .view-toggle {
+      width: 100%;
+      justify-content: space-between;
+    }
+
+    .view-toggle-btn {
+      flex: 1 1 0;
+    }
+
     main {
       padding: 1rem;
     }
 
     header {
       padding: 0.75rem 1rem;
+    }
+
+    .sources-header {
+      flex-direction: column;
+    }
+
+    .developer-grid {
+      grid-template-columns: 1fr;
     }
 
     footer {

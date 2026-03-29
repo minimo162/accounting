@@ -57,7 +57,9 @@ node_modules/
 
 # Local generated data
 data/egov_cache/
+data/html_cache/
 data/full_texts.json
+data/source_manifest.json
 eng.traineddata
 eval/reports/
 

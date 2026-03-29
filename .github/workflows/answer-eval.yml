@@ -2,6 +2,26 @@ name: answer-eval
 
 on:
   workflow_dispatch:
+    inputs:
+      gate_mode:
+        description: Gate mode for release checks
+        required: false
+        default: hard
+        type: choice
+        options:
+          - hard
+          - strict
+          - none
+      local_limit:
+        description: Number of local cases to run before deploy
+        required: false
+        default: "3"
+        type: string
+      override_reason:
+        description: Manual override reason for a failing gate
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "0 22 * * 0"
 
@@ -9,6 +29,10 @@ jobs:
   answer-eval:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      GATE_MODE: ${{ inputs.gate_mode || 'hard' }}
+      LOCAL_LIMIT: ${{ inputs.local_limit || '3' }}
+      OVERRIDE_REASON: ${{ inputs.override_reason || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -25,24 +49,64 @@ jobs:
       - name: Run unit tests
         run: uv run python -m unittest discover -s tests
 
-      - name: Run deployed answer eval
-        if: ${{ vars.ACCOUNTING_QA_API_URL != '' }}
+      - name: Run local subset gate
         run: |
           mkdir -p eval/reports
+          override_args=()
+          if [ -n "${OVERRIDE_REASON}" ]; then
+            override_args+=(--override-reason "${OVERRIDE_REASON}")
+          fi
+          uv run python scripts/eval_answers.py \
+            --backend local \
+            --cases eval/answer_eval_set.jsonl \
+            --limit "${LOCAL_LIMIT}" \
+            --gate-mode "${GATE_MODE}" \
+            --format markdown \
+            --json-output eval/reports/local_answer_eval_gate.json \
+            --markdown-output eval/reports/local_answer_eval_gate.md \
+            "${override_args[@]}"
+
+      - name: Run deployed answer eval gate
+        if: ${{ vars.ACCOUNTING_QA_API_URL != '' }}
+        run: |
+          override_args=()
+          if [ -n "${OVERRIDE_REASON}" ]; then
+            override_args+=(--override-reason "${OVERRIDE_REASON}")
+          fi
           uv run python scripts/eval_answers.py \
             --backend api \
             --api-url "${{ vars.ACCOUNTING_QA_API_URL }}" \
             --cases eval/answer_eval_set.jsonl \
+            --gate-mode "${GATE_MODE}" \
             --format markdown \
-            --output eval/reports/answer_eval.md
+            --json-output eval/reports/prod_answer_eval_gate.json \
+            --markdown-output eval/reports/prod_answer_eval_gate.md \
+            "${override_args[@]}"
 
       - name: Repository variable hint
         if: ${{ vars.ACCOUNTING_QA_API_URL == '' }}
         run: echo "Set repository variable ACCOUNTING_QA_API_URL to enable deployed answer eval."
 
-      - name: Upload answer eval report
-        if: ${{ always() && vars.ACCOUNTING_QA_API_URL != '' }}
+      - name: Publish workflow summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Answer Eval Gate"
+            echo ""
+            echo "- Gate mode: ${GATE_MODE}"
+            if [ -n "${OVERRIDE_REASON}" ]; then
+              echo "- Override reason: ${OVERRIDE_REASON}"
+            fi
+            echo "- Local subset report: \`eval/reports/local_answer_eval_gate.md\`"
+            if [ -f eval/reports/prod_answer_eval_gate.md ]; then
+              echo "- Production report: \`eval/reports/prod_answer_eval_gate.md\`"
+              echo "- Production API URL: ${{ vars.ACCOUNTING_QA_API_URL }}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload answer eval reports
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: answer-eval-report
-          path: eval/reports/answer_eval.md
+          name: answer-eval-reports
+          path: eval/reports/*answer_eval_gate.*

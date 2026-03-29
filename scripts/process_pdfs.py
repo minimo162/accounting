@@ -9,7 +9,12 @@ from pathlib import Path
 from liteparse import LiteParse
 
 sys.path.insert(0, str(Path(__file__).parent))
-from process_egov import get_egov_covered_pdfs
+try:
+    from .process_egov import get_egov_covered_pdfs
+    from .source_manifest import load_source_manifest, load_url_lookup, metadata_for_file
+except ImportError:
+    from process_egov import get_egov_covered_pdfs
+    from source_manifest import load_source_manifest, load_url_lookup, metadata_for_file
 
 
 _PAGE_NUM_RE = re.compile(r"(?:^|\n)\s*-\s*\n\s*\d+\s*\n\s*-\s*(?:\n|$)", re.MULTILINE)
@@ -222,6 +227,9 @@ def create_chunks(pdf_dir: str, output_path: str):
     egov_covered = get_egov_covered_pdfs()
     lp = LiteParse()
     chunks: list[dict] = []
+    data_dir = Path(output_path).resolve().parent
+    manifest_sources = load_source_manifest(data_dir / "source_manifest.json")["sources"]
+    url_lookup = load_url_lookup(data_dir / "pdf_sources.json")
 
     print("=== Deduplicating PDFs by title (keeping newest version) ===")
     pdf_files = _dedup_pdf_files([p for p in pdf_files if p.name not in egov_covered], lp)
@@ -238,6 +246,12 @@ def create_chunks(pdf_dir: str, output_path: str):
         doc_title = _extract_title(clean_full_text) or pdf_path.stem
         doc_type = _infer_doc_type(doc_title)
         standard_no = _extract_standard_no(doc_title)
+        source_meta = metadata_for_file(
+            pdf_path.resolve(),
+            data_dir=data_dir,
+            manifest_sources=manifest_sources,
+            url_lookup=url_lookup,
+        )
         parent_sections = _split_parent_sections(full_text)
         child_counter = 1
         file_chunks: list[dict] = []
@@ -277,6 +291,7 @@ def create_chunks(pdf_dir: str, output_path: str):
                 "standard_no": standard_no,
                 "section_title": first_line,
                 "section_path": source,
+                **source_meta,
             }
             file_chunks.append(parent_chunk)
 
@@ -296,6 +311,7 @@ def create_chunks(pdf_dir: str, output_path: str):
                         "standard_no": standard_no,
                         "section_title": first_line,
                         "section_path": source,
+                        **source_meta,
                     }
                 )
                 child_counter += 1

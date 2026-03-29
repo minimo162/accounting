@@ -57,17 +57,25 @@ class HybridSearchTool(BaseTool):
         top_k = min(int(kwargs.get("top_k", self.config.final_top_k)), 30)
         if not query:
             return "検索クエリを指定してください。", {"error": "no query"}
-        context.set_current_search_query(query)
 
         cache_key = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False, sort_keys=True)
         cached = context.get_cached_tool_result(self.name, cache_key)
         if cached is not None:
             result_text, tool_log = cached
+            context.set_current_search_query(str(tool_log.get("effective_query") or query))
             return result_text, {**tool_log, "cached": True}
 
         final, expansions, hyde_doc, search_info = self._search_with_details(query, top_k)
         if not final:
+            context.set_current_search_query(query)
             return "関連する文書が見つかりませんでした。", {"matches": 0}
+
+        effective_query = (
+            str(search_info.get("corrective_query") or "").strip()
+            or str(search_info.get("profile", {}).get("canonical_focus_query") or "").strip()
+            or query
+        )
+        context.set_current_search_query(effective_query)
 
         lines = []
         snippets = []
@@ -96,6 +104,7 @@ class HybridSearchTool(BaseTool):
                 "profile": search_info.get("profile", {}),
                 "confidence": confidence_score,
                 "corrective_query": search_info.get("corrective_query"),
+                "effective_query": effective_query,
                 "chunk_ids": chunk_ids,
             }
         )
@@ -112,12 +121,14 @@ class HybridSearchTool(BaseTool):
                 "confidence": confidence_score,
                 "corrective_query": search_info.get("corrective_query"),
                 "query_complexity": search_info.get("profile", {}).get("complexity"),
+                "effective_query": effective_query,
             },
         )
         result_text = "\n".join(lines)
         tool_log = {
             "matches": len(final),
             "query": query,
+            "effective_query": effective_query,
             "expansions": expansions,
             "retrieved_tokens": retrieved_tokens,
             "chunk_ids": chunk_ids,
@@ -145,12 +156,24 @@ class HybridSearchTool(BaseTool):
         semantic_limit = min(self.config.semantic_top_k, max(top_k * 2, 8))
 
         if is_exact_query or profile.search_mode == "keyword_first":
-            primary_keyword_query = profile.canonical_focus_query or query
-            exact_keyword_terms = self.query_expander.exact_keyword_terms(primary_keyword_query) if is_exact_query else [primary_keyword_query]
-            primary_keyword = self.keyword_tool.search(exact_keyword_terms, keyword_limit)
+            if is_exact_query:
+                primary_keyword_query = query
+            elif profile.detail_seeking and profile.corrective_query:
+                primary_keyword_query = profile.corrective_query
+            else:
+                primary_keyword_query = profile.canonical_focus_query or profile.corrective_query or query
+            if is_exact_query:
+                keyword_terms = self.query_expander.exact_keyword_terms(primary_keyword_query)
+            else:
+                keyword_terms = [term for term in primary_keyword_query.split() if term] or [primary_keyword_query]
+            primary_keyword = self.keyword_tool.search(keyword_terms, keyword_limit)
             if primary_keyword:
                 keyword_rankings.append(primary_keyword)
-            if not primary_keyword or (profile.complexity == "complex" and not is_exact_query):
+            if (
+                not primary_keyword
+                or (profile.complexity == "complex" and not is_exact_query)
+                or self._should_backfill_semantic_for_keyword_focus(profile, keyword_terms, primary_keyword, is_exact_query)
+            ):
                 semantic_rankings.append(self.semantic_tool.search(semantic_query, semantic_limit))
         else:
             if profile.search_mode != "keyword_first":
@@ -210,6 +233,27 @@ class HybridSearchTool(BaseTool):
         fused = self._apply_topic_alignment_boosts(query, fused)
         fused = self._apply_focus_term_boosts(query, fused)
         return fused[: self.config.rerank_top_n]
+
+    @classmethod
+    def _should_backfill_semantic_for_keyword_focus(
+        cls,
+        profile: QueryProfile,
+        keyword_terms: list[str],
+        primary_keyword: list,
+        is_exact_query: bool,
+    ) -> bool:
+        if is_exact_query or not primary_keyword or profile.search_mode != "keyword_first":
+            return False
+
+        focus_terms = [term for term in keyword_terms if len(term) >= 2][:6]
+        if len(focus_terms) < 3:
+            return False
+
+        top = primary_keyword[0]
+        haystack = f"{top.source} {top.snippet[:260]} {top.text[:800]}"
+        focus_hits = sum(1 for term in focus_terms if term in haystack)
+        required_hits = 3 if len(focus_terms) >= 5 else 2
+        return focus_hits < required_hits
 
     def _estimate_confidence(self, query: str, results: list) -> float:
         if not results:
