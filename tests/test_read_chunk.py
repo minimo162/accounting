@@ -111,6 +111,43 @@ class ReadChunkToolTests(unittest.TestCase):
         self.assertIn("事後テスト", text)
         self.assertNotIn("ヘッジ会計を採用しない場合の補足説明。", text)
 
+    def test_read_chunk_registers_cross_reference_slots_from_excerpt(self):
+        chunks = [
+            {
+                "id": "ketsugou.pdf:p12",
+                "parent_id": "ketsugou.pdf:p12",
+                "level": "parent",
+                "file": "ketsugou.pdf",
+                "source": "企業結合に関する会計基準 > 取得後の会計処理",
+                "text": (
+                    "取得後の会計処理を説明する。\n"
+                    "未実現損益の消去については企業会計基準第22号第36条参照。\n"
+                    "土地再評価差額金の取扱いは別途検討を要する。\n"
+                    + ("補足説明が続く。\n" * 40)
+                ),
+            }
+        ]
+        corpus = ChunkCorpus(chunks)
+        tool = ReadChunkTool(corpus)
+        context = AgentContext()
+        context.set_question(
+            "企業結合後の会計処理を確認したいです",
+            {"complexity": "moderate"},
+        )
+
+        text, _ = tool.execute(context, chunk_ids=["ketsugou.pdf:p12"])
+
+        self.assertIn("企業会計基準第22号第36条参照。", text)
+        self.assertIn("企業会計基準第22号", context.evidence_slots)
+        self.assertEqual(
+            context.evidence_slot_terms["企業会計基準第22号"],
+            ("企業会計基準第22号", "第36条"),
+        )
+        self.assertEqual(
+            context.evidence_slot_hits["企業会計基準第22号"],
+            {"ketsugou.pdf:p12"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

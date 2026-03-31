@@ -156,11 +156,13 @@ class AgentContext:
         slot_terms: dict[str, tuple[str, ...]],
         label: str,
         terms: list[str] | tuple[str, ...] | None = None,
+        *,
+        allow_exact: bool = False,
     ) -> None:
         normalized_label = cls._clean_slot_phrase(label)
         if (
             not normalized_label
-            or cls._EXACT_REFERENCE_RE.search(normalized_label)
+            or (not allow_exact and cls._EXACT_REFERENCE_RE.search(normalized_label))
             or normalized_label in cls._GENERIC_SLOT_TERMS
         ):
             return
@@ -275,6 +277,38 @@ class AgentContext:
                 self.exact_evidence_chunk_ids.add(chunk_id)
             else:
                 self.exact_evidence_chunk_ids.discard(chunk_id)
+
+        self._register_cross_reference_slots(chunk_id, source=source, note=note)
+
+    def _register_cross_reference_slots(self, chunk_id: str, *, source: str, note: str) -> None:
+        discovered = QueryExpander.extract_cross_references(f"{source}\n{note}")
+        if not discovered:
+            return
+
+        source_doc_terms = {
+            str(item.get("doc_term", ""))
+            for item in QueryExpander.extract_cross_references(source)
+            if str(item.get("doc_term", ""))
+        }
+        current_exact_doc_terms = {term for term in self.exact_doc_terms if term}
+
+        for item in discovered:
+            doc_term = str(item.get("doc_term", "")).strip()
+            if (
+                not doc_term
+                or doc_term in source_doc_terms
+                or doc_term in current_exact_doc_terms
+            ):
+                continue
+            section_terms = [str(term).strip() for term in item.get("section_terms", []) if str(term).strip()]
+            self._register_slot(
+                self.evidence_slots,
+                self.evidence_slot_terms,
+                doc_term,
+                [doc_term, *section_terms],
+                allow_exact=True,
+            )
+            self.evidence_slot_hits.setdefault(doc_term, set()).add(chunk_id)
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)

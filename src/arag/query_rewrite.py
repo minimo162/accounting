@@ -61,6 +61,10 @@ class QueryExpander:
         r"(第\s*\d+\s*(?:項|条|号))",
         r"(BC\s*\d+(?:\s*[-‑–]\s*\d+)?)",
     )
+    _CROSS_REFERENCE_RE = re.compile(
+        r"((?:企業会計基準|企業会計基準適用指針|適用指針|実務対応報告|会計基準)第\s*\d+\s*号)"
+        r"(?:[^。\n]{0,40}?((?:第\s*\d+\s*(?:項|条|号)|BC\s*\d+(?:\s*[-‑–]\s*\d+)?))[^。\n]{0,8}?参照?)?",
+    )
     _COMPLEX_TERMS = (
         "改正", "変更", "見直し", "背景", "目的", "経過措置", "適用時期",
         "比較", "違い", "それぞれ", "併せて", "また", "及び", "ならびに",
@@ -426,6 +430,31 @@ class QueryExpander:
             add(section_focus_terms + anchor_terms[:3])
 
         return candidate_sets or [base_terms or [query.strip()]]
+
+    @classmethod
+    def extract_cross_references(cls, text: str) -> list[dict[str, object]]:
+        if not text:
+            return []
+        references: list[dict[str, object]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for match in cls._CROSS_REFERENCE_RE.finditer(text):
+            doc_term = re.sub(r"\s+", "", match.group(1).strip())
+            if not doc_term:
+                continue
+            section_terms: list[str] = []
+            if match.group(2):
+                section_terms.append(re.sub(r"\s+", "", match.group(2).strip()))
+            signature = (doc_term, tuple(section_terms))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            references.append(
+                {
+                    "doc_term": doc_term,
+                    "section_terms": section_terms,
+                }
+            )
+        return references
 
     @classmethod
     def exact_keyword_terms(cls, query: str) -> list[str]:
