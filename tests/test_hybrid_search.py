@@ -69,6 +69,19 @@ class FakeQueryExpander:
             keywords=[],
         )
 
+    def analyze(self, query: str) -> QueryProfile:
+        return self.profile(query)
+
+
+class FakeLLM:
+    def __init__(self, content: str):
+        self.content = content
+        self.calls: list[str] = []
+
+    def chat(self, messages, tools=None, temperature=0.0, max_tokens=0):
+        self.calls.append(messages[0]["content"])
+        return {"message": {"content": self.content}}
+
 
 class FakeReranker:
     def __init__(self, is_expensive=False):
@@ -402,7 +415,8 @@ class HybridSearchTests(unittest.TestCase):
                     "cited_references": ["第36条", "連結財務諸表に関する会計基準"],
                     "doc_terms": ["連結財務諸表に関する会計基準"],
                     "section_terms": ["第36条"],
-                    "search_query": "連結財務諸表に関する会計基準 第36条 単体 計上される売却損 未実現損失 連結調整",
+                    "target_transaction": "未実現損失",
+                    "search_query": "連結財務諸表に関する会計基準 第36条 未実現損失 単体 計上される売却損 連結調整",
                 }
             ],
         )
@@ -422,6 +436,58 @@ class HybridSearchTests(unittest.TestCase):
         self.assertFalse(profile.verification_mode)
         self.assertFalse(profile.judgment_validation)
         self.assertEqual(profile.verification_claims, [])
+
+    def test_analyze_decomposes_long_verification_query_with_llm_and_rule_based_references(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        query = (
+            "親会社が再評価済みの土地を子会社へ簿価を下回る価格で譲渡した事案です。"
+            "私は、この売却損は単体上で認識されても、連結上は未実現損失として必ずしも消去すべきではなく、"
+            "土地再評価差額金もそのまま引き継がれると理解しています。"
+            "また、依拠条文として連結財務諸表に関する会計基準 第36条と、土地再評価差額金の会計処理に関するＱ＆Ａを考えています。"
+            "この整理が妥当か確認してください。必要なら論点を分けてチェックしてください。"
+        )
+        llm = FakeLLM(
+            """[
+  {
+    "claim": "再評価済み土地の売却損は連結上の未実現損失として必ずしも消去しない",
+    "target_transaction": "土地譲渡 / 連結消去"
+  },
+  {
+    "claim": "土地再評価差額金は子会社への土地譲渡後もそのまま引き継がれる",
+    "target_transaction": "土地再評価"
+  }
+]"""
+        )
+        expander = QueryExpander(RetrievalConfig(expansion_max_variants=2), llm=llm)
+
+        profile = expander.analyze(query)
+
+        self.assertTrue(profile.verification_mode)
+        self.assertEqual(len(profile.verification_claims), 2)
+        self.assertEqual(
+            profile.verification_claims[0],
+            {
+                "claim": "再評価済み土地の売却損は連結上の未実現損失として必ずしも消去しない",
+                "cited_references": ["第36条", "連結財務諸表に関する会計基準"],
+                "doc_terms": ["連結財務諸表に関する会計基準"],
+                "section_terms": ["第36条"],
+                "target_transaction": "土地譲渡 / 連結消去",
+                "search_query": "連結財務諸表に関する会計基準 第36条 土地譲渡 連結消去 再評価済み土地 売却損 連結上 未実現損失",
+            },
+        )
+        self.assertEqual(
+            profile.verification_claims[1],
+            {
+                "claim": "土地再評価差額金は子会社への土地譲渡後もそのまま引き継がれる",
+                "cited_references": ["第36条", "連結財務諸表に関する会計基準"],
+                "doc_terms": ["連結財務諸表に関する会計基準"],
+                "section_terms": ["第36条"],
+                "target_transaction": "土地再評価",
+                "search_query": "連結財務諸表に関する会計基準 第36条 土地再評価 土地再評価差額金 子会社 土地譲渡後 まま引き継",
+            },
+        )
+        self.assertEqual(len(llm.calls), 1)
 
     def test_detail_seeking_keyword_first_prefers_corrective_query_over_canonical_focus(self):
         query = "収益認識基準で履行義務はどのように識別しますか。保守サービスや値引きのある契約を念頭に説明してください"

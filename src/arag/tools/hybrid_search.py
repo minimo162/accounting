@@ -156,7 +156,7 @@ class HybridSearchTool(BaseTool):
         return final, expansions, hyde_doc
 
     def _search_with_details(self, query: str, top_k: int) -> tuple[list, list[str], str | None, dict[str, Any]]:
-        profile = self.query_expander.profile(query)
+        profile = self.query_expander.analyze(query)
         expansions = self.query_expander.expand(query)
         is_exact_query = self.query_expander.is_exact_query(query)
         hyde_doc = None if is_exact_query else self.query_expander.generate_hypothetical_document(query)

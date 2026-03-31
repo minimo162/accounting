@@ -1,6 +1,6 @@
 """Query expansion and HyDE helpers."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 import re
@@ -135,6 +135,15 @@ class QueryExpander:
         self.config = config
         self.llm = llm
 
+    def analyze(self, query: str) -> QueryProfile:
+        profile = self.profile(query)
+        if not profile.verification_mode:
+            return profile
+        verification_claims = self.decompose_verification_query(query, profile=profile)
+        if verification_claims == profile.verification_claims:
+            return profile
+        return replace(profile, verification_claims=verification_claims)
+
     @classmethod
     def _extract_keywords(cls, query: str) -> list[str]:
         keywords: list[str] = []
@@ -236,7 +245,8 @@ class QueryExpander:
         terms: list[str] = []
 
         def add(term: str):
-            normalized = re.sub(r"\s+", "", term.strip())
+            cleaned = re.sub(r"^(?:依拠条文として|依拠条文|依拠|根拠として|根拠)\s*[:：]?\s*", "", term.strip())
+            normalized = re.sub(r"\s+", "", cleaned)
             if normalized and normalized not in terms:
                 terms.append(normalized)
 
@@ -476,6 +486,34 @@ class QueryExpander:
         text = response["message"].get("content", "").strip()
         return text or None
 
+    def decompose_verification_query(
+        self,
+        query: str,
+        *,
+        profile: QueryProfile | None = None,
+    ) -> list[dict[str, object]]:
+        profile = profile or self.profile(query)
+        if not profile.verification_mode:
+            return []
+
+        fallback = self._build_verification_claims(
+            profile.validation_claims,
+            profile.cited_references,
+            query=query,
+        )
+        if self.llm is None or len(query) < 200:
+            return fallback
+
+        llm_claims = self._llm_verification_claims(query)
+        if not llm_claims:
+            return fallback
+        normalized = self._normalize_verification_claims(
+            llm_claims,
+            query=query,
+            fallback_references=profile.cited_references,
+        )
+        return normalized or fallback
+
     def _heuristic_variants(self, query: str) -> list[str]:
         keywords = self._extract_keywords(query)
         variants: list[str] = []
@@ -494,6 +532,29 @@ class QueryExpander:
         if "会計" not in query:
             variants.append(f"{query} 会計基準")
         return variants
+
+    def _llm_verification_claims(self, query: str) -> list[dict[str, object]]:
+        prompt = (
+            "次の会計判断の確認依頼を、検索用の主張単位に分解してください。"
+            "JSON配列だけを返してください。各要素は"
+            ' {"claim": "...", "target_transaction": "...", "cited_references": ["..."] } '
+            "の形式にしてください。主張は2〜4件まで、簡潔にしてください。\n\n"
+            f"質問:\n{query}"
+        )
+        try:
+            response = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                tools=None,
+                temperature=0.0,
+                max_tokens=600,
+            )
+            content = response["message"].get("content", "").strip()
+            payload = json.loads(content)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+        except Exception as e:
+            logger.debug(f"Verification decomposition failed: {e}")
+        return []
 
     @classmethod
     def _is_detail_seeking(cls, query: str, exact: bool, complexity: str) -> bool:
@@ -543,34 +604,118 @@ class QueryExpander:
         cls,
         validation_claims: list[str],
         cited_references: list[str],
+        *,
+        query: str = "",
     ) -> list[dict[str, object]]:
         if not validation_claims:
             return []
 
-        doc_terms: list[str] = []
-        section_terms: list[str] = []
-        for ref in cited_references:
-            normalized = cls.normalize_exact_text(ref)
-            if re.fullmatch(r"第\d+(?:項|条|号)", normalized) or re.fullmatch(r"BC\d+(?:[-‑–]\d+)?", normalized, flags=re.IGNORECASE):
-                section_terms.append(ref)
-            else:
-                doc_terms.append(ref)
-
         claims: list[dict[str, object]] = []
         for claim in validation_claims:
+            target_transaction = cls._infer_target_transaction(claim, query=query)
+            doc_terms, section_terms = cls._split_claim_references(
+                cited_references or cls.extract_exact_terms(claim),
+            )
             claims.append(
                 {
                     "claim": claim,
                     "cited_references": list(cited_references),
                     "doc_terms": list(doc_terms),
                     "section_terms": list(section_terms),
-                    "search_query": cls._merge_focus_terms(
-                        " ".join([*doc_terms[:2], *section_terms[:2], *cls._extract_keywords(claim)[:4]]),
-                        [],
-                    ) or claim,
+                    "target_transaction": target_transaction,
+                    "search_query": cls._build_claim_search_query(
+                        claim,
+                        doc_terms=doc_terms,
+                        section_terms=section_terms,
+                        target_transaction=target_transaction,
+                    ),
                 }
             )
         return claims
+
+    @classmethod
+    def _split_claim_references(cls, references: list[str]) -> tuple[list[str], list[str]]:
+        doc_terms: list[str] = []
+        section_terms: list[str] = []
+        for ref in references:
+            normalized = cls.normalize_exact_text(ref)
+            if re.fullmatch(r"第\d+(?:項|条|号)", normalized) or re.fullmatch(r"BC\d+(?:[-‑–]\d+)?", normalized, flags=re.IGNORECASE):
+                if ref not in section_terms:
+                    section_terms.append(ref)
+            elif ref not in doc_terms:
+                doc_terms.append(ref)
+        return doc_terms, section_terms
+
+    @classmethod
+    def _infer_target_transaction(cls, claim: str, *, query: str = "") -> str:
+        haystack = f"{claim} {query}"
+        candidates = [
+            "土地譲渡",
+            "土地再評価",
+            "連結消去",
+            "未実現損失",
+            "未実現利益",
+            "企業結合",
+            "事業分離",
+        ]
+        hits = [term for term in candidates if term in haystack]
+        if hits:
+            return " / ".join(dict.fromkeys(hits))
+        keywords = cls._extract_keywords(claim)
+        return " ".join(keywords[:3])
+
+    @classmethod
+    def _build_claim_search_query(
+        cls,
+        claim: str,
+        *,
+        doc_terms: list[str],
+        section_terms: list[str],
+        target_transaction: str = "",
+    ) -> str:
+        keywords = cls._extract_keywords(claim)
+        target_terms = [term for term in re.split(r"\s*/\s*|\s+", target_transaction) if term]
+        base_terms = [*doc_terms[:2], *section_terms[:2], *target_terms[:3], *keywords[:4]]
+        return cls._merge_focus_terms(" ".join(base_terms), []) or claim
+
+    @classmethod
+    def _normalize_verification_claims(
+        cls,
+        claims: list[dict[str, object]],
+        *,
+        query: str,
+        fallback_references: list[str],
+    ) -> list[dict[str, object]]:
+        normalized_claims: list[dict[str, object]] = []
+        for item in claims:
+            claim = str(item.get("claim", "")).strip()
+            if len(claim) < 8:
+                continue
+            raw_refs = item.get("cited_references", [])
+            references = [str(ref).strip() for ref in raw_refs if str(ref).strip()] if isinstance(raw_refs, list) else []
+            if not references:
+                references = [
+                    ref for ref in fallback_references
+                    if cls.normalize_exact_text(ref) in cls.normalize_exact_text(query)
+                ] or list(fallback_references)
+            doc_terms, section_terms = cls._split_claim_references(references)
+            target_transaction = str(item.get("target_transaction", "")).strip() or cls._infer_target_transaction(claim, query=query)
+            normalized_claims.append(
+                {
+                    "claim": claim,
+                    "cited_references": references,
+                    "doc_terms": doc_terms,
+                    "section_terms": section_terms,
+                    "target_transaction": target_transaction,
+                    "search_query": cls._build_claim_search_query(
+                        claim,
+                        doc_terms=doc_terms,
+                        section_terms=section_terms,
+                        target_transaction=target_transaction,
+                    ),
+                }
+            )
+        return normalized_claims[:4]
 
     @classmethod
     def _detail_focus_terms(cls, query: str) -> list[str]:
