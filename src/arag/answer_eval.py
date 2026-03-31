@@ -308,6 +308,7 @@ def summarize_answer_eval(results: list[AnswerEvalResult]) -> dict[str, Any]:
             "reference_alignment_failures": 0,
             "missing_reference_url_failures": 0,
             "insufficient_detail_failures": 0,
+            "exact_clause_failures": 0,
         }
 
     latencies = sorted(result.elapsed_sec for result in results)
@@ -330,6 +331,9 @@ def summarize_answer_eval(results: list[AnswerEvalResult]) -> dict[str, Any]:
         "missing_reference_url_failures": sum(1 for result in results if result.missing_reference_urls),
         "insufficient_detail_failures": sum(
             1 for result in results if any(reason.startswith("cited_lines<") for reason in result.failure_reasons)
+        ),
+        "exact_clause_failures": sum(
+            1 for result in results if "exact_clause" in result.case_id and result.failure_reasons
         ),
     }
 
@@ -384,6 +388,7 @@ def render_answer_eval_markdown(
         f"- Reference alignment failures: {summary['reference_alignment_failures']}",
         f"- Missing reference URL failures: {summary['missing_reference_url_failures']}",
         f"- Insufficient detail failures: {summary['insufficient_detail_failures']}",
+        f"- Exact clause failures: {summary['exact_clause_failures']}",
     ]
     if gate is not None:
         lines.extend(

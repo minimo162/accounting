@@ -176,6 +176,37 @@ class Agent:
         recent = context.search_history[-3:]
         return max(float(entry.get("confidence", 0.0)) for entry in recent)
 
+    @staticmethod
+    def _required_slot_labels(context: AgentContext) -> set[str]:
+        required: set[str] = set()
+        focus_text = " ".join(
+            [
+                context.question,
+                str(context.query_profile.get("canonical_focus_query", "")),
+                str(context.query_profile.get("corrective_query", "")),
+            ]
+        )
+        if "ヘッジ" in focus_text and "要件" in focus_text and "有効性" in context.evidence_slot_terms:
+            required.add("有効性")
+        return required
+
+    @staticmethod
+    def _has_exact_clause_evidence(context: AgentContext) -> bool:
+        return bool(context.exact_evidence_chunk_ids)
+
+    @classmethod
+    def _has_exact_shortfall(cls, context: AgentContext) -> bool:
+        if not QueryExpander.is_exact_query(context.question):
+            return False
+        if cls._has_exact_clause_evidence(context):
+            return False
+        if any(bool(entry.get("exact_shortfall")) for entry in context.search_history[-2:]):
+            return True
+        return any(
+            log.tool_name == "hybrid_search" and bool(log.metadata.get("exact_shortfall"))
+            for log in context.retrieval_logs[-3:]
+        )
+
     @classmethod
     def _search_results_are_stagnating(cls, context: AgentContext) -> bool:
         recent_entries = [entry for entry in context.search_history[-3:] if entry.get("chunk_ids")]
@@ -208,6 +239,14 @@ class Agent:
             normalized_queries.append(" ".join(tokens[:5]))
 
         return len(set(normalized_queries)) <= max(1, len(normalized_queries) - 1)
+
+    @classmethod
+    def _detail_rich_note_count(cls, context: AgentContext) -> int:
+        return sum(
+            1
+            for note in context.evidence_notes.values()
+            if len(str(note or "")) >= 120 or any(marker in str(note or "") for marker in cls._DETAIL_NOTE_MARKERS)
+        )
 
     def _evidence_requirements(self, context: AgentContext) -> dict[str, float | int]:
         coverage = context.get_evidence_coverage()
@@ -252,14 +291,20 @@ class Agent:
         requirements = self._evidence_requirements(context)
         search_count = self._count_search_calls(context)
         read_count = self._count_tool_calls(context, "read_chunk")
+        read_document_count = self._count_tool_calls(context, "read_document")
         coverage = context.get_evidence_coverage()
         covered_slots = len(coverage["covered_slots"])
         slot_count = len(coverage["slots"])
         uncovered_slot_count = max(slot_count - covered_slots, 0)
+        required_slot_labels = self._required_slot_labels(context)
         keyword_first = str(context.query_profile.get("search_mode", "")) == "keyword_first"
         complexity = context.question_complexity
+        exact_query = QueryExpander.is_exact_query(context.question)
         best_confidence = self._best_search_confidence(context)
         required_slots = int(requirements["required_slots"])
+        detail_seeking = self._is_detail_seeking_context(context)
+        detail_rich_notes = self._detail_rich_note_count(context)
+        read_like_count = max(read_count, read_document_count) if exact_query else read_count
         allow_keyword_first_example_shortfall = (
             keyword_first
             and complexity == "moderate"
@@ -270,6 +315,19 @@ class Agent:
             and read_count >= int(requirements["min_reads"])
             and len(context.evidence_notes) >= int(requirements["min_notes"])
             and best_confidence >= 0.4
+        )
+        allow_detail_keyword_shortfall = (
+            detail_seeking
+            and keyword_first
+            and complexity == "moderate"
+            and slot_count >= 2
+            and uncovered_slot_count <= 1
+            and covered_slots >= max(1, required_slots - 1)
+            and search_count >= int(requirements["min_searches"])
+            and read_like_count >= int(requirements["min_reads"])
+            and len(context.evidence_notes) >= int(requirements["min_notes"])
+            and detail_rich_notes >= max(2, len(context.evidence_notes) - 1)
+            and best_confidence >= 0.35
         )
         allow_one_slot_shortfall = (
             complexity == "complex"
@@ -286,22 +344,33 @@ class Agent:
         min_reads = int(requirements["min_reads"])
         if allow_one_slot_shortfall:
             min_reads = max(2, min_reads - 1)
-        if read_count < min_reads:
+        if read_like_count < min_reads:
             return False
         if len(context.evidence_notes) < int(requirements["min_notes"]):
+            return False
+        if exact_query and not self._has_exact_clause_evidence(context):
+            return False
+        if required_slot_labels and any(not context.evidence_slot_hits.get(label) for label in required_slot_labels):
             return False
 
         if (
             required_slots > 0
             and covered_slots < required_slots
             and not allow_keyword_first_example_shortfall
+            and not allow_detail_keyword_shortfall
         ):
             return False
+
+        if exact_query:
+            return True
 
         if slot_count > 0 and covered_slots >= slot_count:
             return True
 
         if keyword_first and required_slots > 0:
+            return True
+
+        if allow_detail_keyword_shortfall:
             return True
 
         if best_confidence >= float(requirements["min_confidence"]):
@@ -320,6 +389,23 @@ class Agent:
                 return True
 
         return False
+
+    def _build_exact_gap_message(self, context: AgentContext) -> dict[str, str] | None:
+        if context.exact_gap_nudge_sent or not self._has_exact_shortfall(context):
+            return None
+        if self._count_search_calls(context) < 1:
+            return None
+
+        context.exact_gap_nudge_sent = True
+        return {
+            "role": "user",
+            "content": (
+                "【システム通知】指定条項の原文根拠がまだ取れていません。"
+                "追加の hybrid_search は増やさず、候補文書が見えているなら read_document で原文を確認し、"
+                "該当条項の記載を含む根拠を 1 件確保してください。"
+                "別基準の一般論で埋めて最終回答しないでください。"
+            ),
+        }
 
     def _build_coverage_gap_message(self, context: AgentContext) -> dict[str, str] | None:
         coverage = context.get_evidence_coverage()
@@ -388,6 +474,22 @@ class Agent:
         if stop_reason is None or context.final_coverage_review_done:
             return None
 
+        if self._has_exact_shortfall(context):
+            search_count = self._count_search_calls(context)
+            read_like_count = self._count_tool_calls(context, "read_chunk") + self._count_tool_calls(context, "read_document")
+            if search_count < 1 or read_like_count < 1:
+                return None
+            return {
+                "role": "user",
+                "content": (
+                    "【システム通知】最終回答の直前です。指定条項の原文根拠がまだ不足しています。\n"
+                    "次のどちらかだけを選んでください。\n"
+                    "- 候補文書に対して read_document を 1 回だけ使い、指定条項の本文を確認する\n"
+                    "- これ以上原文根拠が増えないなら、最終回答で「今回確認できた根拠では不十分」と明示する\n"
+                    "一般的な解説に逃げず、指定条項の有無を基準に判断してください。"
+                ),
+            }
+
         coverage = context.get_evidence_coverage()
         if not coverage["uncovered_slots"]:
             return None
@@ -451,6 +553,9 @@ class Agent:
 
     def _maybe_nudge(self, messages: list[dict], loop_idx: int, context: AgentContext):
         """Inject a wrap-up hint if we've been searching too long."""
+        exact_hint = self._build_exact_gap_message(context)
+        if exact_hint is not None:
+            messages.append(exact_hint)
         coverage_hint = self._build_coverage_gap_message(context)
         if coverage_hint is not None:
             messages.append(coverage_hint)
@@ -989,6 +1094,44 @@ class Agent:
         )
         return {"role": "user", "content": content}
 
+    @staticmethod
+    def _exact_clause_key_terms(note: str) -> list[str]:
+        mappings = (
+            ("通常の売買取引に係る方法に準じ", "通常の売買処理"),
+            ("通常の賃貸借取引に係る方法に準じ", "通常の賃貸借取引"),
+            ("ファイナンス・リース取引", "ファイナンス・リース"),
+            ("オペレーティング・リース取引", "オペレーティング・リース"),
+        )
+        terms: list[str] = []
+        for raw, label in mappings:
+            if raw in note and label not in terms:
+                terms.append(label)
+        return terms
+
+    def _build_exact_evidence_message(self, context: AgentContext) -> dict[str, str] | None:
+        if not context.exact_evidence_chunk_ids:
+            return None
+
+        lines = [
+            "【exact clause 要点】指定条項の原文根拠があります。条項回答では、原文の言い換えとして短い会計用語も落とさず含めてください。"
+        ]
+        added = 0
+        for chunk_id in self._ordered_evidence_note_ids(context):
+            if chunk_id not in context.exact_evidence_chunk_ids:
+                continue
+            note = context.evidence_notes.get(chunk_id, "")
+            key_terms = self._exact_clause_key_terms(note)
+            if not key_terms:
+                continue
+            lines.append(f"- {chunk_id}: 要点語 {', '.join(key_terms)}")
+            added += 1
+            if added >= 2:
+                break
+
+        if added == 0:
+            return None
+        return {"role": "user", "content": "\n".join(lines)}
+
     def _build_final_answer_messages(self, messages: list[dict], context: AgentContext) -> list[dict]:
         """Force the LLM to produce a final answer without tool calls."""
         force_prompt = (
@@ -1007,6 +1150,9 @@ class Agent:
         note_message = self._build_evidence_note_message(context)
         if note_message is not None:
             messages_copy.append(note_message)
+        exact_evidence_message = self._build_exact_evidence_message(context)
+        if exact_evidence_message is not None:
+            messages_copy.append(exact_evidence_message)
         if self._is_detail_seeking_context(context):
             messages_copy.append(
                 {
@@ -1015,6 +1161,17 @@ class Agent:
                         "【詳細回答ルール】詳しく/違い/どのような場合といった質問です。"
                         "各論点では、原則だけで終わらせず、確認できた範囲で条件・例外・判断基準・比較観点のうち"
                         "該当するものを少なくとも 1 つ含めてください。"
+                    ),
+                }
+            )
+        if context.exact_doc_terms or context.exact_section_terms:
+            messages_copy.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "【exact query ルール】質問で指定された基準番号・条項番号に対応する根拠がある場合だけ、その指定箇所の内容を直接回答してください。"
+                        "指定箇所の根拠が確認できない場合は、別基準や現行基準の一般論で補わず、"
+                        "『今回確認できた根拠では不十分』と明示してください。"
                     ),
                 }
             )
@@ -1341,10 +1498,19 @@ class Agent:
             f"{refs}。"
         )
 
+    def _build_exact_repair_line(self, context: AgentContext) -> str | None:
+        if not self._has_exact_shortfall(context):
+            return None
+        label = " ".join([*context.exact_doc_terms[:1], *context.exact_section_terms[:1]]).strip() or "指定条項"
+        fallback_ids = list(context.exact_evidence_chunk_ids) or context.searched_chunk_ids[:2]
+        refs = "".join(f"[{chunk_id}]" for chunk_id in fallback_ids[:2] if chunk_id)
+        return (
+            f"- {label}: 今回確認できた根拠では不十分であり、指定条項の原文を裏付ける十分な記載を確認できませんでした"
+            f"{refs}。"
+        )
+
     def _repair_answer_coverage(self, answer: str, context: AgentContext) -> str:
         items = self._coverage_plan_items(context)
-        if not items:
-            return answer
 
         repair_lines: list[str] = []
         for item in items:
@@ -1354,6 +1520,10 @@ class Agent:
             line = self._build_slot_repair_line(item, context)
             if line and line not in repair_lines:
                 repair_lines.append(line)
+
+        exact_line = self._build_exact_repair_line(context)
+        if exact_line and "今回確認できた根拠では不十分" not in answer:
+            repair_lines.append(exact_line)
 
         if not repair_lines:
             return answer
@@ -1640,6 +1810,10 @@ class Agent:
         return re.sub(r"\[\d+\]", "", text)
 
     def _natural_answer_retry_reasons(self, result: dict[str, Any], context: AgentContext) -> list[str]:
+        if QueryExpander.is_exact_query(context.question):
+            if self._has_exact_clause_evidence(context):
+                return []
+            return ["missing_exact_evidence"]
         if context.question_complexity == "simple":
             return []
         if len(context.read_chunk_ids) < 2 or len(context.evidence_notes) < 2:

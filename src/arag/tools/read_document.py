@@ -5,10 +5,12 @@ chunks.json から同一ファイルのチャンクを結合して全文を再�
 """
 
 from collections import defaultdict
+import re
 from typing import Any
 
 from .base import BaseTool
 from ..context import AgentContext
+from ..query_rewrite import QueryExpander
 
 _DEFAULT_MAX_CHARS = 40_000  # 旧来の全文読取上限
 
@@ -31,31 +33,69 @@ def _max_chars_for_context(context: AgentContext) -> int:
 def _build_doc_index(chunks: list[dict]) -> dict[str, dict]:
     """chunks リストから {filename: {source, text, char_count}} を構築する。"""
     # filename ごとにチャンクを収集（chunk_num 順）
-    by_file: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    by_file: dict[str, list[tuple[int, str, str, str, str]]] = defaultdict(list)
     for chunk in chunks:
         chunk_id: str = chunk.get("id", "")
         if ":" not in chunk_id:
             continue
         filename, num_str = chunk_id.rsplit(":", 1)
         try:
-            num = int(num_str)
+            num = int(re.sub(r"\D+", "", num_str) or "0")
         except ValueError:
             num = 0
-        source = chunk.get("source", filename).split(" >")[0].strip()
+        raw_source = chunk.get("source", filename).strip()
+        doc_source = raw_source.split(" >")[0].strip()
         text = chunk.get("text", "")
-        by_file[filename].append((num, source, text))
+        by_file[filename].append((num, chunk_id, doc_source, raw_source, text))
 
     docs: dict[str, dict] = {}
     for filename, items in by_file.items():
         items.sort(key=lambda x: x[0])
-        source = items[0][1] if items else filename
-        full_text = "\n\n".join(t for _, _, t in items)
+        full_text = "\n\n".join(text for _, _, _, _, text in items)
         docs[filename] = {
-            "source": source,
+            "source": items[0][2] if items else filename,
             "text": full_text,
             "char_count": len(full_text),
+            "segments": [
+                {"chunk_id": chunk_id, "source": item_source, "text": text}
+                for _, chunk_id, _, item_source, text in items
+            ],
         }
     return docs
+
+
+def _exact_segment_matches(context: AgentContext, filename: str, source: str, text: str) -> bool:
+    doc_haystacks = [filename, source]
+    section_haystacks = [source, text[:2400]]
+    doc_hits = QueryExpander.count_exact_doc_hits(context.exact_doc_terms, doc_haystacks)
+    section_hits = QueryExpander.count_exact_section_hits(context.exact_section_terms, section_haystacks)
+    return (
+        doc_hits == len(context.exact_doc_terms)
+        and section_hits == len(context.exact_section_terms)
+    )
+
+
+def _extract_exact_excerpt(context: AgentContext, text: str) -> str:
+    if not text:
+        return ""
+
+    match_start = 0
+    if context.exact_section_terms:
+        for term in context.exact_section_terms:
+            for pattern in QueryExpander._section_term_patterns(term):
+                match = pattern.search(text)
+                if match:
+                    match_start = max(0, match.start() - 120)
+                    break
+            if match_start:
+                break
+    excerpt = text[match_start: match_start + 1200].strip()
+    if not excerpt:
+        excerpt = text[:1200].strip()
+    excerpt = re.sub(r"\n{3,}", "\n\n", excerpt)
+    if len(excerpt) < len(text):
+        excerpt = f"{excerpt}\n[抜粋]"
+    return excerpt
 
 
 class ReadDocumentTool(BaseTool):
@@ -158,6 +198,19 @@ class ReadDocumentTool(BaseTool):
                 )
 
             parts.append(f"{header}\n\n{chunk}")
+
+            if context.exact_doc_terms or context.exact_section_terms:
+                for segment in doc.get("segments", []):
+                    segment_source = str(segment.get("source", source))
+                    segment_text = str(segment.get("text", ""))
+                    if not _exact_segment_matches(context, filename, segment_source, segment_text):
+                        continue
+                    chunk_id = str(segment.get("chunk_id", ""))
+                    excerpt = _extract_exact_excerpt(context, segment_text)
+                    if chunk_id and excerpt:
+                        context.mark_chunk_read(chunk_id, len(excerpt) // 4)
+                        context.set_evidence_note(chunk_id, excerpt, source=segment_source)
+                    break
 
         result = "\n\n---\n\n".join(parts)
         context.add_retrieval_log(

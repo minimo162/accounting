@@ -9,9 +9,11 @@ from scripts.corpus_pipeline import rollback_release, snapshot_release, validate
 from scripts import process_html_sources
 from scripts.source_manifest import (
     build_source_record,
+    load_source_metadata_lookup,
     metadata_for_file,
     save_source_manifest,
     scan_source_tree,
+    source_metadata_for_path,
     summarize_source_diff,
 )
 
@@ -50,6 +52,30 @@ class SourceManifestTests(unittest.TestCase):
             self.assertEqual(record["version"], "20250328")
             self.assertEqual(record["url"], "https://example.com/sample.pdf")
 
+    def test_build_source_record_includes_optional_document_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            file_path = data_dir / "pdfs" / "sample.pdf"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(b"sample-pdf")
+
+            record = build_source_record(
+                file_path,
+                data_dir=data_dir,
+                url="https://example.com/sample.pdf",
+                source_group="pdfs",
+                kind="pdf",
+                metadata={
+                    "source_url": "https://example.com/sample.pdf",
+                    "doc_title": "企業会計基準第22号",
+                    "standard_no": "企業会計基準第22号",
+                },
+            )
+
+            self.assertEqual(record["source_url"], "https://example.com/sample.pdf")
+            self.assertEqual(record["doc_title"], "企業会計基準第22号")
+            self.assertEqual(record["standard_no"], "企業会計基準第22号")
+
     def test_scan_source_tree_and_diff_detect_source_changes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir) / "data"
@@ -75,6 +101,56 @@ class SourceManifestTests(unittest.TestCase):
             self.assertEqual(diff["removed_count"], 1)
             self.assertEqual(diff["added_count"], 1)
             self.assertEqual(diff["changed"][0]["path"], "pdfs/a_20250328.pdf")
+
+    def test_source_metadata_lookup_supports_filename_and_relative_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            file_path = data_dir / "pdfs" / "sample.pdf"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(b"sample-pdf")
+            metadata_path = data_dir / "source_metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "sample.pdf": {"doc_title": "ファイル名優先"},
+                        "pdfs/sample.pdf": {"doc_title": "相対パス優先", "standard_no": "企業会計基準第99号"},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            lookup = load_source_metadata_lookup(metadata_path)
+            metadata = source_metadata_for_path(file_path, data_dir=data_dir, metadata_lookup=lookup)
+
+            self.assertEqual(metadata["doc_title"], "相対パス優先")
+            self.assertEqual(metadata["standard_no"], "企業会計基準第99号")
+
+    def test_scan_source_tree_applies_source_metadata_lookup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            pdf_dir = data_dir / "pdfs"
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            source_file = pdf_dir / "lease_20250328.pdf"
+            source_file.write_bytes(b"pdf-bytes")
+
+            sources = scan_source_tree(
+                data_dir,
+                url_lookup={"lease_20250328.pdf": "https://example.com/lease_20250328.pdf"},
+                metadata_lookup={
+                    "lease_20250328.pdf": {
+                        "doc_title": "企業会計基準第22号",
+                        "standard_no": "企業会計基準第22号",
+                        "source_url": "https://example.com/lease_20250328.pdf",
+                    }
+                },
+            )
+
+            entry = sources["pdfs/lease_20250328.pdf"]
+            self.assertEqual(entry["doc_title"], "企業会計基準第22号")
+            self.assertEqual(entry["standard_no"], "企業会計基準第22号")
+            self.assertEqual(entry["source_url"], "https://example.com/lease_20250328.pdf")
 
 
 class CorpusPipelineArtifactTests(unittest.TestCase):

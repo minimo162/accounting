@@ -86,6 +86,36 @@ def load_url_lookup(path: Path) -> dict[str, str]:
     return {str(key): str(value) for key, value in data.items()}
 
 
+def load_source_metadata_lookup(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    lookup: dict[str, dict[str, str]] = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lookup[str(key)] = {
+                str(field): str(field_value)
+                for field, field_value in value.items()
+                if field_value is not None
+            }
+    return lookup
+
+
+def source_metadata_for_path(
+    file_path: Path,
+    *,
+    data_dir: Path,
+    metadata_lookup: dict[str, dict[str, str]] | None = None,
+) -> dict[str, str]:
+    metadata_lookup = metadata_lookup or {}
+    rel_path = relative_source_path(file_path, data_dir)
+    return dict(
+        metadata_lookup.get(rel_path)
+        or metadata_lookup.get(file_path.name)
+        or {}
+    )
+
+
 def relative_source_path(file_path: Path, data_dir: Path) -> str:
     return file_path.resolve().relative_to(data_dir.resolve()).as_posix()
 
@@ -99,6 +129,7 @@ def build_source_record(
     source_group: str = "",
     kind: str = "",
     checked_at: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stat = file_path.stat()
     source_hash = sha256_file(file_path)
@@ -106,6 +137,7 @@ def build_source_record(
     rel_path = relative_source_path(file_path, data_dir)
     kind = kind or infer_source_kind(file_path)
     checked_at = checked_at or utc_now_iso()
+    metadata = metadata or {}
     fetched_at = (
         str(existing_entry.get("fetched_at", ""))
         if same_hash and existing_entry and existing_entry.get("fetched_at")
@@ -128,6 +160,9 @@ def build_source_record(
         "modified_at": iso_from_timestamp(stat.st_mtime),
         "file_size": stat.st_size,
         "source_hash": source_hash,
+        "source_url": str(metadata.get("source_url", url or str((existing_entry or {}).get("source_url", "")))),
+        "doc_title": str(metadata.get("doc_title", str((existing_entry or {}).get("doc_title", "")))),
+        "standard_no": str(metadata.get("standard_no", str((existing_entry or {}).get("standard_no", "")))),
     }
 
 
@@ -139,6 +174,7 @@ def upsert_source_record(
     url: str = "",
     source_group: str = "",
     kind: str = "",
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = load_source_manifest(manifest_file)
     sources = payload["sources"]
@@ -150,6 +186,7 @@ def upsert_source_record(
         url=url,
         source_group=source_group,
         kind=kind,
+        metadata=metadata,
     )
     save_source_manifest(manifest_file, sources)
     return sources[rel_path]
@@ -161,10 +198,12 @@ def scan_source_tree(
     roots: tuple[str, ...] = SOURCE_ROOTS,
     base_sources: dict[str, dict[str, Any]] | None = None,
     url_lookup: dict[str, str] | None = None,
+    metadata_lookup: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     sources: dict[str, dict[str, Any]] = {}
     base_sources = base_sources or {}
     url_lookup = url_lookup or {}
+    metadata_lookup = metadata_lookup or {}
     for root_name in roots:
         root = data_dir / root_name
         if not root.exists():
@@ -173,12 +212,18 @@ def scan_source_tree(
             rel_path = relative_source_path(file_path, data_dir)
             existing_entry = base_sources.get(rel_path, {})
             url = str(existing_entry.get("url", "")) or url_lookup.get(rel_path) or url_lookup.get(file_path.name, "")
+            metadata = source_metadata_for_path(
+                file_path,
+                data_dir=data_dir,
+                metadata_lookup=metadata_lookup,
+            )
             sources[rel_path] = build_source_record(
                 file_path,
                 data_dir=data_dir,
                 existing_entry=existing_entry,
                 url=url,
                 source_group=root_name,
+                metadata=metadata,
             )
     return sources
 

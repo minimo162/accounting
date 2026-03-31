@@ -12,6 +12,17 @@ class ToolRegistry:
     _EXACT_FILTERED_TOOL_NAMES = {"read_document"}
     _EXACT_FOLLOWUP_FILTERED_TOOL_NAMES = {"hybrid_search"}
 
+    @staticmethod
+    def _has_exact_shortfall(context: AgentContext | None) -> bool:
+        if context is None:
+            return False
+        if any(bool(entry.get("exact_shortfall")) for entry in context.search_history):
+            return True
+        return any(
+            log.tool_name == "hybrid_search" and bool(log.metadata.get("exact_shortfall"))
+            for log in context.retrieval_logs
+        )
+
     def __init__(self):
         self._tools: dict[str, BaseTool] = {}
 
@@ -23,7 +34,8 @@ class ToolRegistry:
             context and any(log.tool_name == "hybrid_search" for log in context.retrieval_logs)
         )
         is_exact_query = bool(context and QueryExpander.is_exact_query(context.question))
-        hide_exact_tools = is_exact_query
+        exact_shortfall = self._has_exact_shortfall(context)
+        hide_exact_tools = is_exact_query and not exact_shortfall
         hide_exact_followup_searches = bool(
             context and is_exact_query and any(log.tool_name == "hybrid_search" for log in context.retrieval_logs)
         )

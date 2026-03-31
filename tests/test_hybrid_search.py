@@ -130,6 +130,36 @@ class HybridSearchTests(unittest.TestCase):
 
         self.assertEqual(terms, ["企業会計基準第13号", "第10項", "借手", "リース"])
 
+    def test_exact_section_hit_matches_legacy_numeric_body_label(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        hits = QueryExpander.count_exact_section_hits(["第10項"], ["10. 借手は通常の売買取引に準じて会計処理を行う。"])
+
+        self.assertEqual(hits, 1)
+
+    def test_split_exact_constraints_keeps_standard_number_as_doc_term(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        doc_terms, section_terms = QueryExpander.split_exact_constraints(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか"
+        )
+
+        self.assertEqual(doc_terms, ["企業会計基準第13号"])
+        self.assertEqual(section_terms, ["第10項"])
+
+    def test_exact_keyword_term_sets_include_legacy_variants(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        term_sets = QueryExpander.exact_keyword_term_sets(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか"
+        )
+
+        self.assertIn(["企業会計基準第13号", "第10項"], term_sets)
+        self.assertIn(
+            ["企業会計基準第13号", "企業会計基準第13 号", "第10項", "10項", "10.", "10．", "借手", "リース"],
+            term_sets,
+        )
+
     def test_query_expansion_adds_hedge_accounting_focus_terms(self):
         from src.arag.query_rewrite import QueryExpander
 
@@ -345,6 +375,54 @@ class HybridSearchTests(unittest.TestCase):
             ],
         )
 
+    def test_query_profile_detects_judgment_validation_query(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        query = (
+            "単体で計上される売却損（未実現損失）は連結調整で消去するべきものでないと判断しています。"
+            "依拠: 連結財務諸表に関する会計基準 第36条。"
+            "この理解が妥当か確認してください。"
+        )
+
+        profile = QueryExpander.profile(query)
+
+        self.assertEqual(profile.complexity, "complex")
+        self.assertEqual(profile.search_mode, "keyword_first")
+        self.assertTrue(profile.verification_mode)
+        self.assertTrue(profile.judgment_validation)
+        self.assertEqual(
+            profile.validation_claims,
+            ["単体で計上される売却損（未実現損失）は連結調整で消去するべきものでないと判断しています"],
+        )
+        self.assertEqual(
+            profile.verification_claims,
+            [
+                {
+                    "claim": "単体で計上される売却損（未実現損失）は連結調整で消去するべきものでないと判断しています",
+                    "cited_references": ["第36条", "連結財務諸表に関する会計基準"],
+                    "doc_terms": ["連結財務諸表に関する会計基準"],
+                    "section_terms": ["第36条"],
+                    "search_query": "連結財務諸表に関する会計基準 第36条 単体 計上される売却損 未実現損失 連結調整",
+                }
+            ],
+        )
+        self.assertEqual(profile.cited_references, ["第36条", "連結財務諸表に関する会計基準"])
+        self.assertEqual(
+            profile.corrective_query,
+            "第36条 連結財務諸表に関する会計基準 単体 計上される売却損 未実現損失 連結調整 消去するべき 判断",
+        )
+
+    def test_query_profile_does_not_mark_normal_explanatory_query_as_verification_mode(self):
+        from src.arag.query_rewrite import QueryExpander
+
+        query = "連結財務諸表に関する会計基準第36条の内容を教えてください"
+
+        profile = QueryExpander.profile(query)
+
+        self.assertFalse(profile.verification_mode)
+        self.assertFalse(profile.judgment_validation)
+        self.assertEqual(profile.verification_claims, [])
+
     def test_detail_seeking_keyword_first_prefers_corrective_query_over_canonical_focus(self):
         query = "収益認識基準で履行義務はどのように識別しますか。保守サービスや値引きのある契約を念頭に説明してください"
         profile = QueryProfile(
@@ -436,8 +514,82 @@ class HybridSearchTests(unittest.TestCase):
 
         results, _, _ = tool.search(query, top_k=5)
 
-        self.assertEqual(keyword.calls[0][0], ("企業会計基準第13号", "第10項", "借手", "リース"))
-        self.assertEqual([item.parent_id for item in results], ["doc-a:p1"])
+        self.assertEqual(keyword.calls[0][0], ("企業会計基準第13号", "第10項"))
+        self.assertIn(("企業会計基準第13号", "第10項", "借手", "リース"), [call[0] for call in keyword.calls])
+
+    def test_judgment_validation_exact_query_uses_corrective_semantic_backfill(self):
+        query = (
+            "単体で計上される売却損（未実現損失）は連結調整で消去するべきものでないと判断しています。"
+            "依拠: 連結財務諸表に関する会計基準 第36条。"
+            "この理解が妥当か確認してください。"
+        )
+        corrective_query = "第36条 連結財務諸表に関する会計基準 単体 計上される売却損 未実現損失 連結調整 消去するべき 判断"
+        profile = QueryProfile(
+            query=query,
+            complexity="complex",
+            search_mode="keyword_first",
+            keywords=["売却損", "未実現損失", "連結調整", "消去"],
+            canonical_focus_query=corrective_query,
+            corrective_query=corrective_query,
+            judgment_validation=True,
+            validation_claims=["単体で計上される売却損（未実現損失）は連結調整で消去するべきものでないと判断しています"],
+            cited_references=["第36条", "連結財務諸表に関する会計基準"],
+        )
+        semantic = FakeSemanticTool({corrective_query: [make_result("doc-a:p36", 0.91)]})
+        keyword = FakeKeywordTool({})
+        tool = HybridSearchTool(
+            semantic_tool=semantic,
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander([query], exact=True, profile=profile),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        results, _, _ = tool.search(query, top_k=5)
+
+        self.assertEqual(semantic.calls[0][0], corrective_query)
+        self.assertEqual([item.parent_id for item in results], ["doc-a:p36"])
+
+    def test_exact_query_uses_semantic_backfill_when_keyword_hits_lack_exact_evidence(self):
+        query = "企業会計基準第13号第10項では借手のリースをどのように扱いますか"
+        profile = QueryProfile(
+            query=query,
+            complexity="simple",
+            search_mode="keyword_first",
+            keywords=["企業会計基準第13号", "第10項", "借手", "リース"],
+        )
+        semantic = FakeSemanticTool(
+            {
+                query: [
+                    SearchResult(
+                        chunk_id="doc-sem:p2",
+                        parent_id="doc-sem:p2",
+                        score=0.92,
+                        source="企業会計基準第13号 > 第10項",
+                        snippet="10. 借手は通常の売買取引に準じて処理する。",
+                        text="10. 借手は通常の売買取引に準じて処理する。",
+                        metadata={"standard_no": "企業会計基準第13号", "section_title": "第10項"},
+                    )
+                ]
+            }
+        )
+        keyword = FakeKeywordTool(
+            {
+                ("企業会計基準第13号", "第10項", "借手", "リース"): [make_result("doc-a:p1", 0.85)],
+            }
+        )
+        tool = HybridSearchTool(
+            semantic_tool=semantic,
+            keyword_tool=keyword,
+            query_expander=FakeQueryExpander([query], exact=True, profile=profile),
+            reranker=FakeReranker(),
+            config=RetrievalConfig(),
+        )
+
+        results, _, _ = tool.search(query, top_k=5)
+
+        self.assertEqual([called_query for called_query, _ in semantic.calls], [query])
+        self.assertEqual(results[0].parent_id, "doc-sem:p2")
 
     def test_keyword_first_focus_query_adds_semantic_backfill_when_top_hit_is_too_narrow(self):
         query = "収益認識基準における本人と代理人の区分はどう判断しますか"
@@ -525,8 +677,24 @@ class HybridSearchTests(unittest.TestCase):
         keyword = FakeKeywordTool(
             {
                 ("企業会計基準第13号", "第10項"): [
-                    make_result("doc-a:p1", 0.95),
-                    make_result("doc-b:p1", 0.85),
+                    SearchResult(
+                        chunk_id="doc-a:p1",
+                        parent_id="doc-a:p1",
+                        score=0.95,
+                        source="企業会計基準第13号 > 第10項",
+                        snippet="第10項 借手は通常の売買取引に準じて処理する。",
+                        text="第10項 借手は通常の売買取引に準じて処理する。",
+                        metadata={"standard_no": "企業会計基準第13号", "section_title": "第10項"},
+                    ),
+                    SearchResult(
+                        chunk_id="doc-b:p1",
+                        parent_id="doc-b:p1",
+                        score=0.85,
+                        source="企業会計基準第13号 > 第10項",
+                        snippet="第10項 オペレーティング・リース取引については通常の賃貸借取引に準じて処理する。",
+                        text="第10項 オペレーティング・リース取引については通常の賃貸借取引に準じて処理する。",
+                        metadata={"standard_no": "企業会計基準第13号", "section_title": "第10項"},
+                    ),
                 ]
             }
         )
@@ -542,7 +710,7 @@ class HybridSearchTests(unittest.TestCase):
         results, expansions, hyde_doc = tool.search("企業会計基準第13号 第10項", top_k=2)
 
         self.assertEqual([query for query, _ in semantic.calls], [])
-        self.assertEqual([keywords for keywords, _ in keyword.calls], [("企業会計基準第13号", "第10項")])
+        self.assertEqual(keyword.calls[0][0], ("企業会計基準第13号", "第10項"))
         self.assertEqual(reranker.calls, [])
         self.assertEqual(len(results), 2)
         self.assertEqual(expansions, ["企業会計基準第13号 第10項"])

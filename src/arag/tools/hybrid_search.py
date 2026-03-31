@@ -106,6 +106,10 @@ class HybridSearchTool(BaseTool):
                 "corrective_query": search_info.get("corrective_query"),
                 "effective_query": effective_query,
                 "chunk_ids": chunk_ids,
+                "exact_evidence_found": bool(search_info.get("exact_evidence_found")),
+                "exact_shortfall": bool(search_info.get("exact_shortfall")),
+                "exact_doc_hits": int(search_info.get("exact_doc_hits", 0) or 0),
+                "exact_section_hits": int(search_info.get("exact_section_hits", 0) or 0),
             }
         )
         retrieved_tokens = len(_tokenizer.encode("\n".join(snippets))) if snippets else 0
@@ -122,6 +126,10 @@ class HybridSearchTool(BaseTool):
                 "corrective_query": search_info.get("corrective_query"),
                 "query_complexity": search_info.get("profile", {}).get("complexity"),
                 "effective_query": effective_query,
+                "exact_evidence_found": bool(search_info.get("exact_evidence_found")),
+                "exact_shortfall": bool(search_info.get("exact_shortfall")),
+                "exact_doc_hits": int(search_info.get("exact_doc_hits", 0) or 0),
+                "exact_section_hits": int(search_info.get("exact_section_hits", 0) or 0),
             },
         )
         result_text = "\n".join(lines)
@@ -135,6 +143,10 @@ class HybridSearchTool(BaseTool):
             "confidence": confidence_score,
             "corrective_query": search_info.get("corrective_query"),
             "profile": search_info.get("profile", {}),
+            "exact_evidence_found": bool(search_info.get("exact_evidence_found")),
+            "exact_shortfall": bool(search_info.get("exact_shortfall")),
+            "exact_doc_hits": int(search_info.get("exact_doc_hits", 0) or 0),
+            "exact_section_hits": int(search_info.get("exact_section_hits", 0) or 0),
         }
         context.set_cached_tool_result(self.name, cache_key, result_text, tool_log)
         return result_text, tool_log
@@ -148,7 +160,7 @@ class HybridSearchTool(BaseTool):
         expansions = self.query_expander.expand(query)
         is_exact_query = self.query_expander.is_exact_query(query)
         hyde_doc = None if is_exact_query else self.query_expander.generate_hypothetical_document(query)
-        semantic_query = self._select_semantic_query(query, expansions)
+        semantic_query = self._select_semantic_query(query, expansions, profile)
 
         semantic_rankings = []
         keyword_rankings = []
@@ -156,6 +168,7 @@ class HybridSearchTool(BaseTool):
         semantic_limit = min(self.config.semantic_top_k, max(top_k * 2, 8))
 
         if is_exact_query or profile.search_mode == "keyword_first":
+            exact_term_sets: list[list[str]] = []
             if is_exact_query:
                 primary_keyword_query = query
             elif profile.detail_seeking and profile.corrective_query:
@@ -163,16 +176,23 @@ class HybridSearchTool(BaseTool):
             else:
                 primary_keyword_query = profile.canonical_focus_query or profile.corrective_query or query
             if is_exact_query:
-                keyword_terms = self.query_expander.exact_keyword_terms(primary_keyword_query)
+                exact_term_sets = QueryExpander.exact_keyword_term_sets(primary_keyword_query)
+                keyword_terms = exact_term_sets[0] if exact_term_sets else self.query_expander.exact_keyword_terms(primary_keyword_query)
             else:
                 keyword_terms = [term for term in primary_keyword_query.split() if term] or [primary_keyword_query]
             primary_keyword = self.keyword_tool.search(keyword_terms, keyword_limit)
             if primary_keyword:
                 keyword_rankings.append(primary_keyword)
+            if is_exact_query and not self._rankings_have_exact_evidence(query, keyword_rankings):
+                for term_set in exact_term_sets[1:3]:
+                    ranking = self.keyword_tool.search(term_set, keyword_limit)
+                    if ranking:
+                        keyword_rankings.append(ranking)
             if (
                 not primary_keyword
                 or (profile.complexity == "complex" and not is_exact_query)
                 or self._should_backfill_semantic_for_keyword_focus(profile, keyword_terms, primary_keyword, is_exact_query)
+                or (is_exact_query and not self._rankings_have_exact_evidence(query, keyword_rankings))
             ):
                 semantic_rankings.append(self.semantic_tool.search(semantic_query, semantic_limit))
         else:
@@ -203,14 +223,32 @@ class HybridSearchTool(BaseTool):
         reranked = self._filter_change_delta_results(query, reranked)
         reranked = self._filter_low_value_parent_results(reranked)
         final = reranked[:top_k]
+        exact_doc_hits = 0
+        exact_section_hits = 0
+        exact_evidence_found = False
+        doc_terms, section_terms = QueryExpander.split_exact_constraints(query)
+        if doc_terms or section_terms:
+            for item in final:
+                doc_hits, section_hits = self._exact_match_counts(query, item)
+                exact_doc_hits = max(exact_doc_hits, doc_hits)
+                exact_section_hits = max(exact_section_hits, section_hits)
+                if doc_hits == len(doc_terms) and section_hits == len(section_terms):
+                    exact_evidence_found = True
+                    break
         return final, expansions, hyde_doc, {
             "confidence": confidence,
             "corrective_query": corrective_query,
             "profile": profile.to_dict(),
+            "exact_evidence_found": exact_evidence_found,
+            "exact_shortfall": bool((doc_terms or section_terms) and not exact_evidence_found),
+            "exact_doc_hits": exact_doc_hits,
+            "exact_section_hits": exact_section_hits,
         }
 
     @staticmethod
-    def _select_semantic_query(query: str, expansions: list[str]) -> str:
+    def _select_semantic_query(query: str, expansions: list[str], profile: QueryProfile) -> str:
+        if (profile.verification_mode or profile.judgment_validation) and profile.corrective_query:
+            return profile.corrective_query
         if "会計基準" not in query:
             return query
         for variant in expansions:
@@ -263,7 +301,13 @@ class HybridSearchTool(BaseTool):
         anchors = self._query_anchor_terms(query)
         top_window = f"{top.source} {top.snippet[:260]} {top.text[:800]}"
         anchor_hits = sum(1 for term in anchors if term in top_window)
-        exact_hit = any(term in top_window for term in self._extract_exact_terms(query))
+        doc_terms, section_terms = self._split_exact_constraints(query)
+        doc_hits, section_hits = self._exact_match_counts(query, top)
+        exact_hit = (
+            (doc_terms or section_terms)
+            and doc_hits == len(doc_terms)
+            and section_hits == len(section_terms)
+        ) or any(term in top_window for term in self._extract_exact_terms(query))
         doc_type_match = self._doc_type_matches(
             self._target_doc_type(query),
             top.metadata or {},
@@ -282,6 +326,8 @@ class HybridSearchTool(BaseTool):
             confidence += 0.1
         if exact_hit:
             confidence += 0.25
+        elif (doc_terms and doc_hits == len(doc_terms)) or (section_terms and section_hits == len(section_terms)):
+            confidence += 0.12
         if doc_type_match:
             confidence += 0.1
         if title_hit:
@@ -318,14 +364,7 @@ class HybridSearchTool(BaseTool):
 
     @classmethod
     def _split_exact_constraints(cls, query: str) -> tuple[list[str], list[str]]:
-        doc_terms: list[str] = []
-        section_terms: list[str] = []
-        for term in cls._extract_exact_terms(query):
-            if re.search(r"(第\d+(?:項|条)$|^BC\d+)", term):
-                section_terms.append(term)
-            else:
-                doc_terms.append(term)
-        return doc_terms, section_terms
+        return QueryExpander.split_exact_constraints(query)
 
     def _exact_match_counts(self, query: str, item) -> tuple[int, int]:
         doc_terms, section_terms = self._split_exact_constraints(query)
@@ -333,25 +372,24 @@ class HybridSearchTool(BaseTool):
         file_name = str(meta.get("file", ""))
         aliases = self.semantic_tool._corpus.get_document_aliases(file_name) if file_name else set()
 
-        doc_haystacks = [
-            self._normalize_exact_text(item.source),
-            self._normalize_exact_text(str(meta.get("source", ""))),
-            self._normalize_exact_text(str(meta.get("doc_title", ""))),
-            self._normalize_exact_text(str(meta.get("standard_no", ""))),
-            *(self._normalize_exact_text(alias) for alias in aliases),
-        ]
-        section_haystacks = [
-            self._normalize_exact_text(item.source),
-            self._normalize_exact_text(str(meta.get("section_title", ""))),
-            self._normalize_exact_text(item.snippet[:260]),
-            self._normalize_exact_text(item.text[:1200]),
-        ]
-
-        doc_hits = sum(
-            1 for term in doc_terms if any(self._normalize_exact_text(term) in haystack for haystack in doc_haystacks)
+        doc_hits = QueryExpander.count_exact_doc_hits(
+            doc_terms,
+            [
+                item.source,
+                str(meta.get("source", "")),
+                str(meta.get("doc_title", "")),
+                str(meta.get("standard_no", "")),
+                *aliases,
+            ],
         )
-        section_hits = sum(
-            1 for term in section_terms if any(self._normalize_exact_text(term) in haystack for haystack in section_haystacks)
+        section_hits = QueryExpander.count_exact_section_hits(
+            section_terms,
+            [
+                item.source,
+                str(meta.get("section_title", "")),
+                item.snippet[:260],
+                item.text[:1200],
+            ],
         )
         return doc_hits, section_hits
 
@@ -443,6 +481,17 @@ class HybridSearchTool(BaseTool):
             )
         boosted.sort(key=lambda item: item.score, reverse=True)
         return boosted
+
+    def _rankings_have_exact_evidence(self, query: str, rankings: list[list]) -> bool:
+        doc_terms, section_terms = QueryExpander.split_exact_constraints(query)
+        if not doc_terms and not section_terms:
+            return False
+        for ranking in rankings:
+            for item in ranking[:5]:
+                doc_hits, section_hits = self._exact_match_counts(query, item)
+                if doc_hits == len(doc_terms) and section_hits == len(section_terms):
+                    return True
+        return False
 
     @staticmethod
     def _is_change_query(query: str) -> bool:

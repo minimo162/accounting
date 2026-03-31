@@ -22,6 +22,13 @@ class ReadChunkTool(BaseTool):
         "また", "次の", "以下", "比較", "区分", "判断", "経過措置",
         "適用時期", "別個", "見積り", "制約",
     )
+    _COMPACT_REQUIREMENT_MARKERS = (
+        "主な要件", "要件", "記載事項", "文書化", "有効性", "事前", "事後",
+        "リスク管理方針", "ヘッジ", "繰延ヘッジ",
+    )
+    _REQUIREMENT_SIGNAL_MARKERS = (
+        "要件", "文書", "有効性", "事前", "事後", "リスク管理", "ヘッジ対象", "ヘッジ手段", "対象リスク",
+    )
 
     def __init__(self, corpus: ChunkCorpus):
         self._corpus = corpus
@@ -87,11 +94,19 @@ class ReadChunkTool(BaseTool):
             source = parent.get("source", "")
             query = context.current_search_query or context.question
             detail_seeking = bool(context.query_profile.get("detail_seeking"))
+            compact_requirements = self._is_compact_requirement_query(query, detail_seeking=detail_seeking)
+            focus_terms = (
+                self._extract_query_terms(query)
+                if compact_requirements
+                else self._focus_terms_for_context(context, query)
+            )
             excerpt, compressed = self._build_excerpt(
                 text,
                 query,
                 context.question_complexity,
                 detail_seeking=detail_seeking,
+                focus_terms=focus_terms,
+                compact_requirements=compact_requirements,
             )
             chunk_tokens = len(_tokenizer.encode(excerpt))
             total_tokens += chunk_tokens
@@ -167,6 +182,26 @@ class ReadChunkTool(BaseTool):
         return units
 
     @classmethod
+    def _focus_terms_for_context(cls, context: AgentContext, query: str) -> list[str]:
+        terms = cls._extract_query_terms(query)
+        coverage = context.get_evidence_coverage()
+        slot_labels = coverage["uncovered_slots"] or coverage["slots"]
+        for label in slot_labels:
+            aliases = context.evidence_slot_terms.get(label, (label,))
+            for alias in aliases:
+                normalized = alias.strip()
+                if (
+                    not normalized
+                    or normalized in cls._GENERIC_QUERY_TERMS
+                    or normalized in terms
+                ):
+                    continue
+                terms.append(normalized)
+                if len(terms) >= 8:
+                    return terms
+        return terms[:8]
+
+    @classmethod
     def _score_unit(cls, unit: str, query_terms: list[str], *, detail_seeking: bool = False) -> int:
         score = 0
         for term in query_terms:
@@ -179,7 +214,25 @@ class ReadChunkTool(BaseTool):
         return score
 
     @classmethod
-    def _excerpt_budget(cls, complexity: str, *, detail_seeking: bool = False) -> int:
+    def _is_compact_requirement_query(cls, query: str, *, detail_seeking: bool = False) -> bool:
+        if not detail_seeking:
+            return False
+        return sum(1 for marker in cls._COMPACT_REQUIREMENT_MARKERS if marker in query) >= 2
+
+    @classmethod
+    def _excerpt_budget(
+        cls,
+        complexity: str,
+        *,
+        detail_seeking: bool = False,
+        compact_requirements: bool = False,
+    ) -> int:
+        if compact_requirements:
+            if complexity == "simple":
+                return 1000
+            if complexity == "complex":
+                return 2100
+            return 1450
         if complexity == "simple":
             return 1200
         if complexity == "complex":
@@ -194,12 +247,18 @@ class ReadChunkTool(BaseTool):
         complexity: str,
         *,
         detail_seeking: bool = False,
+        focus_terms: list[str] | None = None,
+        compact_requirements: bool = False,
     ) -> tuple[str, bool]:
-        budget = cls._excerpt_budget(complexity, detail_seeking=detail_seeking)
+        budget = cls._excerpt_budget(
+            complexity,
+            detail_seeking=detail_seeking,
+            compact_requirements=compact_requirements,
+        )
         if len(text) <= budget:
             return text, False
 
-        query_terms = cls._extract_query_terms(query)
+        query_terms = list(focus_terms or cls._extract_query_terms(query))
         units = cls._sentence_units(text)
         if not units:
             return text[:budget].rstrip(), True
@@ -214,31 +273,44 @@ class ReadChunkTool(BaseTool):
                 key=lambda item: (item[0], -item[1]),
                 reverse=True,
             )
-            selected_budget = 8 if detail_seeking else 6
+            selected_budget = 5 if compact_requirements else 8 if detail_seeking else 6
             for score, idx in scored_units[:selected_budget]:
                 if score <= 0:
                     continue
+                if compact_requirements:
+                    unit = units[idx]
+                    lexical_score = sum(
+                        3 if len(term) >= 4 else 2
+                        for term in query_terms
+                        if term in unit
+                    )
+                    if lexical_score < 4 and not any(marker in unit for marker in cls._REQUIREMENT_SIGNAL_MARKERS):
+                        continue
                 selected_indexes.add(idx)
-                if idx > 0:
+                if idx > 0 and not compact_requirements:
                     selected_indexes.add(idx - 1)
-                if idx + 1 < len(units):
+                if idx + 1 < len(units) and not compact_requirements:
                     selected_indexes.add(idx + 1)
-                if detail_seeking and idx + 2 < len(units):
+                if detail_seeking and not compact_requirements and idx + 2 < len(units):
                     next_unit = units[idx + 1]
                     if any(marker in next_unit for marker in cls._DETAIL_MARKERS):
                         selected_indexes.add(idx + 2)
 
         if not selected_indexes:
-            fallback_budget = 8 if detail_seeking else 6
+            fallback_budget = 5 if compact_requirements else 8 if detail_seeking else 6
             selected_indexes.update(range(min(fallback_budget, len(units))))
 
         if detail_seeking:
             for idx, unit in enumerate(units):
                 if any(marker in unit for marker in cls._DETAIL_MARKERS):
+                    if compact_requirements and not any(
+                        marker in unit for marker in cls._REQUIREMENT_SIGNAL_MARKERS
+                    ):
+                        continue
                     selected_indexes.add(idx)
-                    if idx > 0:
+                    if idx > 0 and not compact_requirements:
                         selected_indexes.add(idx - 1)
-                    if idx + 1 < len(units):
+                    if idx + 1 < len(units) and not compact_requirements:
                         selected_indexes.add(idx + 1)
 
         ordered_units = [units[idx] for idx in sorted(selected_indexes)]

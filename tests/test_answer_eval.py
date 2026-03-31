@@ -189,6 +189,49 @@ class AnswerEvalTests(unittest.TestCase):
         self.assertEqual(summary["avg_uncited_lines"], 0.5)
         self.assertEqual(summary["reference_alignment_failures"], 1)
         self.assertEqual(summary["missing_reference_url_failures"], 1)
+        self.assertEqual(summary["exact_clause_failures"], 0)
+
+    def test_summarize_answer_eval_counts_exact_clause_failures(self):
+        results = [
+            AnswerEvalResult(
+                case_id="lease_exact_clause",
+                question="Q1",
+                passed=False,
+                elapsed_sec=10.0,
+                loops=3,
+                read_chunk_count=2,
+                retrieved_tokens=1000,
+                citation_count=1,
+                cited_line_count=1,
+                inline_citation_count=1,
+                reference_count=1,
+                max_citation_number=1,
+                uncited_line_count=0,
+                reference_alignment_ok=True,
+                failure_reasons=["missing_any=['売買処理']"],
+            ),
+            AnswerEvalResult(
+                case_id="other_case",
+                question="Q2",
+                passed=False,
+                elapsed_sec=20.0,
+                loops=5,
+                read_chunk_count=4,
+                retrieved_tokens=3000,
+                citation_count=1,
+                cited_line_count=1,
+                inline_citation_count=1,
+                reference_count=1,
+                max_citation_number=1,
+                uncited_line_count=1,
+                reference_alignment_ok=False,
+                failure_reasons=["missing_all=['借手']"],
+            ),
+        ]
+
+        summary = summarize_answer_eval(results)
+
+        self.assertEqual(summary["exact_clause_failures"], 1)
 
     def test_split_failure_reasons_separates_hard_and_soft(self):
         hard, soft = split_failure_reasons(
@@ -275,6 +318,7 @@ class AnswerEvalTests(unittest.TestCase):
             "reference_alignment_failures": 1,
             "missing_reference_url_failures": 1,
             "insufficient_detail_failures": 1,
+            "exact_clause_failures": 1,
         }
         results = [
             AnswerEvalResult(
@@ -311,6 +355,7 @@ class AnswerEvalTests(unittest.TestCase):
         self.assertIn("Avg cited lines: 1.0", report)
         self.assertIn("Avg uncited lines: 1.0", report)
         self.assertIn("Insufficient detail failures: 1", report)
+        self.assertIn("Exact clause failures: 1", report)
         self.assertIn("Gate mode: hard", report)
         self.assertIn("Override reason: approved", report)
         self.assertIn("FAIL lease", report)

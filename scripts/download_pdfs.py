@@ -10,9 +10,23 @@ from pathlib import Path
 import httpx
 
 try:
-    from .source_manifest import load_url_lookup, manifest_path, sha256_file, upsert_source_record
+    from .source_manifest import (
+        load_source_metadata_lookup,
+        load_url_lookup,
+        manifest_path,
+        sha256_file,
+        source_metadata_for_path,
+        upsert_source_record,
+    )
 except ImportError:
-    from source_manifest import load_url_lookup, manifest_path, sha256_file, upsert_source_record
+    from source_manifest import (
+        load_source_metadata_lookup,
+        load_url_lookup,
+        manifest_path,
+        sha256_file,
+        source_metadata_for_path,
+        upsert_source_record,
+    )
 
 
 def _pdf_entries(source_map: dict[str, str]) -> list[tuple[str, str]]:
@@ -29,6 +43,7 @@ async def sync_pdfs(
     output_dir: str = "data/pdfs",
     *,
     pdf_sources_path: str = "data/pdf_sources.json",
+    source_metadata_path: str = "data/source_metadata.json",
     refresh_existing: bool = True,
     limit: int | None = None,
 ) -> dict[str, int]:
@@ -36,6 +51,7 @@ async def sync_pdfs(
     output_path.mkdir(parents=True, exist_ok=True)
     data_dir = output_path.parent
     sources = load_url_lookup(Path(pdf_sources_path))
+    metadata_lookup = load_source_metadata_lookup(Path(source_metadata_path))
     entries = _pdf_entries(sources)
     if limit is not None:
         entries = entries[:limit]
@@ -69,6 +85,11 @@ async def sync_pdfs(
                     url=url,
                     source_group="pdfs",
                     kind="pdf",
+                    metadata=source_metadata_for_path(
+                        destination,
+                        data_dir=data_dir,
+                        metadata_lookup=metadata_lookup,
+                    ),
                 )
                 summary["skipped"] += 1
                 print("  Skip (existing, refresh disabled)")
@@ -104,6 +125,11 @@ async def sync_pdfs(
                 url=url,
                 source_group="pdfs",
                 kind="pdf",
+                metadata=source_metadata_for_path(
+                    destination,
+                    data_dir=data_dir,
+                    metadata_lookup=metadata_lookup,
+                ),
             )
 
     print(
@@ -122,6 +148,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", nargs="?", default="data/pdfs")
     parser.add_argument("--pdf-sources", default="data/pdf_sources.json")
+    parser.add_argument("--source-metadata", default="data/source_metadata.json")
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--skip-existing",
@@ -137,6 +164,7 @@ if __name__ == "__main__":
         sync_pdfs(
             args.output_dir,
             pdf_sources_path=args.pdf_sources,
+            source_metadata_path=args.source_metadata,
             refresh_existing=not args.skip_existing,
             limit=args.limit,
         )

@@ -22,6 +22,22 @@ class ReadDocumentToolTests(unittest.TestCase):
             },
         ]
 
+    def _make_exact_chunks(self) -> list[dict]:
+        return [
+            {
+                "id": "lease.pdf:1",
+                "file": "lease.pdf",
+                "source": "企業会計基準第13号 > 総則",
+                "text": "1. 総則",
+            },
+            {
+                "id": "lease.pdf:2",
+                "file": "lease.pdf",
+                "source": "企業会計基準第13号 > 借手側",
+                "text": "10. 借手は、通常の売買取引に係る方法に準じて会計処理を行う。15. オペレーティング・リース取引については、通常の賃貸借取引に係る方法に準じて会計処理を行う。",
+            },
+        ]
+
     def test_read_document_uses_complex_budget(self):
         tool = ReadDocumentTool(self._make_chunks())
         context = AgentContext()
@@ -45,6 +61,17 @@ class ReadDocumentToolTests(unittest.TestCase):
         self.assertEqual(log["max_chars"], 18_000)
         self.assertIn("[読取範囲: 0〜18,000文字目]", text)
         self.assertIn('read_document(name="sample.pdf", offset=18000)', text)
+
+    def test_read_document_registers_exact_evidence_from_legacy_section_label(self):
+        tool = ReadDocumentTool(self._make_exact_chunks())
+        context = AgentContext()
+        context.set_question("企業会計基準第13号第10項では借手のリースをどのように扱いますか", {"complexity": "simple"})
+
+        _, _ = tool.execute(context, name="lease.pdf")
+
+        self.assertIn("lease.pdf:2", context.evidence_notes)
+        self.assertIn("10. 借手は", context.evidence_notes["lease.pdf:2"])
+        self.assertIn("lease.pdf:2", context.exact_evidence_chunk_ids)
 
 
 if __name__ == "__main__":

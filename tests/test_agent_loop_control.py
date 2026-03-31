@@ -160,6 +160,19 @@ class AgentLoopControlTests(unittest.TestCase):
 
         self.assertEqual(names, ["hybrid_search", "keyword_search", "semantic_search", "read_chunk"])
 
+    def test_tool_registry_allows_read_document_after_exact_shortfall(self):
+        registry = ToolRegistry()
+        for tool_name in ("hybrid_search", "keyword_search", "semantic_search", "read_chunk", "read_document"):
+            registry.register(self.DummyTool(tool_name))
+        context = AgentContext()
+        context.set_question("企業会計基準第13号第10項では借手のリースをどのように扱いますか", {"complexity": "simple"})
+        context.add_search_entry({"exact_shortfall": True})
+        context.add_retrieval_log("hybrid_search", 10, metadata={"exact_shortfall": True})
+
+        names = [entry["function"]["name"] for entry in registry.get_schemas(context)]
+
+        self.assertEqual(names, ["read_chunk", "read_document"])
+
     def test_tool_registry_hides_hybrid_search_after_first_exact_query_search(self):
         registry = ToolRegistry()
         for tool_name in ("hybrid_search", "keyword_search", "semantic_search", "read_chunk", "read_document"):
@@ -253,6 +266,23 @@ class AgentLoopControlTests(unittest.TestCase):
 
         self.assertEqual(context.evidence_slots, ["本人", "代理人"])
 
+    def test_hedge_requirement_question_infers_focus_slots_from_corrective_query(self):
+        context = AgentContext()
+        context.set_question(
+            "繰延ヘッジを適用するための主な要件を教えてください",
+            {
+                "complexity": "moderate",
+                "detail_seeking": True,
+                "canonical_focus_query": "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+                "corrective_query": "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト 要件",
+            },
+        )
+
+        self.assertEqual(
+            context.evidence_slots,
+            ["ヘッジ", "有効性", "文書化", "事前", "事後"],
+        )
+
     def test_arun_emits_structured_completion_log(self):
         agent = self.make_agent()
         agent.llm = self.NaturalAnswerLLM()
@@ -315,6 +345,20 @@ class AgentLoopControlTests(unittest.TestCase):
             agent._should_retry_natural_answer({"cited_reference_count": 1}, context)
         )
 
+    def test_retry_natural_answer_for_exact_query_without_exact_evidence(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか",
+            {"complexity": "simple", "search_mode": "keyword_first", "keywords": ["借手"]},
+        )
+        context.mark_chunk_read("lease:p11")
+        context.set_evidence_note("lease:p11", "借手の一般的な説明。", source="企業会計基準第13号 > 借手")
+
+        self.assertTrue(
+            agent._should_retry_natural_answer({"cited_reference_count": 1}, context)
+        )
+
     def test_force_stop_reason_returns_evidence_sufficient_before_budget(self):
         agent = self.make_agent()
         context = AgentContext()
@@ -332,6 +376,93 @@ class AgentLoopControlTests(unittest.TestCase):
         )
 
         self.assertEqual(agent._force_stop_reason(context), "evidence_sufficient")
+
+    def test_exact_query_is_not_sufficient_without_exact_evidence(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか",
+            {"complexity": "simple", "search_mode": "keyword_first", "keywords": ["借手", "リース"]},
+        )
+        context.add_retrieval_log("hybrid_search", 10, metadata={"exact_shortfall": True})
+        context.add_retrieval_log("read_chunk", 10)
+        context.set_evidence_note("lease:p11", "借手の一般的な説明。", source="企業会計基準第13号 > 借手")
+
+        self.assertFalse(agent._has_sufficient_evidence(context))
+
+    def test_exact_query_with_read_document_exact_evidence_is_sufficient(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか",
+            {"complexity": "simple", "search_mode": "keyword_first", "keywords": ["借手", "リース"]},
+        )
+        context.add_retrieval_log("hybrid_search", 10, metadata={"exact_shortfall": True})
+        context.add_retrieval_log("read_document", 10)
+        context.set_evidence_note(
+            "lease:p10",
+            "10. 借手は、通常の売買取引に係る方法に準じて会計処理を行う。",
+            source="企業会計基準第13号 > 借手側",
+        )
+
+        self.assertTrue(agent._has_sufficient_evidence(context))
+
+    def test_hedge_requirement_query_requires_effectiveness_slot_before_stop(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "繰延ヘッジを適用するための主な要件を教えてください",
+            {
+                "complexity": "moderate",
+                "search_mode": "keyword_first",
+                "detail_seeking": True,
+                "canonical_focus_query": "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト",
+                "corrective_query": "ヘッジ会計 繰延ヘッジ ヘッジ会計の適用要件 正式な文書 有効性 事前テスト 事後テスト 要件",
+            },
+        )
+        for _ in range(2):
+            context.add_retrieval_log("hybrid_search", 10)
+        context.add_retrieval_log("read_chunk", 10)
+        context.add_retrieval_log("read_chunk", 10)
+        context.set_evidence_note("hedge:p1", "正式な文書によりヘッジ取引を明確にする。", source="移管指針第9号 > 文書化")
+        context.set_evidence_note("hedge:p2", "ヘッジ取引開始時に事前テストを行う。事後テストも必要である。", source="移管指針第9号 > 有効性")
+        context.evidence_slot_hits["有効性"].clear()
+
+        self.assertFalse(agent._has_sufficient_evidence(context))
+
+    def test_exact_gap_message_guides_read_document_and_blocks_general_fallback(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか",
+            {"complexity": "simple", "search_mode": "keyword_first", "keywords": ["企業会計基準第13号", "第10項"]},
+        )
+        context.add_search_entry({"exact_shortfall": True})
+        context.add_retrieval_log("hybrid_search", 10, metadata={"exact_shortfall": True})
+
+        message = agent._build_exact_gap_message(context)
+
+        self.assertIsNotNone(message)
+        self.assertIn("read_document", message["content"])
+        self.assertIn("一般論", message["content"])
+
+    def test_exact_evidence_message_surfaces_clause_key_terms(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "企業会計基準第13号第10項では借手のリースをどのように扱いますか",
+            {"complexity": "simple", "search_mode": "keyword_first", "keywords": ["企業会計基準第13号", "第10項"]},
+        )
+        context.set_evidence_note(
+            "lease:p10",
+            "10. 借手は、通常の売買取引に係る方法に準じた会計処理により、リース資産及びリース債務を計上する。",
+            source="企業会計基準第13号 > 借手側",
+        )
+
+        message = agent._build_exact_evidence_message(context)
+
+        self.assertIsNotNone(message)
+        self.assertIn("通常の売買処理", message["content"])
 
     def test_keyword_first_query_can_stop_with_slot_coverage_even_without_high_confidence(self):
         agent = self.make_agent()
@@ -453,6 +584,44 @@ class AgentLoopControlTests(unittest.TestCase):
             "rev:p2",
             "値引きは原則として履行義務に比例配分する。",
             source="収益認識基準 > 値引きの配分",
+        )
+
+        self.assertEqual(agent._force_stop_reason(context), "evidence_sufficient")
+
+    def test_detail_keyword_first_query_can_stop_with_detail_rich_notes_at_lower_confidence(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "収益認識基準で履行義務はどのように識別しますか。保守サービスや値引きのある契約を念頭に説明してください",
+            {
+                "complexity": "moderate",
+                "search_mode": "keyword_first",
+                "detail_seeking": True,
+                "keywords": ["履行義務", "保守サービス", "値引き"],
+            },
+        )
+        query = "収益認識基準 履行義務 別個 保守サービス 値引き 契約 識別"
+        context.add_search_entry(
+            {
+                "confidence": 0.36,
+                "query": query,
+                "effective_query": query,
+                "chunk_ids": ["rev:p1", "rev:p2", "rev:p3"],
+                "exact_shortfall": False,
+            }
+        )
+        context.add_retrieval_log("hybrid_search", 10)
+        context.add_retrieval_log("read_chunk", 10)
+        context.add_retrieval_log("read_chunk", 10)
+        context.set_evidence_note(
+            "rev:p1",
+            "履行義務は顧客との契約で約束した財又はサービスを識別し、別個の便益を提供できるかや、他の約束と統合して提供されるかを判断する。",
+            source="収益認識基準 > 履行義務の識別",
+        )
+        context.set_evidence_note(
+            "rev:p2",
+            "保守サービスが単独で便益を提供できる場合は別個の履行義務となり、値引きは履行義務の識別後に取引価格の配分で検討する。",
+            source="収益認識基準 > 契約の分解",
         )
 
         self.assertEqual(agent._force_stop_reason(context), "evidence_sufficient")

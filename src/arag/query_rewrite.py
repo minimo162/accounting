@@ -21,6 +21,11 @@ class QueryProfile:
     corrective_query: str | None = None
     detail_seeking: bool = False
     detail_terms: list[str] = field(default_factory=list)
+    verification_mode: bool = False
+    verification_claims: list[dict[str, object]] = field(default_factory=list)
+    judgment_validation: bool = False
+    validation_claims: list[str] = field(default_factory=list)
+    cited_references: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -32,6 +37,11 @@ class QueryProfile:
             "corrective_query": self.corrective_query,
             "detail_seeking": self.detail_seeking,
             "detail_terms": list(self.detail_terms),
+            "verification_mode": self.verification_mode,
+            "verification_claims": list(self.verification_claims),
+            "judgment_validation": self.judgment_validation,
+            "validation_claims": list(self.validation_claims),
+            "cited_references": list(self.cited_references),
         }
 
 
@@ -62,6 +72,15 @@ class QueryExpander:
     _DETAIL_HINT_TERMS = (
         "要件", "条件", "例外", "判断", "比較", "経過措置", "適用時期",
         "識別", "見積り", "見積もり", "場合", "区分", "差異",
+    )
+    _JUDGMENT_VALIDATION_TERMS = (
+        "妥当か", "妥当でしょうか", "正しいか", "正しいでしょうか", "問題ないか",
+        "問題ないでしょうか", "確認して", "確認してください", "チェックして",
+        "チェックしてください", "見てください", "適切か", "適切でしょうか",
+    )
+    _JUDGMENT_ASSERTION_TERMS = (
+        "と判断", "と考え", "べき", "ではない", "だと思", "という理解",
+        "という認識", "としている", "として扱", "と整理",
     )
     _SIMPLE_TERMS = ("とは", "何か", "意味", "定義", "概要", "趣旨")
     _KEYWORD_PATTERNS = (
@@ -150,16 +169,34 @@ class QueryExpander:
     def profile(cls, query: str) -> QueryProfile:
         keywords = cls._extract_keywords(query)
         exact = cls.is_exact_query(query)
-        complexity = cls._infer_complexity(query, keywords, exact)
+        judgment_validation = cls._is_judgment_validation(query)
+        validation_claims = cls._extract_validation_claims(query)
+        cited_references = cls.extract_exact_terms(query)
+        verification_claims = cls._build_verification_claims(
+            validation_claims,
+            cited_references,
+        )
+        complexity = cls._infer_complexity(query, keywords, exact, judgment_validation=judgment_validation)
         detail_seeking = cls._is_detail_seeking(query, exact, complexity)
         detail_terms = cls._detail_focus_terms(query)
-        canonical_focus = cls._domain_focus_variant(query) or cls._canonical_title_focus_variant(query)
+        canonical_focus = (
+            cls._validation_focus_variant(
+                query,
+                keywords=keywords,
+                exact_terms=cited_references,
+                validation_claims=validation_claims,
+            )
+            if judgment_validation
+            else None
+        ) or cls._domain_focus_variant(query) or cls._canonical_title_focus_variant(query)
         corrective_query = cls._merge_focus_terms(
             canonical_focus or cls._anchor_focus_variant(query),
             detail_terms if detail_seeking else [],
         )
 
         if exact:
+            search_mode = "keyword_first"
+        elif judgment_validation and (canonical_focus or corrective_query):
             search_mode = "keyword_first"
         elif canonical_focus and (
             complexity != "complex"
@@ -183,6 +220,11 @@ class QueryExpander:
             corrective_query=corrective_query,
             detail_seeking=detail_seeking,
             detail_terms=detail_terms,
+            verification_mode=judgment_validation,
+            verification_claims=verification_claims,
+            judgment_validation=judgment_validation,
+            validation_claims=validation_claims,
+            cited_references=cited_references,
         )
 
     @staticmethod
@@ -210,6 +252,170 @@ class QueryExpander:
                 continue
             filtered.append(term)
         return filtered
+
+    @classmethod
+    def split_exact_constraints(cls, query: str) -> tuple[list[str], list[str]]:
+        doc_terms: list[str] = []
+        section_terms: list[str] = []
+        for term in cls.extract_exact_terms(query):
+            normalized = cls.normalize_exact_text(term)
+            if re.fullmatch(
+                r"(?:企業会計基準|企業会計基準適用指針|適用指針|実務対応報告|会計基準)第\d+号",
+                normalized,
+            ):
+                doc_terms.append(term)
+            elif re.fullmatch(r"第\d+(?:項|条|号)", normalized) or re.fullmatch(r"BC\d+(?:[-‑–]\d+)?", normalized, flags=re.IGNORECASE):
+                section_terms.append(term)
+            else:
+                doc_terms.append(term)
+        return doc_terms, section_terms
+
+    @staticmethod
+    def normalize_exact_text(text: str) -> str:
+        return re.sub(r"[\s　]+", "", text or "")
+
+    @classmethod
+    def _section_term_patterns(cls, term: str) -> list[re.Pattern[str]]:
+        normalized = cls.normalize_exact_text(term)
+        match = re.fullmatch(r"第(\d+)(項|条|号)", normalized)
+        if match:
+            number, suffix = match.groups()
+            return [
+                re.compile(rf"第\s*{re.escape(number)}\s*{re.escape(suffix)}"),
+                re.compile(rf"(?<!\d){re.escape(number)}\s*{re.escape(suffix)}(?!\d)"),
+                re.compile(rf"(?<!\d){re.escape(number)}\s*[\.．](?!\d)"),
+                re.compile(rf"[（(]\s*{re.escape(number)}\s*[)）](?!\d)"),
+            ]
+        bc_match = re.fullmatch(r"BC(\d+)", normalized, flags=re.IGNORECASE)
+        if bc_match:
+            number = bc_match.group(1)
+            return [
+                re.compile(rf"BC\s*{re.escape(number)}", flags=re.IGNORECASE),
+                re.compile(rf"結論の背景\s*{re.escape(number)}"),
+            ]
+        return [re.compile(re.escape(normalized))]
+
+    @classmethod
+    def count_exact_doc_hits(cls, doc_terms: list[str], texts: list[str]) -> int:
+        if not doc_terms:
+            return 0
+        haystacks = [cls.normalize_exact_text(text) for text in texts if text]
+        return sum(
+            1
+            for term in doc_terms
+            if any(cls.normalize_exact_text(term) in haystack for haystack in haystacks)
+        )
+
+    @classmethod
+    def count_exact_section_hits(cls, section_terms: list[str], texts: list[str]) -> int:
+        if not section_terms:
+            return 0
+        haystacks = [text for text in texts if text]
+        hits = 0
+        for term in section_terms:
+            patterns = cls._section_term_patterns(term)
+            if any(any(pattern.search(text) for pattern in patterns) for text in haystacks):
+                hits += 1
+        return hits
+
+    @classmethod
+    def _exact_doc_term_variants(cls, term: str) -> list[str]:
+        normalized = cls.normalize_exact_text(term)
+        variants: list[str] = []
+
+        def add(value: str) -> None:
+            cleaned = value.strip()
+            if cleaned and cleaned not in variants:
+                variants.append(cleaned)
+
+        add(term)
+        if normalized != term:
+            add(normalized)
+
+        reference_match = re.fullmatch(r"(.+第)(\d+)(号)", normalized)
+        if reference_match:
+            prefix, number, suffix = reference_match.groups()
+            add(f"{prefix}{number}{suffix}")
+            add(f"{prefix}{number} {suffix}")
+
+        return variants
+
+    @classmethod
+    def _exact_section_term_variants(cls, term: str) -> list[str]:
+        normalized = cls.normalize_exact_text(term)
+        variants: list[str] = []
+
+        def add(value: str) -> None:
+            cleaned = value.strip()
+            if cleaned and cleaned not in variants:
+                variants.append(cleaned)
+
+        add(term)
+        if normalized != term:
+            add(normalized)
+
+        match = re.fullmatch(r"第(\d+)(項|条|号)", normalized)
+        if match:
+            number, suffix = match.groups()
+            add(f"{number}{suffix}")
+            add(f"{number}.")
+            add(f"{number}．")
+
+        bc_match = re.fullmatch(r"BC(\d+)", normalized, flags=re.IGNORECASE)
+        if bc_match:
+            number = bc_match.group(1)
+            add(f"BC{number}")
+            add(f"結論の背景 {number}")
+
+        return variants
+
+    @classmethod
+    def exact_keyword_term_sets(cls, query: str) -> list[list[str]]:
+        exact_terms = cls.extract_exact_terms(query)
+        base_terms = cls.exact_keyword_terms(query)
+        doc_terms, section_terms = cls.split_exact_constraints(query)
+        anchor_terms = [
+            term
+            for term in base_terms
+            if not any(
+                cls.normalize_exact_text(term) == cls.normalize_exact_text(exact_term)
+                for exact_term in exact_terms
+            )
+        ]
+
+        candidate_sets: list[list[str]] = []
+
+        def add(term_set: list[str]) -> None:
+            deduped: list[str] = []
+            for term in term_set:
+                cleaned = str(term).strip()
+                if cleaned and cleaned not in deduped:
+                    deduped.append(cleaned)
+            if not deduped:
+                return
+            signature = "\u241f".join(deduped)
+            if any("\u241f".join(existing) == signature for existing in candidate_sets):
+                return
+            candidate_sets.append(deduped)
+
+        if exact_terms:
+            add(exact_terms)
+        add(base_terms)
+
+        expanded_terms: list[str] = []
+        for term in doc_terms:
+            expanded_terms.extend(cls._exact_doc_term_variants(term))
+        for term in section_terms:
+            expanded_terms.extend(cls._exact_section_term_variants(term))
+        add(expanded_terms + anchor_terms[:2])
+
+        if section_terms:
+            section_focus_terms: list[str] = []
+            for term in section_terms:
+                section_focus_terms.extend(cls._exact_section_term_variants(term))
+            add(section_focus_terms + anchor_terms[:3])
+
+        return candidate_sets or [base_terms or [query.strip()]]
 
     @classmethod
     def exact_keyword_terms(cls, query: str) -> list[str]:
@@ -298,6 +504,75 @@ class QueryExpander:
         return any(term in query for term in cls._DETAIL_SEEKING_TERMS)
 
     @classmethod
+    def _is_judgment_validation(cls, query: str) -> bool:
+        has_validation_request = any(term in query for term in cls._JUDGMENT_VALIDATION_TERMS)
+        if not has_validation_request:
+            return False
+        return any(term in query for term in cls._JUDGMENT_ASSERTION_TERMS) or "依拠" in query
+
+    @classmethod
+    def _extract_validation_claims(cls, query: str) -> list[str]:
+        if not cls._is_judgment_validation(query):
+            return []
+
+        claims: list[str] = []
+
+        def add(text: str) -> None:
+            cleaned = text.strip(" 　。.!！?？:：;；")
+            cleaned = re.sub(r"^(私は|当社では|当社|実務上|なお)\s*", "", cleaned)
+            cleaned = re.sub(r"(依拠|根拠)\s*[：:].*$", "", cleaned).strip()
+            if len(cleaned) < 8:
+                return
+            if cleaned not in claims:
+                claims.append(cleaned)
+
+        for sentence in re.split(r"[。!?！？\n]+", query):
+            normalized = sentence.strip()
+            if not normalized:
+                continue
+            if any(term in normalized for term in cls._JUDGMENT_ASSERTION_TERMS):
+                add(normalized)
+                continue
+            if "という理解" in normalized or "という認識" in normalized:
+                add(normalized)
+
+        return claims[:3]
+
+    @classmethod
+    def _build_verification_claims(
+        cls,
+        validation_claims: list[str],
+        cited_references: list[str],
+    ) -> list[dict[str, object]]:
+        if not validation_claims:
+            return []
+
+        doc_terms: list[str] = []
+        section_terms: list[str] = []
+        for ref in cited_references:
+            normalized = cls.normalize_exact_text(ref)
+            if re.fullmatch(r"第\d+(?:項|条|号)", normalized) or re.fullmatch(r"BC\d+(?:[-‑–]\d+)?", normalized, flags=re.IGNORECASE):
+                section_terms.append(ref)
+            else:
+                doc_terms.append(ref)
+
+        claims: list[dict[str, object]] = []
+        for claim in validation_claims:
+            claims.append(
+                {
+                    "claim": claim,
+                    "cited_references": list(cited_references),
+                    "doc_terms": list(doc_terms),
+                    "section_terms": list(section_terms),
+                    "search_query": cls._merge_focus_terms(
+                        " ".join([*doc_terms[:2], *section_terms[:2], *cls._extract_keywords(claim)[:4]]),
+                        [],
+                    ) or claim,
+                }
+            )
+        return claims
+
+    @classmethod
     def _detail_focus_terms(cls, query: str) -> list[str]:
         terms: list[str] = []
 
@@ -337,7 +612,18 @@ class QueryExpander:
         return " ".join(tokens) or None
 
     @classmethod
-    def _infer_complexity(cls, query: str, keywords: list[str], exact: bool) -> str:
+    def _infer_complexity(
+        cls,
+        query: str,
+        keywords: list[str],
+        exact: bool,
+        *,
+        judgment_validation: bool = False,
+    ) -> str:
+        if judgment_validation:
+            if len(query) >= 40 or "依拠" in query or len(keywords) >= 5:
+                return "complex"
+            return "moderate"
         complex_hits = sum(1 for term in cls._COMPLEX_TERMS if term in query)
         separator_hits = sum(query.count(token) for token in ("と", "、", "/", "・"))
         if exact:
@@ -456,6 +742,40 @@ class QueryExpander:
                 focus_parts.append("税率変更")
             return " ".join(dict.fromkeys(focus_parts))
         return None
+
+    @classmethod
+    def _validation_focus_variant(
+        cls,
+        query: str,
+        *,
+        keywords: list[str],
+        exact_terms: list[str],
+        validation_claims: list[str],
+    ) -> str | None:
+        focus_parts: list[str] = []
+
+        for term in exact_terms[:3]:
+            if term not in focus_parts:
+                focus_parts.append(term)
+
+        claim_keywords = cls._extract_keywords(" ".join(validation_claims)) if validation_claims else []
+        for term in claim_keywords + keywords:
+            normalized = cls.normalize_exact_text(term)
+            if not normalized:
+                continue
+            if any(normalized == cls.normalize_exact_text(existing) for existing in focus_parts):
+                continue
+            if term in {"確認", "妥当", "正しい", "問題", "依拠"}:
+                continue
+            focus_parts.append(term)
+            if len(focus_parts) >= 7:
+                break
+
+        if not focus_parts:
+            return None
+        if "判断" in query and "判断" not in focus_parts:
+            focus_parts.append("判断")
+        return " ".join(focus_parts[:8])
 
     @classmethod
     def _prefer_keyword_first_for_complex(cls, query: str, keywords: list[str]) -> bool:

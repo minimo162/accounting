@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
+from .query_rewrite import QueryExpander
+
 
 @dataclass
 class RetrievalLog:
@@ -127,6 +129,10 @@ class AgentContext:
         self.evidence_slots: list[str] = []
         self.evidence_slot_terms: dict[str, tuple[str, ...]] = {}
         self.evidence_slot_hits: dict[str, set[str]] = {}
+        self.exact_doc_terms: list[str] = []
+        self.exact_section_terms: list[str] = []
+        self.exact_evidence_chunk_ids: set[str] = set()
+        self.exact_gap_nudge_sent: bool = False
         self.wrap_up_nudged: bool = False
         self.coverage_gap_nudge_signature: str = ""
         self.final_coverage_review_done: bool = False
@@ -195,6 +201,19 @@ class AgentContext:
                     cls._register_slot(slots, slot_terms, label, list(aliases))
                     break
 
+        if len(slots) <= 1 and bool((query_profile or {}).get("detail_seeking")):
+            focus_texts = [
+                str((query_profile or {}).get("canonical_focus_query", "")),
+                str((query_profile or {}).get("corrective_query", "")),
+            ]
+            for focus_text in focus_texts:
+                normalized_focus = cls._normalize_slot_text(focus_text)
+                if not normalized_focus:
+                    continue
+                for label, aliases in cls._SLOT_ALIASES.items():
+                    if any(cls._normalize_slot_text(alias) in normalized_focus for alias in aliases):
+                        cls._register_slot(slots, slot_terms, label, list(aliases))
+
         if not slots:
             keywords = list((query_profile or {}).get("keywords", []))
             complexity = str((query_profile or {}).get("complexity", "moderate"))
@@ -220,6 +239,9 @@ class AgentContext:
         self.current_search_query = question
         self.evidence_slots, self.evidence_slot_terms = self._infer_evidence_slots(question, self.query_profile)
         self.evidence_slot_hits = {slot: set() for slot in self.evidence_slots}
+        self.exact_doc_terms, self.exact_section_terms = QueryExpander.split_exact_constraints(question)
+        self.exact_evidence_chunk_ids.clear()
+        self.exact_gap_nudge_sent = False
         self.coverage_gap_nudge_signature = ""
         self.final_coverage_review_done = False
 
@@ -239,6 +261,20 @@ class AgentContext:
         for slot, terms in self.evidence_slot_terms.items():
             if any(self._normalize_slot_text(term) in haystack for term in terms):
                 self.evidence_slot_hits.setdefault(slot, set()).add(chunk_id)
+
+        if self.exact_doc_terms or self.exact_section_terms:
+            doc_hits = QueryExpander.count_exact_doc_hits(
+                self.exact_doc_terms,
+                [source, note],
+            )
+            section_hits = QueryExpander.count_exact_section_hits(
+                self.exact_section_terms,
+                [source, note],
+            )
+            if doc_hits == len(self.exact_doc_terms) and section_hits == len(self.exact_section_terms):
+                self.exact_evidence_chunk_ids.add(chunk_id)
+            else:
+                self.exact_evidence_chunk_ids.discard(chunk_id)
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)
@@ -327,6 +363,10 @@ class AgentContext:
         self.evidence_slots.clear()
         self.evidence_slot_terms.clear()
         self.evidence_slot_hits.clear()
+        self.exact_doc_terms.clear()
+        self.exact_section_terms.clear()
+        self.exact_evidence_chunk_ids.clear()
+        self.exact_gap_nudge_sent = False
         self.wrap_up_nudged = False
         self.coverage_gap_nudge_signature = ""
         self.final_coverage_review_done = False
