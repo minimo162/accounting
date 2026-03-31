@@ -253,6 +253,66 @@ class AgentLoopControlTests(unittest.TestCase):
 
         self.assertIsNone(message)
 
+    def test_context_initializes_verification_results(self):
+        context = AgentContext()
+        context.set_question(
+            "この判断は妥当ですか",
+            {
+                "complexity": "complex",
+                "verification_mode": True,
+                "verification_claims": [
+                    {
+                        "claim": "再評価済み土地の売却損は連結上の未実現損失として必ずしも消去しない",
+                        "search_query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                        "doc_terms": ["企業会計基準第22号"],
+                        "section_terms": ["第36条"],
+                        "cited_references": ["企業会計基準第22号", "第36条"],
+                        "target_transaction": "土地譲渡 / 未実現損失",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(len(context.verification_results), 1)
+        self.assertEqual(context.verification_results[0]["judgment"], "△要注意")
+        self.assertEqual(context.verification_results[0]["status"], "pending")
+
+    def test_context_marks_verification_claim_supported_when_exact_evidence_is_read(self):
+        context = AgentContext()
+        context.set_question(
+            "この判断は妥当ですか",
+            {
+                "complexity": "complex",
+                "verification_mode": True,
+                "verification_claims": [
+                    {
+                        "claim": "再評価済み土地の売却損は連結上の未実現損失として必ずしも消去しない",
+                        "search_query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                        "doc_terms": ["企業会計基準第22号"],
+                        "section_terms": ["第36条"],
+                        "cited_references": ["企業会計基準第22号", "第36条"],
+                        "target_transaction": "土地譲渡 / 未実現損失",
+                    }
+                ],
+            },
+        )
+        context.add_search_entry(
+            {
+                "query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                "effective_query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                "chunk_ids": ["consol.pdf:p36"],
+            }
+        )
+        context.set_evidence_note(
+            "consol.pdf:p36",
+            "第36条では、土地譲渡による未実現損失の扱いを定めている。",
+            source="企業会計基準第22号 > 第36条",
+        )
+
+        self.assertEqual(context.verification_results[0]["judgment"], "○適切")
+        self.assertEqual(context.verification_results[0]["status"], "supported")
+        self.assertEqual(context.verification_results[0]["evidence_chunk_ids"], ["consol.pdf:p36"])
+
     def test_context_tracks_evidence_slot_coverage(self):
         context = AgentContext()
         context.set_question(
@@ -930,6 +990,88 @@ class AgentLoopControlTests(unittest.TestCase):
             "【詳細回答ルール】" in str(message.get("content", ""))
             for message in agent.llm.messages
         ))
+
+    def test_force_final_answer_includes_verification_structure_messages(self):
+        agent = self.make_agent()
+        agent.llm = self.FakeLLM()
+        context = AgentContext()
+        context.set_question(
+            "この判断は妥当ですか",
+            {
+                "complexity": "complex",
+                "verification_mode": True,
+                "verification_claims": [
+                    {
+                        "claim": "再評価済み土地の売却損は連結上の未実現損失として必ずしも消去しない",
+                        "search_query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                        "doc_terms": ["企業会計基準第22号"],
+                        "section_terms": ["第36条"],
+                        "cited_references": ["企業会計基準第22号", "第36条"],
+                        "target_transaction": "土地譲渡 / 未実現損失",
+                    }
+                ],
+            },
+        )
+        context.add_search_entry(
+            {
+                "query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                "effective_query": "企業会計基準第22号 第36条 土地譲渡 未実現損失",
+                "chunk_ids": ["consol.pdf:p36"],
+            }
+        )
+        context.set_evidence_note(
+            "consol.pdf:p36",
+            "第36条では、土地譲渡による未実現損失の扱いを定めている。",
+            source="企業会計基準第22号 > 第36条",
+        )
+
+        agent._force_final_answer([{"role": "user", "content": "question"}], context)
+
+        self.assertTrue(any(
+            "## 主張別照合メモ" in str(message.get("content", ""))
+            for message in agent.llm.messages
+        ))
+        self.assertTrue(any(
+            "【判断検証の最終回答ルール】" in str(message.get("content", ""))
+            and "## 主張要約" in str(message.get("content", ""))
+            and "## 照合結果" in str(message.get("content", ""))
+            and "## 追加考慮事項" in str(message.get("content", ""))
+            and "## 参照" in str(message.get("content", ""))
+            for message in agent.llm.messages
+        ))
+
+    def test_verification_mode_uses_twelve_loop_cap(self):
+        agent = self.make_agent()
+        agent.max_loops = 20
+        context = AgentContext()
+        context.set_question(
+            "この判断は妥当ですか",
+            {
+                "complexity": "complex",
+                "verification_mode": True,
+                "verification_claims": [{"claim": "テスト主張"}],
+            },
+        )
+
+        self.assertEqual(agent._loop_budget(context), 12)
+
+    def test_retry_natural_answer_when_verification_answer_missing_sections(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question(
+            "この判断は妥当ですか",
+            {
+                "complexity": "complex",
+                "verification_mode": True,
+                "verification_claims": [{"claim": "テスト主張"}],
+            },
+        )
+        result = {
+            "answer": "主張は概ね妥当です[1]。",
+            "cited_reference_count": 1,
+        }
+
+        self.assertTrue(agent._should_retry_natural_answer(result, context))
 
     def test_force_final_answer_prefers_slot_snippets_over_full_notes(self):
         agent = self.make_agent()

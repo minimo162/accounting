@@ -29,6 +29,7 @@ class Agent:
     SEARCH_TOOL_NAMES = {"hybrid_search", "keyword_search", "semantic_search"}
     _SEARCH_STAGNATION_MIN_OVERLAP = 0.6
     _MAX_CROSS_REFERENCE_NUDGES = 2
+    _VERIFICATION_MAX_LOOPS = 12
     _DETAIL_NOTE_MARKERS = (
         "場合", "とき", "要件", "条件", "例外", "ただし", "なお", "一方",
         "また", "比較", "違い", "区分", "判断", "経過措置", "適用時期",
@@ -54,6 +55,15 @@ class Agent:
 
     def _count_search_calls(self, context: AgentContext) -> int:
         return sum(1 for log in context.retrieval_logs if log.tool_name in self.SEARCH_TOOL_NAMES)
+
+    @staticmethod
+    def _is_verification_context(context: AgentContext) -> bool:
+        return bool(context.query_profile.get("verification_mode") or context.verification_claims)
+
+    def _loop_budget(self, context: AgentContext) -> int:
+        if self._is_verification_context(context):
+            return min(self.max_loops, self._VERIFICATION_MAX_LOOPS)
+        return self.max_loops
 
     @staticmethod
     def _query_class(context: AgentContext) -> str:
@@ -638,11 +648,68 @@ class Agent:
         messages.append({"role": "user", "content": question})
         return messages
 
+    def _build_verification_loop_message(self, context: AgentContext) -> dict[str, str] | None:
+        if not self._is_verification_context(context) or not context.verification_results:
+            return None
+
+        lines = [
+            "【判断検証モード】この質問は、ユーザーの判断を主張単位で照合するタスクです。",
+            "次の順で進めてください。",
+            "- まず主張ごとに `hybrid_search` を 1 回ずつ試し、必要なら `read_chunk` または `read_document` で根拠本文を確認する",
+            "- 既に十分な根拠を読めた主張は再検索しない",
+            "- 最終回答では、各主張に `○適切` / `△要注意` / `×不適切` のいずれかを付けて報告する",
+            "",
+            "## 検証対象の主張",
+        ]
+        for item in context.verification_results:
+            refs = item.get("cited_references", [])
+            ref_text = f" | 依拠条文: {', '.join(refs)}" if refs else ""
+            query_text = str(item.get("search_query", "")).strip()
+            lines.append(
+                f"- 主張{item['index']}: {item['claim']}{ref_text}"
+            )
+            if query_text:
+                lines.append(f"  推奨検索: {query_text}")
+        return {"role": "user", "content": "\n".join(lines)}
+
+    def _build_verification_result_message(self, context: AgentContext) -> dict[str, str] | None:
+        if not self._is_verification_context(context) or not context.verification_results:
+            return None
+
+        lines = ["## 主張別照合メモ"]
+        for item in context.verification_results:
+            refs = item.get("cited_references", [])
+            ref_text = f" | 依拠条文: {', '.join(refs)}" if refs else ""
+            lines.append(
+                f"- 主張{item['index']} | 判定候補: {item['judgment']} | 状態: {item['status']}{ref_text}"
+            )
+            lines.append(f"  - 内容: {item['claim']}")
+            query_text = str(item.get("search_query", "")).strip()
+            if query_text:
+                lines.append(f"  - 推奨検索: {query_text}")
+            evidence_ids = [str(chunk_id) for chunk_id in item.get("evidence_chunk_ids", []) if str(chunk_id)]
+            if evidence_ids:
+                refs_text = "".join(f"[{chunk_id}]" for chunk_id in evidence_ids[:2])
+                lines.append(f"  - 根拠候補: {refs_text}")
+            else:
+                search_ids = [str(chunk_id) for chunk_id in item.get("search_chunk_ids", []) if str(chunk_id)]
+                if search_ids:
+                    refs_text = "".join(f"[{chunk_id}]" for chunk_id in search_ids[:2])
+                    lines.append(f"  - 検索済み候補: {refs_text}")
+                else:
+                    lines.append("  - 根拠候補: 未確認")
+        return {"role": "user", "content": "\n".join(lines)}
+
+    @staticmethod
+    def _has_verification_answer_sections(answer: str) -> bool:
+        required = ("## 主張要約", "## 照合結果", "## 追加考慮事項", "## 参照")
+        return all(section in answer for section in required)
+
     def _tool_schemas(self, context: AgentContext) -> list[dict[str, Any]]:
         return self.tools.get_schemas(context)
 
     def _seed_context(self, context: AgentContext, question: str):
-        profile = QueryExpander.profile(question)
+        profile = QueryExpander(self.config.retrieval, self.llm).analyze(question)
         context.set_question(question, profile.to_dict())
 
     def run(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
@@ -651,11 +718,15 @@ class Agent:
         try:
             self._seed_context(context, question)
             messages = self._build_initial_messages(question, history)
+            verification_message = self._build_verification_loop_message(context)
+            if verification_message is not None:
+                messages.append(verification_message)
             total_cost = 0.0
+            loop_budget = self._loop_budget(context)
 
-            for loop_idx in range(self.max_loops):
+            for loop_idx in range(loop_budget):
                 if self.verbose:
-                    logger.info(f"Loop {loop_idx + 1}/{self.max_loops}")
+                    logger.info(f"Loop {loop_idx + 1}/{loop_budget}")
 
                 self._maybe_nudge(messages, loop_idx, context)
 
@@ -733,7 +804,7 @@ class Agent:
             # Max loops exceeded
             answer, cost = self._force_final_answer(messages, context)
             total_cost += cost
-            result = self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
+            result = self._build_result(answer, context, loop_budget, "max_loops", total_cost)
             self._log_completion(result["observability"])
             return result
         except Exception as exc:
@@ -746,9 +817,13 @@ class Agent:
         try:
             self._seed_context(context, question)
             messages = self._build_initial_messages(question, history)
+            verification_message = self._build_verification_loop_message(context)
+            if verification_message is not None:
+                messages.append(verification_message)
             total_cost = 0.0
+            loop_budget = self._loop_budget(context)
 
-            for loop_idx in range(self.max_loops):
+            for loop_idx in range(loop_budget):
                 self._maybe_nudge(messages, loop_idx, context)
 
                 stop_reason = self._force_stop_reason(context)
@@ -817,7 +892,7 @@ class Agent:
 
             answer, cost = await self._aforce_final_answer(messages, context)
             total_cost += cost
-            result = self._build_result(answer, context, self.max_loops, "max_loops", total_cost)
+            result = self._build_result(answer, context, loop_budget, "max_loops", total_cost)
             self._log_completion(result["observability"])
             return result
         except Exception as exc:
@@ -834,9 +909,13 @@ class Agent:
         try:
             self._seed_context(context, question)
             messages = self._build_initial_messages(question, history)
+            verification_message = self._build_verification_loop_message(context)
+            if verification_message is not None:
+                messages.append(verification_message)
             total_cost = 0.0
+            loop_budget = self._loop_budget(context)
 
-            for loop_idx in range(self.max_loops):
+            for loop_idx in range(loop_budget):
                 status_msg = "調査中..." if loop_idx == 0 else f"調査中... (ステップ {loop_idx + 1})"
                 yield {"type": "status", "data": status_msg}
 
@@ -943,7 +1022,7 @@ class Agent:
 
             # Max loops - force final answer with streaming
             yield {"type": "status", "data": "回答を生成中..."}
-            async for event in self._astream_final_answer(messages, context, self.max_loops, "max_loops", total_cost):
+            async for event in self._astream_final_answer(messages, context, loop_budget, "max_loops", total_cost):
                 yield event
         except Exception as exc:
             self._log_error(context, exc)
@@ -1207,6 +1286,9 @@ class Agent:
         exact_evidence_message = self._build_exact_evidence_message(context)
         if exact_evidence_message is not None:
             messages_copy.append(exact_evidence_message)
+        verification_message = self._build_verification_result_message(context)
+        if verification_message is not None:
+            messages_copy.append(verification_message)
         if self._is_detail_seeking_context(context):
             messages_copy.append(
                 {
@@ -1215,6 +1297,19 @@ class Agent:
                         "【詳細回答ルール】詳しく/違い/どのような場合といった質問です。"
                         "各論点では、原則だけで終わらせず、確認できた範囲で条件・例外・判断基準・比較観点のうち"
                         "該当するものを少なくとも 1 つ含めてください。"
+                    ),
+                }
+            )
+        if self._is_verification_context(context):
+            messages_copy.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "【判断検証の最終回答ルール】最終回答は必ず次の 4 セクションで構成してください。"
+                        "`## 主張要約` → `## 照合結果` → `## 追加考慮事項` → `## 参照`。"
+                        "各主張について、確認できた根拠に基づき `○適切` / `△要注意` / `×不適切` のいずれかを付け、"
+                        "判定理由の本文行末には必ず引用を付けてください。"
+                        "根拠が弱い場合は `△要注意` とし、参照条文とズレる場合だけ `×不適切` を使ってください。"
                     ),
                 }
             )
@@ -1631,7 +1726,8 @@ class Agent:
         return result
 
     def _finalize_answer(self, answer: str, context: AgentContext) -> tuple[str, list[dict[str, Any]], dict[str, str]]:
-        answer = self._repair_answer_coverage(answer, context)
+        if not self._is_verification_context(context):
+            answer = self._repair_answer_coverage(answer, context)
         sanitized_answer, cited_ids = self._sanitize_answer(answer, number_refs=True)
         references, source_url_map = self._get_referenced_chunks(context, cited_ids)
         return sanitized_answer, references, source_url_map
@@ -1864,6 +1960,14 @@ class Agent:
         return re.sub(r"\[\d+\]", "", text)
 
     def _natural_answer_retry_reasons(self, result: dict[str, Any], context: AgentContext) -> list[str]:
+        answer = str(result.get("answer", ""))
+        if self._is_verification_context(context):
+            reasons: list[str] = []
+            if not self._has_verification_answer_sections(answer):
+                reasons.append("verification_format")
+            if int(result.get("cited_reference_count", 0)) < max(1, min(2, len(context.verification_results) or 1)):
+                reasons.append("verification_citations")
+            return reasons
         if QueryExpander.is_exact_query(context.question):
             if self._has_exact_clause_evidence(context):
                 return []
@@ -1878,7 +1982,6 @@ class Agent:
         if cited_reference_count < 2:
             reasons.append("low_citations")
 
-        answer = str(result.get("answer", ""))
         cited_lines = self._iter_cited_answer_lines(answer)
         coverage = context.get_evidence_coverage()
         required_line_count = 2

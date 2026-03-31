@@ -135,6 +135,8 @@ class AgentContext:
         self.exact_gap_nudge_sent: bool = False
         self.discovered_cross_references: dict[str, dict[str, Any]] = {}
         self.cross_reference_nudges_sent: int = 0
+        self.verification_claims: list[dict[str, Any]] = []
+        self.verification_results: list[dict[str, Any]] = []
         self.wrap_up_nudged: bool = False
         self.coverage_gap_nudge_signature: str = ""
         self.final_coverage_review_done: bool = False
@@ -248,6 +250,12 @@ class AgentContext:
         self.exact_gap_nudge_sent = False
         self.discovered_cross_references.clear()
         self.cross_reference_nudges_sent = 0
+        self.verification_claims = [
+            dict(item)
+            for item in self.query_profile.get("verification_claims", [])
+            if isinstance(item, dict) and str(item.get("claim", "")).strip()
+        ]
+        self.verification_results = self._build_verification_results()
         self.coverage_gap_nudge_signature = ""
         self.final_coverage_review_done = False
 
@@ -256,6 +264,8 @@ class AgentContext:
 
     def add_search_entry(self, entry: dict[str, Any]):
         self.search_history.append(entry)
+        if self.verification_claims:
+            self.verification_results = self._build_verification_results()
 
     def set_evidence_note(self, chunk_id: str, note: str, source: str = ""):
         self.evidence_notes[chunk_id] = note
@@ -283,6 +293,120 @@ class AgentContext:
                 self.exact_evidence_chunk_ids.discard(chunk_id)
 
         self._register_cross_reference_slots(chunk_id, source=source, note=note)
+        if self.verification_claims:
+            self.verification_results = self._build_verification_results()
+
+    @staticmethod
+    def _verification_terms(claim: dict[str, Any]) -> list[str]:
+        terms: list[str] = []
+        for field in ("doc_terms", "section_terms", "cited_references"):
+            for raw in claim.get(field, []):
+                term = str(raw).strip()
+                if term and term not in terms:
+                    terms.append(term)
+        target = str(claim.get("target_transaction", "")).strip()
+        if target:
+            for raw in re.split(r"\s*/\s*|\s+", target):
+                term = raw.strip()
+                if len(term) >= 2 and term not in terms:
+                    terms.append(term)
+        for raw in re.findall(r"[一-龥ぁ-んァ-ヶーA-Za-z0-9]{2,}", str(claim.get("claim", ""))):
+            if raw not in terms:
+                terms.append(raw)
+        return terms[:10]
+
+    @classmethod
+    def _entry_matches_verification_claim(cls, entry: dict[str, Any], claim: dict[str, Any]) -> bool:
+        haystack = "\n".join(
+            str(entry.get(field, "")).strip()
+            for field in ("query", "effective_query", "corrective_query")
+            if str(entry.get(field, "")).strip()
+        )
+        if not haystack:
+            return False
+        claim_query = str(claim.get("search_query", "")).strip()
+        if claim_query and claim_query in haystack:
+            return True
+        return any(term in haystack for term in cls._verification_terms(claim))
+
+    @classmethod
+    def _note_matches_verification_claim(
+        cls,
+        source: str,
+        note: str,
+        claim: dict[str, Any],
+    ) -> tuple[bool, bool]:
+        haystack = f"{source}\n{note}"
+        doc_terms = [str(term).strip() for term in claim.get("doc_terms", []) if str(term).strip()]
+        section_terms = [str(term).strip() for term in claim.get("section_terms", []) if str(term).strip()]
+        matched_terms = [term for term in cls._verification_terms(claim) if term in haystack]
+        exact_match = (
+            (not doc_terms or all(term in haystack for term in doc_terms))
+            and (not section_terms or all(term in haystack for term in section_terms))
+        )
+        if exact_match and matched_terms:
+            return True, True
+        if len(matched_terms) >= 2:
+            return True, False
+        return False, False
+
+    def _build_verification_results(self) -> list[dict[str, Any]]:
+        if not self.verification_claims:
+            return []
+
+        results: list[dict[str, Any]] = []
+        has_searches = bool(self.search_history)
+        for idx, claim in enumerate(self.verification_claims, start=1):
+            search_chunk_ids: list[str] = []
+            for entry in self.search_history:
+                if not self._entry_matches_verification_claim(entry, claim):
+                    continue
+                for chunk_id in entry.get("chunk_ids", []) or []:
+                    normalized = str(chunk_id).strip()
+                    if normalized and normalized not in search_chunk_ids:
+                        search_chunk_ids.append(normalized)
+
+            evidence_chunk_ids: list[str] = []
+            exact_evidence_chunk_ids: list[str] = []
+            for chunk_id, note in self.evidence_notes.items():
+                source = self.evidence_note_sources.get(chunk_id, "")
+                matched, exact_match = self._note_matches_verification_claim(source, note, claim)
+                if not matched:
+                    continue
+                if chunk_id not in evidence_chunk_ids:
+                    evidence_chunk_ids.append(chunk_id)
+                if exact_match and chunk_id not in exact_evidence_chunk_ids:
+                    exact_evidence_chunk_ids.append(chunk_id)
+
+            status = "pending"
+            judgment = "△要注意"
+            if exact_evidence_chunk_ids:
+                status = "supported"
+                judgment = "○適切"
+            elif evidence_chunk_ids or search_chunk_ids:
+                status = "partial"
+                judgment = "△要注意"
+            elif has_searches:
+                status = "insufficient"
+                judgment = "×不適切"
+
+            results.append(
+                {
+                    "index": idx,
+                    "claim": str(claim.get("claim", "")).strip(),
+                    "search_query": str(claim.get("search_query", "")).strip(),
+                    "target_transaction": str(claim.get("target_transaction", "")).strip(),
+                    "doc_terms": [str(term).strip() for term in claim.get("doc_terms", []) if str(term).strip()],
+                    "section_terms": [str(term).strip() for term in claim.get("section_terms", []) if str(term).strip()],
+                    "cited_references": [str(term).strip() for term in claim.get("cited_references", []) if str(term).strip()],
+                    "status": status,
+                    "judgment": judgment,
+                    "search_chunk_ids": search_chunk_ids,
+                    "evidence_chunk_ids": evidence_chunk_ids,
+                    "exact_evidence_chunk_ids": exact_evidence_chunk_ids,
+                }
+            )
+        return results
 
     def _register_cross_reference_slots(self, chunk_id: str, *, source: str, note: str) -> None:
         discovered = QueryExpander.extract_cross_references(f"{source}\n{note}")
@@ -385,6 +509,7 @@ class AgentContext:
             ],
             "question_complexity": self.question_complexity,
             "evidence_coverage": self.get_evidence_coverage(),
+            "verification_results": list(self.verification_results),
         }
 
     def get_evidence_coverage(self) -> dict[str, Any]:
@@ -420,6 +545,8 @@ class AgentContext:
         self.exact_gap_nudge_sent = False
         self.discovered_cross_references.clear()
         self.cross_reference_nudges_sent = 0
+        self.verification_claims.clear()
+        self.verification_results.clear()
         self.wrap_up_nudged = False
         self.coverage_gap_nudge_signature = ""
         self.final_coverage_review_done = False
