@@ -28,6 +28,7 @@ class Agent:
     NUDGE_AT_LOOP = 8  # After this many loops, hint the LLM to wrap up
     SEARCH_TOOL_NAMES = {"hybrid_search", "keyword_search", "semantic_search"}
     _SEARCH_STAGNATION_MIN_OVERLAP = 0.6
+    _MAX_CROSS_REFERENCE_NUDGES = 2
     _DETAIL_NOTE_MARKERS = (
         "場合", "とき", "要件", "条件", "例外", "ただし", "なお", "一方",
         "また", "比較", "違い", "区分", "判断", "経過措置", "適用時期",
@@ -407,6 +408,56 @@ class Agent:
             ),
         }
 
+    def _build_cross_reference_message(self, context: AgentContext) -> dict[str, str] | None:
+        if context.cross_reference_nudges_sent >= self._MAX_CROSS_REFERENCE_NUDGES:
+            return None
+        if self._count_search_calls(context) < 1 or self._count_tool_calls(context, "read_chunk") < 1:
+            return None
+
+        searched_text = " ".join(
+            filter(
+                None,
+                [
+                    str(entry.get("query", "")).strip()
+                    for entry in context.search_history
+                ]
+                + [
+                    str(entry.get("effective_query", "")).strip()
+                    for entry in context.search_history
+                ],
+            )
+        )
+        candidates: list[dict[str, Any]] = []
+        for item in context.discovered_cross_references.values():
+            doc_term = str(item.get("doc_term", "")).strip()
+            if not doc_term or doc_term in searched_text:
+                continue
+            section_terms = [str(term).strip() for term in item.get("section_terms", []) if str(term).strip()]
+            candidates.append(
+                {
+                    "doc_term": doc_term,
+                    "section_terms": section_terms,
+                    "search_query": " ".join([doc_term, *section_terms[:1]]).strip(),
+                }
+            )
+
+        if not candidates:
+            return None
+
+        top = candidates[0]
+        context.cross_reference_nudges_sent += 1
+        suffix = f"（{context.cross_reference_nudges_sent}/{self._MAX_CROSS_REFERENCE_NUDGES}回目）"
+        return {
+            "role": "user",
+            "content": (
+                "【システム通知】読取済みの根拠本文から、未確認の参照先基準が見つかりました。"
+                f"{suffix}\n"
+                f"- 追加検索候補: {top['search_query']}\n"
+                "この参照先だけを対象に 1 回だけ追加で hybrid_search し、必要なら read_chunk または read_document で確認してください。"
+                "同じ参照先を繰り返し検索しないでください。"
+            ),
+        }
+
     def _build_coverage_gap_message(self, context: AgentContext) -> dict[str, str] | None:
         coverage = context.get_evidence_coverage()
         uncovered_slots = coverage["uncovered_slots"]
@@ -556,6 +607,9 @@ class Agent:
         exact_hint = self._build_exact_gap_message(context)
         if exact_hint is not None:
             messages.append(exact_hint)
+        cross_reference_hint = self._build_cross_reference_message(context)
+        if cross_reference_hint is not None:
+            messages.append(cross_reference_hint)
         coverage_hint = self._build_coverage_gap_message(context)
         if coverage_hint is not None:
             messages.append(coverage_hint)

@@ -133,6 +133,8 @@ class AgentContext:
         self.exact_section_terms: list[str] = []
         self.exact_evidence_chunk_ids: set[str] = set()
         self.exact_gap_nudge_sent: bool = False
+        self.discovered_cross_references: dict[str, dict[str, Any]] = {}
+        self.cross_reference_nudges_sent: int = 0
         self.wrap_up_nudged: bool = False
         self.coverage_gap_nudge_signature: str = ""
         self.final_coverage_review_done: bool = False
@@ -244,6 +246,8 @@ class AgentContext:
         self.exact_doc_terms, self.exact_section_terms = QueryExpander.split_exact_constraints(question)
         self.exact_evidence_chunk_ids.clear()
         self.exact_gap_nudge_sent = False
+        self.discovered_cross_references.clear()
+        self.cross_reference_nudges_sent = 0
         self.coverage_gap_nudge_signature = ""
         self.final_coverage_review_done = False
 
@@ -309,6 +313,19 @@ class AgentContext:
                 allow_exact=True,
             )
             self.evidence_slot_hits.setdefault(doc_term, set()).add(chunk_id)
+            existing = self.discovered_cross_references.get(doc_term, {})
+            merged_sections = list(existing.get("section_terms", []))
+            for term in section_terms:
+                if term not in merged_sections:
+                    merged_sections.append(term)
+            source_chunk_ids = list(existing.get("source_chunk_ids", []))
+            if chunk_id not in source_chunk_ids:
+                source_chunk_ids.append(chunk_id)
+            self.discovered_cross_references[doc_term] = {
+                "doc_term": doc_term,
+                "section_terms": merged_sections,
+                "source_chunk_ids": source_chunk_ids,
+            }
 
     def mark_chunk_read(self, chunk_id: str, token_count: int = 0):
         self.read_chunk_ids.add(chunk_id)
@@ -401,6 +418,8 @@ class AgentContext:
         self.exact_section_terms.clear()
         self.exact_evidence_chunk_ids.clear()
         self.exact_gap_nudge_sent = False
+        self.discovered_cross_references.clear()
+        self.cross_reference_nudges_sent = 0
         self.wrap_up_nudged = False
         self.coverage_gap_nudge_signature = ""
         self.final_coverage_review_done = False

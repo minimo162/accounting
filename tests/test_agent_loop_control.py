@@ -218,6 +218,41 @@ class AgentLoopControlTests(unittest.TestCase):
 
         self.assertTrue(agent._should_force_wrap_up(context))
 
+    def test_build_cross_reference_message_prompts_additional_search(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question("企業結合後の会計処理を確認したいです", {"complexity": "moderate"})
+        context.add_retrieval_log("hybrid_search", 10)
+        context.add_retrieval_log("read_chunk", 10)
+        context.set_evidence_note(
+            "ketsugou.pdf:p12",
+            "未実現損益の消去については企業会計基準第22号第36条参照。",
+            source="企業結合に関する会計基準 > 取得後の会計処理",
+        )
+
+        message = agent._build_cross_reference_message(context)
+
+        self.assertIsNotNone(message)
+        self.assertIn("企業会計基準第22号 第36条", message["content"])
+        self.assertEqual(context.cross_reference_nudges_sent, 1)
+
+    def test_build_cross_reference_message_stops_after_two_nudges(self):
+        agent = self.make_agent()
+        context = AgentContext()
+        context.set_question("企業結合後の会計処理を確認したいです", {"complexity": "moderate"})
+        context.add_retrieval_log("hybrid_search", 10)
+        context.add_retrieval_log("read_chunk", 10)
+        context.set_evidence_note(
+            "ketsugou.pdf:p12",
+            "未実現損益の消去については企業会計基準第22号第36条参照。",
+            source="企業結合に関する会計基準 > 取得後の会計処理",
+        )
+        context.cross_reference_nudges_sent = 2
+
+        message = agent._build_cross_reference_message(context)
+
+        self.assertIsNone(message)
+
     def test_context_tracks_evidence_slot_coverage(self):
         context = AgentContext()
         context.set_question(
