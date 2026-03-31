@@ -422,7 +422,7 @@
       "id": "39",
       "title": "連結会計・判断検証・クロスリファレンスの評価ケースを追加する",
       "description": "answer_eval_set.jsonl に連結会計、判断検証型、クロスリファレンス型の評価ケースを追加する。",
-      "status": "pending",
+      "status": "done",
       "dependencies": ["33", "38"],
       "priority": "high",
       "details": "連結: 未実現損益の消去、連結範囲判定。判断検証: ユーザー例題（土地譲渡+再評価+連結消去）に基づくケース。クロスリファレンス: 2 基準以上を引用する必要があるケース。各ケースに must_include_all, min_citations, max_loops を設定する。",
@@ -445,7 +445,7 @@
     "version": "1.0.0",
     "lastModified": "2026-03-31T12:00:00+09:00",
     "taskCount": 40,
-    "completedCount": 38,
+    "completedCount": 39,
     "tags": ["master"]
   }
 }

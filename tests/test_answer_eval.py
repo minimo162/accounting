@@ -19,6 +19,19 @@ from src.arag.answer_eval import (
 
 
 class AnswerEvalTests(unittest.TestCase):
+    def test_repo_answer_eval_cases_include_phase6_additions(self):
+        cases = load_answer_eval_cases(Path("eval/answer_eval_set.jsonl"))
+        case_map = {case.case_id: case for case in cases}
+
+        self.assertEqual(len(cases), 21)
+        self.assertIn("consolidation_unrealized_gain_elimination", case_map)
+        self.assertIn("consolidation_scope_determination", case_map)
+        self.assertIn("verification_land_revaluation_judgment", case_map)
+        self.assertIn("cross_reference_land_revaluation", case_map)
+        self.assertEqual(case_map["consolidation_unrealized_gain_elimination"].max_loops, 6)
+        self.assertEqual(case_map["verification_land_revaluation_judgment"].max_loops, 12)
+        self.assertGreaterEqual(case_map["cross_reference_land_revaluation"].min_citations, 2)
+
     def test_extract_visible_citation_numbers_returns_unique_numbers(self):
         answer = "借手です。[1] 貸手です。[2][2]"
 

@@ -1040,6 +1040,58 @@ class AgentLoopControlTests(unittest.TestCase):
             for message in agent.llm.messages
         ))
 
+    def test_finalize_answer_restructures_verification_output_when_unstructured(self):
+        agent = self.make_agent()
+        agent.chunk_map = {
+            "consol.pdf:p36": {
+                "id": "consol.pdf:p36",
+                "parent_id": "consol.pdf:p36",
+                "text": "第36条では、連結会社間取引に係る未実現損益の消去を定めている。",
+                "source": "連結財務諸表に関する会計基準 第36条",
+                "file": "consol.pdf",
+                "pdf_page": 36,
+            }
+        }
+        context = AgentContext()
+        context.set_question(
+            "この判断は妥当ですか",
+            {
+                "complexity": "complex",
+                "verification_mode": True,
+                "verification_claims": [
+                    {
+                        "claim": "再評価済み土地の売却損は連結上の未実現損失として必ずしも消去しない",
+                        "search_query": "連結財務諸表に関する会計基準 第36条 土地譲渡 未実現損失",
+                        "doc_terms": ["連結財務諸表に関する会計基準"],
+                        "section_terms": ["第36条"],
+                        "cited_references": ["連結財務諸表に関する会計基準", "第36条"],
+                        "target_transaction": "土地譲渡 / 連結消去",
+                    }
+                ],
+            },
+        )
+        context.add_search_entry(
+            {
+                "query": "連結財務諸表に関する会計基準 第36条 土地譲渡 未実現損失",
+                "effective_query": "連結財務諸表に関する会計基準 第36条 土地譲渡 未実現損失",
+                "chunk_ids": ["consol.pdf:p36"],
+            }
+        )
+        context.set_evidence_note(
+            "consol.pdf:p36",
+            "第36条では、連結会社間取引に係る未実現損益の消去を定めている。",
+            source="連結財務諸表に関する会計基準 第36条",
+        )
+
+        answer, references, _ = agent._finalize_answer("判断は妥当です。", context)
+
+        self.assertIn("## 主張要約", answer)
+        self.assertIn("## 照合結果", answer)
+        self.assertIn("## 追加考慮事項", answer)
+        self.assertIn("## 参照", answer)
+        self.assertIn("○適切", answer)
+        self.assertEqual(len(references), 1)
+
     def test_verification_mode_uses_twelve_loop_cap(self):
         agent = self.make_agent()
         agent.max_loops = 20

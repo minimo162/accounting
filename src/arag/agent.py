@@ -1683,6 +1683,94 @@ class Agent:
         cleaned += "## 論点カバレッジ\n" + "\n".join(repair_lines)
         return cleaned
 
+    @staticmethod
+    def _verification_judgment_present(answer: str) -> bool:
+        return any(marker in answer for marker in ("○適切", "△要注意", "×不適切"))
+
+    def _verification_refs(self, item: dict[str, Any], context: AgentContext) -> list[str]:
+        refs: list[str] = []
+        for bucket in ("exact_evidence_chunk_ids", "evidence_chunk_ids", "search_chunk_ids"):
+            for raw in item.get(bucket, []) or []:
+                chunk_id = str(raw).strip()
+                if chunk_id and chunk_id not in refs:
+                    refs.append(chunk_id)
+        for chunk_id in context.searched_chunk_ids:
+            normalized = str(chunk_id).strip()
+            if normalized and normalized not in refs:
+                refs.append(normalized)
+            if len(refs) >= 2:
+                break
+        return refs[:2]
+
+    def _verification_reason_line(self, item: dict[str, Any], context: AgentContext) -> str:
+        refs = self._verification_refs(item, context)
+        ref_text = "".join(f"[{chunk_id}]" for chunk_id in refs)
+        cited_refs = [str(ref).strip() for ref in item.get("cited_references", []) if str(ref).strip()]
+        cited_text = f"依拠条文: {', '.join(cited_refs)}。 " if cited_refs else ""
+        note = ""
+        if refs:
+            note = context.evidence_notes.get(refs[0], "").strip()
+        snippet = ""
+        if note:
+            snippet = self._note_units(note)[0].rstrip("。！？")
+        judgment = str(item.get("judgment", "△要注意"))
+        if judgment == "○適切":
+            reason = "確認できた根拠と主張の方向性は整合しています"
+        elif judgment == "×不適切":
+            reason = "今回確認できた根拠では主張をそのまま採用するのは難しいです"
+        else:
+            reason = "関連する根拠は見つかったものの、適用関係の確認がまだ不十分です"
+        if snippet:
+            reason = f"{reason}。{snippet}"
+        return f"{cited_text}{reason}{ref_text}".strip()
+
+    def _build_verification_structured_answer(self, context: AgentContext) -> str:
+        if not context.verification_results:
+            return ""
+
+        summary_lines = ["## 主張要約"]
+        result_lines = ["## 照合結果"]
+        consideration_lines = ["## 追加考慮事項"]
+        reference_lines = ["## 参照"]
+
+        for item in context.verification_results:
+            refs = self._verification_refs(item, context)
+            ref_text = "".join(f"[{chunk_id}]" for chunk_id in refs)
+            cited_refs = [str(ref).strip() for ref in item.get("cited_references", []) if str(ref).strip()]
+            cited_text = f"（依拠: {', '.join(cited_refs)}）" if cited_refs else ""
+            summary_lines.append(f"- 主張{item['index']}: {item['claim']}{cited_text}{ref_text}")
+            result_lines.append(
+                f"- 主張{item['index']}: {item.get('judgment', '△要注意')}。{self._verification_reason_line(item, context)}"
+            )
+
+        if any(str(item.get("judgment", "")) != "○適切" for item in context.verification_results):
+            for item in context.verification_results:
+                if str(item.get("judgment", "")) == "○適切":
+                    continue
+                refs = self._verification_refs(item, context)
+                ref_text = "".join(f"[{chunk_id}]" for chunk_id in refs)
+                consideration_lines.append(
+                    f"- 主張{item['index']}: 原文の条項対応と適用場面を追加確認してください{ref_text}"
+                )
+        else:
+            refs = self._verification_refs(context.verification_results[0], context)
+            ref_text = "".join(f"[{chunk_id}]" for chunk_id in refs)
+            consideration_lines.append(f"- 今回確認した範囲では、主張同士の大きな矛盾は見当たりません{ref_text}")
+
+        seen_refs: set[str] = set()
+        for item in context.verification_results:
+            refs = self._verification_refs(item, context)
+            cited_refs = [str(ref).strip() for ref in item.get("cited_references", []) if str(ref).strip()]
+            label = " / ".join(cited_refs) if cited_refs else f"主張{item['index']}の確認根拠"
+            ref_text = "".join(f"[{chunk_id}]" for chunk_id in refs)
+            key = f"{label}|{ref_text}"
+            if key in seen_refs:
+                continue
+            seen_refs.add(key)
+            reference_lines.append(f"- {label}{ref_text}")
+
+        return "\n".join(summary_lines + [""] + result_lines + [""] + consideration_lines + [""] + reference_lines)
+
     def _sanitize_answer(self, text: str, *, number_refs: bool = False) -> tuple[str, list[str]] | str:
         """Normalize answer formatting before returning it to clients.
 
@@ -1726,7 +1814,10 @@ class Agent:
         return result
 
     def _finalize_answer(self, answer: str, context: AgentContext) -> tuple[str, list[dict[str, Any]], dict[str, str]]:
-        if not self._is_verification_context(context):
+        if self._is_verification_context(context):
+            if not self._has_verification_answer_sections(answer) or not self._verification_judgment_present(answer):
+                answer = self._build_verification_structured_answer(context) or answer
+        else:
             answer = self._repair_answer_coverage(answer, context)
         sanitized_answer, cited_ids = self._sanitize_answer(answer, number_refs=True)
         references, source_url_map = self._get_referenced_chunks(context, cited_ids)
