@@ -433,7 +433,7 @@
       "id": "40",
       "title": "既存評価ケースの regression 確認と Phase 7 baseline 更新",
       "description": "全変更後に既存 17 ケースが引き続き pass することを確認し、Phase 7 の baseline を記録する。",
-      "status": "pending",
+      "status": "done",
       "dependencies": ["39"],
       "priority": "medium",
       "details": "full API hard gate を再実行し、既存ケースに regression がないことを検証する。新規ケースを含む全ケースの baseline（latency, loops, tokens）を記録する。",
@@ -445,7 +445,7 @@
     "version": "1.0.0",
     "lastModified": "2026-03-31T12:00:00+09:00",
     "taskCount": 40,
-    "completedCount": 39,
+    "completedCount": 40,
     "tags": ["master"]
   }
 }
