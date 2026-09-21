@@ -417,7 +417,7 @@ Cloud Logging 向けの structured log は JSON 1 行で出力します。主な
 
 GitHub Actions:
 
-- `.github/workflows/answer-eval.yml` は `workflow_dispatch` と週次 schedule で実行します
+- `.github/workflows/answer-eval.yml` は手動（`workflow_dispatch`）のみで実行します
 - `workflow_dispatch` では `gate_mode` `local_limit` `override_reason` を指定できます
 - repository variable `ACCOUNTING_QA_API_URL` を設定すると、deployed API に対する production gate も実行します
 - local subset gate は `eval/reports/local_answer_eval_gate.{md,json}`、production gate は `eval/reports/prod_answer_eval_gate.{md,json}` を artifact に保存します
